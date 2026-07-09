@@ -1,0 +1,2820 @@
+#include "winxterm_smoke.h"
+
+#include "winxterm_font_6x13.h"
+#include "winxterm_glyph_fallback.h"
+#include "winxterm_bridge.h"
+#include "winxterm_client.h"
+#include "winxterm_clipboard.h"
+#include "winxterm_input.h"
+#include "winxterm_log.h"
+#include "winxterm_macro.h"
+#include "winxterm_modes.h"
+#include "winxterm_mouse.h"
+#include "winxterm_options.h"
+#include "winxterm_replies.h"
+#include "winxterm_render.h"
+#include "winxterm_scale.h"
+#include "winxterm_screen.h"
+#include "winxterm_text.h"
+#include "winxterm_ux.h"
+#include "winxterm_window_placement.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+#define WINXTERM_SMOKE_PATH_CAPACITY 32768u
+
+typedef struct WinxtermSmokeState {
+    int failures;
+} WinxtermSmokeState;
+
+typedef struct WinxtermProtocolCapture {
+    WinxtermScreen *screen;
+    WinxtermTerminalOp ops[128];
+    size_t op_count;
+    uint8_t replies[1024];
+    size_t reply_count;
+} WinxtermProtocolCapture;
+
+static void winxterm_smoke_expect(WinxtermSmokeState *state, bool condition, const char *message)
+{
+    if (condition) {
+        return;
+    }
+
+    ++state->failures;
+    OutputDebugStringA("winxterm smoke failure: ");
+    OutputDebugStringA(message);
+    OutputDebugStringA("\n");
+}
+
+static bool winxterm_smoke_bytes_contain(const uint8_t *haystack,
+                                         size_t haystack_count,
+                                         const char *needle)
+{
+    size_t needle_count = needle != 0 ? strlen(needle) : 0u;
+    if (haystack == 0 || needle_count == 0u || haystack_count < needle_count) {
+        return false;
+    }
+    for (size_t i = 0u; i + needle_count <= haystack_count; ++i) {
+        if (memcmp(haystack + i, needle, needle_count) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static WinxtermScreenCell winxterm_smoke_text_cell(uint32_t codepoint)
+{
+    WinxtermScreenCell cell;
+    memset(&cell, 0, sizeof(cell));
+    cell.codepoint = codepoint;
+    cell.glyph_index = winxterm_screen_map_codepoint_to_glyph(codepoint);
+    cell.foreground_rgb = WINXTERM_DEFAULT_FOREGROUND_RGB;
+    cell.background_rgb = WINXTERM_DEFAULT_BACKGROUND_RGB;
+    cell.foreground_palette_index = 7u;
+    cell.background_palette_index = 0u;
+    cell.color_flags = (uint8_t)(WINXTERM_SCREEN_COLOR_FOREGROUND_DEFAULT |
+                                 WINXTERM_SCREEN_COLOR_BACKGROUND_DEFAULT);
+    cell.width = 1u;
+    return cell;
+}
+
+static void winxterm_smoke_fill_text_cells(WinxtermScreenCell *cells, int columns, const char *text)
+{
+    if (cells == 0 || columns <= 0) {
+        return;
+    }
+    for (int column = 0; column < columns; ++column) {
+        cells[column] = winxterm_smoke_text_cell((uint32_t)' ');
+    }
+    if (text == 0) {
+        return;
+    }
+    for (int column = 0; column < columns && text[column] != '\0'; ++column) {
+        cells[column] = winxterm_smoke_text_cell((uint32_t)(uint8_t)text[column]);
+    }
+}
+
+static bool winxterm_smoke_set_scrollback_line(WinxtermScreen *screen,
+                                               size_t index,
+                                               const char *text,
+                                               bool soft_wrapped)
+{
+    if (screen == 0 || index >= screen->scrollback_count) {
+        return false;
+    }
+    WinxtermScreenLine *line = &screen->scrollback_lines[index];
+    line->cells = (WinxtermScreenCell *)malloc((size_t)screen->columns * sizeof(*line->cells));
+    if (line->cells == 0) {
+        return false;
+    }
+    line->columns = screen->columns;
+    line->soft_wrapped = soft_wrapped;
+    winxterm_smoke_fill_text_cells(line->cells, screen->columns, text);
+    return true;
+}
+
+static bool winxterm_smoke_protocol_append_reply(WinxtermProtocolCapture *capture,
+                                                 const uint8_t *bytes,
+                                                 size_t byte_count)
+{
+    if (capture == 0 || bytes == 0 || capture->reply_count + byte_count > sizeof(capture->replies)) {
+        return false;
+    }
+    memcpy(capture->replies + capture->reply_count, bytes, byte_count);
+    capture->reply_count += byte_count;
+    return true;
+}
+
+static bool winxterm_smoke_protocol_sink(void *context, const WinxtermTerminalOp *op)
+{
+    WinxtermProtocolCapture *capture = (WinxtermProtocolCapture *)context;
+    if (capture == 0 || op == 0) {
+        return false;
+    }
+    if (capture->op_count < sizeof(capture->ops) / sizeof(capture->ops[0])) {
+        capture->ops[capture->op_count++] = *op;
+    }
+
+    if (op->type == WINXTERM_TERMINAL_OP_QUERY) {
+        uint8_t reply[WINXTERM_TERMINAL_REPLY_CAPACITY];
+        size_t reply_length = 0u;
+        switch (op->data.query.type) {
+        case WINXTERM_TERMINAL_QUERY_PRIMARY_DA:
+            reply_length = winxterm_reply_primary_da(reply, sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_SECONDARY_DA:
+            reply_length = winxterm_reply_secondary_da(reply, sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_DSR_STATUS:
+            reply_length = winxterm_reply_dsr_status(reply, sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_CPR:
+            reply_length = winxterm_reply_cpr(capture->screen != 0 ? capture->screen->cursor_row + 1 : 1,
+                                              capture->screen != 0 ? capture->screen->cursor_col + 1 : 1,
+                                              reply,
+                                              sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_DECRQM: {
+            WinxtermTerminalMode mode;
+            int status = 0;
+            if (capture->screen != 0 &&
+                winxterm_mode_from_csi(op->data.query.private_marker, op->data.query.param, &mode)) {
+                status = winxterm_mode_decrqm_status(&capture->screen->mode_state, mode);
+            }
+            reply_length = winxterm_reply_decrqm(op->data.query.private_marker,
+                                                 op->data.query.param,
+                                                 status,
+                                                 reply,
+                                                 sizeof(reply));
+            break;
+        }
+        case WINXTERM_TERMINAL_QUERY_DECRQSS:
+            reply_length = winxterm_reply_decrqss(op->data.query.request,
+                                                  op->data.query.request_length,
+                                                  op->data.query.request_length == 1u &&
+                                                      op->data.query.request[0] == 'm',
+                                                  reply,
+                                                  sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_XTVERSION:
+            reply_length = winxterm_reply_xtversion(reply, sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_XTQMODKEYS:
+            reply_length = winxterm_reply_xtqmodkeys(reply, sizeof(reply));
+            break;
+        case WINXTERM_TERMINAL_QUERY_XTQFMTKEYS:
+            reply_length = winxterm_reply_xtqfmtkeys(reply, sizeof(reply));
+            break;
+        default:
+            break;
+        }
+        return reply_length == 0u || winxterm_smoke_protocol_append_reply(capture, reply, reply_length);
+    }
+
+    if (capture->screen != 0) {
+        return winxterm_screen_apply_op(capture->screen, op);
+    }
+    return true;
+}
+
+static bool winxterm_smoke_replies_contain(const WinxtermProtocolCapture *capture,
+                                           const char *text,
+                                           size_t length)
+{
+    if (capture == 0 || text == 0 || length == 0u || length > capture->reply_count) {
+        return false;
+    }
+    for (size_t i = 0u; i + length <= capture->reply_count; ++i) {
+        if (memcmp(capture->replies + i, text, length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool winxterm_smoke_screen_contains_text(const WinxtermScreen *screen, const char *text)
+{
+    if (screen == 0 || text == 0 || text[0] == '\0') {
+        return false;
+    }
+    size_t length = strlen(text);
+    if (length == 0u || length > (size_t)screen->columns) {
+        return false;
+    }
+    for (int row = 0; row < screen->rows; ++row) {
+        for (int column = 0; column + (int)length <= screen->columns; ++column) {
+            bool matched = true;
+            for (size_t i = 0u; i < length; ++i) {
+                const WinxtermScreenCell *cell = winxterm_screen_cell_at((WinxtermScreen *)screen,
+                                                                         row,
+                                                                         column + (int)i);
+                if (cell == 0 || cell->codepoint != (uint32_t)(unsigned char)text[i]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool winxterm_smoke_screen_row_contains_text(const WinxtermScreen *screen, int row, const char *text)
+{
+    if (screen == 0 || text == 0 || text[0] == '\0' || row < 0 || row >= screen->rows) {
+        return false;
+    }
+    size_t length = strlen(text);
+    if (length == 0u || length > (size_t)screen->columns) {
+        return false;
+    }
+    for (int column = 0; column + (int)length <= screen->columns; ++column) {
+        bool matched = true;
+        for (size_t i = 0u; i < length; ++i) {
+            const WinxtermScreenCell *cell = winxterm_screen_cell_at((WinxtermScreen *)screen,
+                                                                     row,
+                                                                     column + (int)i);
+            if (cell == 0 || cell->codepoint != (uint32_t)(unsigned char)text[i]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool winxterm_smoke_row_view_contains_text(const WinxtermScreenRowView *row, const char *text)
+{
+    if (row == 0 || row->cells == 0 || text == 0 || text[0] == '\0') {
+        return false;
+    }
+    size_t length = strlen(text);
+    if (length == 0u || length > (size_t)row->columns) {
+        return false;
+    }
+    for (int column = 0; column + (int)length <= row->columns; ++column) {
+        bool matched = true;
+        for (size_t i = 0u; i < length; ++i) {
+            const WinxtermScreenCell *cell = row->cells + column + i;
+            if (cell->codepoint != (uint32_t)(unsigned char)text[i]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void winxterm_smoke_test_render_constants(WinxtermSmokeState *state)
+{
+    winxterm_smoke_expect(state, WINXTERM_TERMINAL_COLUMNS == 80, "terminal columns must be 80");
+    winxterm_smoke_expect(state, WINXTERM_TERMINAL_ROWS == 24, "terminal rows must be 24");
+    winxterm_smoke_expect(state, WINXTERM_CELL_WIDTH_PIXELS == 6, "cell width must be 6");
+    winxterm_smoke_expect(state, WINXTERM_CELL_HEIGHT_PIXELS == 13, "cell height must be 13");
+    winxterm_smoke_expect(state, WINXTERM_INITIAL_PIXEL_WIDTH == 480, "initial width must be 480");
+    winxterm_smoke_expect(state, WINXTERM_INITIAL_PIXEL_HEIGHT == 312, "initial height must be 312");
+    winxterm_smoke_expect(state, WINXTERM_BYTES_PER_PIXEL == 4, "pixel format must be 32-bit");
+    winxterm_smoke_expect(state,
+                          WINXTERM_DEFAULT_FOREGROUND_RGB == 0x00e3e3e3u,
+                          "default foreground must match Phase 2 plan");
+    winxterm_smoke_expect(state,
+                          WINXTERM_DEFAULT_BACKGROUND_RGB == 0x00262626u,
+                          "default background must match Phase 2 plan");
+
+    WinxtermCellSize cells = winxterm_pixels_to_cells(479, 311);
+    winxterm_smoke_expect(state, cells.columns == 79, "pixel-to-cell width must truncate");
+    winxterm_smoke_expect(state, cells.rows == 23, "pixel-to-cell height must truncate");
+
+    WinxtermCellSize scale_one_cells =
+        winxterm_physical_pixels_to_cells(WINXTERM_INITIAL_PIXEL_WIDTH,
+                                          WINXTERM_INITIAL_PIXEL_HEIGHT,
+                                          1u);
+    winxterm_smoke_expect(state,
+                          scale_one_cells.columns == 80 && scale_one_cells.rows == 24,
+                          "scale-1 capacity should preserve initial 80x24 grid");
+    WinxtermCellSize scale_two_cells =
+        winxterm_physical_pixels_to_cells(WINXTERM_INITIAL_PIXEL_WIDTH * 2,
+                                          WINXTERM_INITIAL_PIXEL_HEIGHT * 2,
+                                          2u);
+    winxterm_smoke_expect(state,
+                          scale_two_cells.columns == 80 && scale_two_cells.rows == 24,
+                          "scale-2 capacity should preserve doubled 80x24 grid");
+    WinxtermCellSize half_scale_two_cells =
+        winxterm_physical_pixels_to_cells(WINXTERM_INITIAL_PIXEL_WIDTH,
+                                          WINXTERM_INITIAL_PIXEL_HEIGHT,
+                                          2u);
+    winxterm_smoke_expect(state,
+                          half_scale_two_cells.columns == 40 && half_scale_two_cells.rows == 12,
+                          "scale-2 capacity should halve fixed physical client capacity");
+}
+
+static void winxterm_smoke_test_font_contract(WinxtermSmokeState *state)
+{
+    winxterm_smoke_expect(state, winxterm_font_6x13.width == 6, "font width contract must be 6");
+    winxterm_smoke_expect(state, winxterm_font_6x13.height == 13, "font height contract must be 13");
+    winxterm_smoke_expect(state, WINXTERM_FONT_6X13_SOURCE_GLYPH_COUNT == 256u, "source font glyph slots must be 256");
+    winxterm_smoke_expect(state, winxterm_font_6x13.glyph_count == 257, "font glyph count must include fallback");
+    winxterm_smoke_expect(state,
+                          WINXTERM_FONT_6X13_GLYPH_DATA_AVAILABLE == 1,
+                          "Phase 2 must embed generated glyph data");
+    winxterm_smoke_expect(state,
+                          winxterm_font_6x13_rows[WINXTERM_FONT_6X13_FALLBACK_GLYPH_INDEX][0].foreground_mask == 0x3fu,
+                          "fallback glyph top row must be a full rectangle edge");
+    winxterm_smoke_expect(state,
+                          winxterm_font_6x13_rows[WINXTERM_FONT_6X13_FALLBACK_GLYPH_INDEX][12].foreground_mask == 0x3fu,
+                          "fallback glyph bottom row must be a full rectangle edge");
+    winxterm_smoke_expect(state,
+                          winxterm_font_6x13_rows[WINXTERM_FONT_6X13_FALLBACK_GLYPH_INDEX][1].foreground_mask == 0x21u,
+                          "fallback glyph side row must include rectangle edges");
+}
+
+static void winxterm_smoke_test_log_names(WinxtermSmokeState *state)
+{
+    wchar_t filename[64];
+    bool ok = winxterm_log_format_filename(1234u, filename, 64);
+    winxterm_smoke_expect(state, ok, "log filename formatting should succeed");
+    winxterm_smoke_expect(state,
+                          wcscmp(filename, L"winxterm-debug-1234.txt") == 0,
+                          "log filename must include PID");
+
+    wchar_t tiny[4];
+    winxterm_smoke_expect(state,
+                          !winxterm_log_format_filename(1234u, tiny, 4),
+                          "log filename formatting should reject tiny buffers");
+}
+
+static void winxterm_smoke_test_window_placement(WinxtermSmokeState *state)
+{
+    WinxtermWindowPlacementSaved saved;
+    memset(&saved, 0, sizeof(saved));
+    wcscpy_s(saved.monitor_name, CCHDEVICENAME, L"\\\\.\\DISPLAY1");
+    saved.left = 40;
+    saved.top = 50;
+
+    char text[512];
+    WinxtermWindowPlacementSaved parsed;
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_format_state(&saved, text, sizeof(text)),
+                          "window placement state should format");
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_parse_state(text, &parsed),
+                          "window placement state should parse");
+    winxterm_smoke_expect(state,
+                          wcscmp(parsed.monitor_name, saved.monitor_name) == 0 &&
+                              parsed.left == saved.left &&
+                              parsed.top == saved.top,
+                          "window placement state should round trip position only");
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_parse_state(
+                              "winxterm-window-placement-v2\r\n"
+                              "monitor=\\\\.\\DISPLAY2\r\n"
+                              "left=1\r\n"
+                              "top=2\r\n",
+                              &parsed),
+                          "window placement parser should accept CRLF");
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_parse_state(
+                              "winxterm-window-placement-v1\n"
+                              "monitor=\\\\.\\DISPLAY1\n"
+                              "left=0\n"
+                              "top=0\n"
+                              "width=0\n"
+                              "height=480\n",
+                              &parsed),
+                          "window placement parser should ignore obsolete saved dimensions");
+
+    WinxtermWindowPlacementMonitorScore score;
+    memset(&score, 0, sizeof(score));
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_monitor_penalty(&score) == 0,
+                          "empty monitor placement score should have no penalty");
+    score.has_foreground_maximized_instance = true;
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_monitor_penalty(&score) > 0,
+                          "foreground maximized window should penalize a monitor");
+    int maximized_penalty = winxterm_window_placement_monitor_penalty(&score);
+    score.has_fullscreen_instance = true;
+    winxterm_smoke_expect(state,
+                          winxterm_window_placement_monitor_penalty(&score) > maximized_penalty,
+                          "fullscreen window should penalize a monitor more than maximized");
+
+    RECT monitor = {100, 200, 2020, 1280};
+    RECT existing = {500, 600, 900, 1000};
+    RECT cascaded = winxterm_window_placement_cascade_rect(&monitor, &existing, 640, 480);
+    winxterm_smoke_expect(state,
+                          cascaded.left == 650 &&
+                              cascaded.top == 675 &&
+                              cascaded.right == 1290 &&
+                              cascaded.bottom == 1155,
+                          "window placement cascade should use screen-local offset");
+    RECT edge_existing = {1600, 900, 1900, 1200};
+    RECT edge_cascaded =
+        winxterm_window_placement_cascade_rect(&monitor, &edge_existing, 640, 480);
+    winxterm_smoke_expect(state,
+                          edge_cascaded.left == monitor.right - 640 &&
+                              edge_cascaded.top == monitor.bottom - 480 &&
+                              edge_cascaded.right == monitor.right &&
+                              edge_cascaded.bottom == monitor.bottom,
+                          "window placement cascade should clamp to the visible edge");
+
+    RECT from_local = winxterm_window_placement_rect_from_local(&monitor, 40, 50, 640, 480);
+    winxterm_smoke_expect(state,
+                          from_local.left == 140 &&
+                              from_local.top == 250 &&
+                              from_local.right == 780 &&
+                              from_local.bottom == 730 &&
+                              winxterm_window_placement_rect_fits_monitor(&from_local, &monitor),
+                          "window placement local rect should convert to virtual coordinates");
+    RECT offscreen = winxterm_window_placement_rect_from_local(&monitor, 1500, 50, 640, 480);
+    winxterm_smoke_expect(state,
+                          !winxterm_window_placement_rect_fits_monitor(&offscreen, &monitor),
+                          "window placement saved rect should be rejected when outside monitor");
+    RECT clamped =
+        winxterm_window_placement_clamp_rect_to_visible_area(&monitor, &offscreen);
+    winxterm_smoke_expect(state,
+                          clamped.left == monitor.right - 640 &&
+                              clamped.top == offscreen.top &&
+                              clamped.right == monitor.right &&
+                              clamped.bottom == offscreen.bottom &&
+                              winxterm_window_placement_rect_fits_monitor(&clamped, &monitor),
+                          "window placement saved rect should clamp inside visible area");
+    RECT oversized = winxterm_window_placement_rect_from_local(&monitor, -20, -30, 3000, 2000);
+    RECT clamped_oversized =
+        winxterm_window_placement_clamp_rect_to_visible_area(&monitor, &oversized);
+    winxterm_smoke_expect(state,
+                          clamped_oversized.left == monitor.left &&
+                              clamped_oversized.top == monitor.top &&
+                              clamped_oversized.right == monitor.right &&
+                              clamped_oversized.bottom == monitor.bottom,
+                          "window placement oversized rect should shrink to visible area");
+
+    RECT centered = winxterm_window_placement_center_rect(&monitor, 800, 600);
+    winxterm_smoke_expect(state,
+                          centered.left == 660 &&
+                              centered.top == 440 &&
+                              centered.right == 1460 &&
+                              centered.bottom == 1040,
+                          "window placement center fallback should center on the monitor");
+}
+
+static void winxterm_smoke_test_grouped_u64_format(WinxtermSmokeState *state)
+{
+    wchar_t grouped[WINXTERM_DIAG_GROUPED_U64_CAPACITY];
+    winxterm_smoke_expect(state,
+                          winxterm_diag_format_grouped_u64(0u,
+                                                            grouped,
+                                                            WINXTERM_DIAG_GROUPED_U64_CAPACITY) &&
+                              wcscmp(grouped, L"0") == 0,
+                          "grouped uint64 formatter should format zero");
+    winxterm_smoke_expect(state,
+                          winxterm_diag_format_grouped_u64(100000000000ull,
+                                                            grouped,
+                                                            WINXTERM_DIAG_GROUPED_U64_CAPACITY) &&
+                              wcscmp(grouped, L"100 000 000 000") == 0,
+                          "grouped uint64 formatter should use space thousands separators");
+    winxterm_smoke_expect(state,
+                          winxterm_diag_format_grouped_u64(UINT64_MAX,
+                                                            grouped,
+                                                            WINXTERM_DIAG_GROUPED_U64_CAPACITY) &&
+                              wcscmp(grouped, L"18 446 744 073 709 551 615") == 0,
+                          "grouped uint64 formatter should handle uint64 max");
+}
+
+static void winxterm_smoke_test_options(WinxtermSmokeState *state)
+{
+    const wchar_t *smoke_argv[] = {L"winxterm.exe", L"--smoke"};
+    WinxtermOptions options;
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(2, smoke_argv, &options) == 0,
+                          "option parser should accept --smoke");
+    winxterm_smoke_expect(state, options.smoke, "option parser should set smoke flag");
+    winxterm_smoke_expect(state, !options.help, "option parser should leave help false");
+    winxterm_smoke_expect(state,
+                          options.unpainted_line_limit == WINXTERM_DEFAULT_UNPAINTED_LINE_LIMIT,
+                          "option parser should set default unpainted line limit");
+    winxterm_smoke_expect(state,
+                          options.render_backend == WINXTERM_DEFAULT_RENDER_BACKEND,
+                          "option parser should set profiled default renderer");
+    winxterm_smoke_expect(state,
+                          options.display_scale == WINXTERM_DEFAULT_DISPLAY_SCALE,
+                          "option parser should set default display scale");
+    winxterm_smoke_expect(state,
+                          options.render_thread_count >= 1u &&
+                              options.render_thread_count <= WINXTERM_MAX_RENDER_THREADS,
+                          "option parser should default render threads to available hardware capacity");
+
+    const wchar_t *demo_argv[] = {L"winxterm.exe", L"--demo"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(2, demo_argv, &options) == 0,
+                          "option parser should accept --demo");
+    winxterm_smoke_expect(state, options.demo, "option parser should set demo flag");
+
+    const wchar_t *bench_argv[] = {L"winxterm.exe", L"--glyphbench"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(2, bench_argv, &options) == 0,
+                          "option parser should accept --glyphbench");
+    winxterm_smoke_expect(state, options.glyphbench, "option parser should set glyphbench flag");
+
+    const wchar_t *macro_argv[] = {L"winxterm.exe", L"--macro", L"boot.macro"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, macro_argv, &options) == 0 &&
+                              options.macro_path != 0 &&
+                              wcscmp(options.macro_path, L"boot.macro") == 0,
+                          "option parser should accept startup macro path");
+
+    const wchar_t *macro_help_argv[] = {L"winxterm.exe", L"--help", L"macro"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, macro_help_argv, &options) == 0 &&
+                              options.help &&
+                              options.help_topic != 0 &&
+                              wcscmp(options.help_topic, L"macro") == 0 &&
+                              options.client_argc == 0,
+                          "option parser should accept macro help topic");
+
+    const wchar_t *render_argv[] = {L"winxterm.exe",
+                                    L"--rendermethod",
+                                    L"row-masks",
+                                    L"--unpaintedlines",
+                                    L"42"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(5, render_argv, &options) == 0,
+                          "option parser should accept renderer and backlog options");
+    winxterm_smoke_expect(state,
+                          options.render_backend_set &&
+                              options.render_backend == WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                          "option parser should select row-mask renderer");
+    winxterm_smoke_expect(state,
+                          options.unpainted_line_limit == 42u,
+                          "option parser should set custom unpainted line limit");
+
+    const wchar_t *thread_argv[] = {L"winxterm.exe", L"--ncputhreads", L"2"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, thread_argv, &options) == 0 &&
+                              options.render_thread_count == 2u,
+                          "option parser should accept render thread count");
+
+    const wchar_t *all_render_argv[] = {L"winxterm.exe", L"--rendermethod", L"all"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, all_render_argv, &options) == 0,
+                          "option parser should accept all renderer mode");
+    winxterm_smoke_expect(state, options.render_backend_all, "option parser should set all renderer mode");
+
+    const wchar_t *scale_argv[] = {L"winxterm.exe", L"-x", L"2"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, scale_argv, &options) == 0 &&
+                              options.display_scale == 2u,
+                          "option parser should accept display scale");
+
+    const wchar_t *client_argv[] = {L"winxterm.exe", L"cmd.exe", L"/c", L"echo", L"hello"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(5, client_argv, &options) == 0,
+                          "option parser should accept positional client commands");
+    winxterm_smoke_expect(state, options.client_arg_start == 1, "client command should start at first positional arg");
+    winxterm_smoke_expect(state, options.client_argc == 4, "client command should preserve remaining args");
+
+    const wchar_t *bad_argv[] = {L"winxterm.exe", L"--unknown"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(2, bad_argv, &options) != 0,
+                          "option parser should reject unknown options");
+
+    const wchar_t *bad_integer_argv[] = {L"winxterm.exe", L"--unpaintedlines", L"0"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, bad_integer_argv, &options) != 0,
+                          "option parser should reject non-positive unpainted line limits");
+
+    const wchar_t *missing_scale_argv[] = {L"winxterm.exe", L"-x"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(2, missing_scale_argv, &options) != 0,
+                          "option parser should reject missing display scale");
+
+    const wchar_t *zero_scale_argv[] = {L"winxterm.exe", L"-x", L"0"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, zero_scale_argv, &options) != 0,
+                          "option parser should reject zero display scale");
+
+    const wchar_t *large_scale_argv[] = {L"winxterm.exe", L"-x", L"101"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, large_scale_argv, &options) != 0,
+                          "option parser should reject too-large display scale");
+
+    const wchar_t *bad_scale_argv[] = {L"winxterm.exe", L"-x", L"abc"};
+    winxterm_smoke_expect(state,
+                          winxterm_options_parse(3, bad_scale_argv, &options) != 0,
+                          "option parser should reject non-integer display scale");
+}
+
+static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
+{
+    WinxtermBridge bridge;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_init(&bridge, 0, WINXTERM_TERMINAL_COLUMNS, WINXTERM_TERMINAL_ROWS),
+                          "bridge should initialize for hardening tests");
+    if (bridge.input_buffer == 0) {
+        return;
+    }
+
+    static const uint8_t control_query[] = "\x1b]9001;winxterm;v=1;id=7;cmd=query\a";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge,
+                                                        control_query,
+                                                        sizeof(control_query) - 1u),
+                          "bridge should enqueue winxterm OSC control query");
+    bool control_content_changed = false;
+    bool control_more_pending = false;
+    bool control_presentation_changed = false;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                       WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                       &control_content_changed,
+                                                       &control_more_pending,
+                                                       &control_presentation_changed),
+                          "bridge should dispatch winxterm OSC control query");
+    uint8_t reply[256];
+    size_t reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    static const char expected_reply[] = "id=7;status=ok";
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, expected_reply),
+                          "winxterm OSC query should queue an acknowledgement");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "set-bell") &&
+                              !winxterm_bridge_bell_enabled(&bridge),
+                          "winxterm OSC query should advertise bell control and default off");
+    winxterm_bridge_clear_input(&bridge);
+
+    size_t large_count = WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY + 1024u;
+    uint8_t *large = (uint8_t *)malloc(large_count);
+    winxterm_smoke_expect(state, large != 0, "bridge hardening large input buffer should allocate");
+    if (large != 0) {
+        for (size_t i = 0; i < large_count; ++i) {
+            large[i] = (uint8_t)(i & 0xffu);
+        }
+        winxterm_smoke_expect(state,
+                              winxterm_bridge_queue_input(&bridge, large, large_count),
+                              "elastic input queue should grow for large enqueue");
+        WinxtermBridgeDiagnostics diagnostics;
+        winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+        winxterm_smoke_expect(state,
+                              diagnostics.input_capacity >= large_count &&
+                                  diagnostics.input_grow_count >= 1u &&
+                                  diagnostics.input_high_water == large_count,
+                              "elastic input queue diagnostics should record growth and high water");
+
+        uint8_t readback[64];
+        size_t copied = winxterm_bridge_read_input(&bridge, readback, sizeof(readback));
+        winxterm_smoke_expect(state, copied == sizeof(readback), "bridge input read should copy requested bytes");
+        winxterm_smoke_expect(state,
+                              memcmp(readback, large, sizeof(readback)) == 0,
+                              "elastic input queue should preserve FIFO order after growth");
+        winxterm_bridge_clear_input(&bridge);
+        free(large);
+    }
+
+    uint8_t one = 0x5au;
+    winxterm_smoke_expect(state,
+                          !winxterm_bridge_queue_input(&bridge,
+                                                       &one,
+                                                       WINXTERM_BRIDGE_INPUT_MAX_CAPACITY + 1u),
+                          "elastic input queue should reject over-cap enqueue atomically");
+    WinxtermBridgeDiagnostics diagnostics;
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.input_count == 0u && diagnostics.input_enqueue_failures >= 1u,
+                          "over-cap enqueue should leave queue empty and record failure");
+
+    static const uint8_t queued_output[] = "queued output\n";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge,
+                                                         queued_output,
+                                                         sizeof(queued_output) - 1u),
+                          "bridge should enqueue terminal output without parsing it immediately");
+    winxterm_smoke_expect(state,
+                          !winxterm_smoke_screen_contains_text(&bridge.screen, "queued"),
+                          "queued output should not mutate screen before commit");
+    winxterm_smoke_expect(state,
+                          (winxterm_bridge_take_frame_request(&bridge) & WINXTERM_FRAME_CAUSE_CONTENT) != 0u,
+                          "queued output should request a content frame");
+    bool content_changed = false;
+    bool more_pending = false;
+    bool presentation_changed = false;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit queued terminal output");
+    winxterm_smoke_expect(state,
+                          content_changed && !more_pending && !presentation_changed,
+                          "plain queued output should commit as content only");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_screen_contains_text(&bridge.screen, "queued output"),
+                          "committed queued output should mutate screen");
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.output_queue_high_water >= sizeof(queued_output) - 1u,
+                          "output queue diagnostics should record high water");
+
+    WinxtermBridge fast_bridge;
+    memset(&fast_bridge, 0, sizeof(fast_bridge));
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_init(&fast_bridge, 0, 12, 3),
+                          "fast-output bridge should initialize");
+    if (fast_bridge.output_buffer != 0) {
+        char fast_output[128];
+        size_t fast_offset = 0u;
+        for (int line = 0; line < 8; ++line) {
+            int written = sprintf_s(fast_output + fast_offset,
+                                    sizeof(fast_output) - fast_offset,
+                                    "fast%02d\n",
+                                    line);
+            if (written <= 0) {
+                break;
+            }
+            fast_offset += (size_t)written;
+        }
+        winxterm_smoke_expect(state,
+                              winxterm_bridge_enqueue_output(&fast_bridge,
+                                                             (const uint8_t *)fast_output,
+                                                             fast_offset),
+                              "fast output should enqueue before model commit");
+        content_changed = false;
+        more_pending = true;
+        presentation_changed = true;
+        winxterm_smoke_expect(state,
+                              winxterm_bridge_commit_output(&fast_bridge,
+                                                            0u,
+                                                            &content_changed,
+                                                            &more_pending,
+                                                            &presentation_changed),
+                              "fast output should commit into the model without rendering");
+        WinxtermScreenRowView fast_row;
+        memset(&fast_row, 0, sizeof(fast_row));
+        winxterm_smoke_expect(state,
+                              content_changed &&
+                                  !more_pending &&
+                                  !presentation_changed &&
+                                  fast_bridge.screen.scrollback_count >= 6u &&
+                                  winxterm_screen_get_primary_view_row(&fast_bridge.screen, 0u, &fast_row) &&
+                                  winxterm_smoke_row_view_contains_text(&fast_row, "fast00") &&
+                                  winxterm_screen_get_primary_view_row(&fast_bridge.screen, 5u, &fast_row) &&
+                                  winxterm_smoke_row_view_contains_text(&fast_row, "fast05"),
+                              "fast committed output should preserve scrolled rows in scrollback before any render");
+    }
+    winxterm_bridge_dispose(&fast_bridge);
+
+    static const uint8_t queue_byte[] = "Q";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, queue_byte, sizeof(queue_byte) - 1u),
+                          "output room test should enqueue one byte");
+    HANDLE queue_shutdown_event = CreateEventW(0, TRUE, TRUE, 0);
+    winxterm_smoke_expect(state,
+                          queue_shutdown_event != 0,
+                          "output room shutdown event should initialize");
+    if (queue_shutdown_event != 0) {
+        winxterm_smoke_expect(state,
+                              !winxterm_bridge_wait_for_output_room(&bridge,
+                                                                    WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY,
+                                                                    queue_shutdown_event),
+                              "output room wait should stop when shutdown is signaled");
+        CloseHandle(queue_shutdown_event);
+    }
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        1u,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "committing output should release output queue room");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_wait_for_output_room(&bridge,
+                                                              WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY,
+                                                              0),
+                          "drained output queue should have room for another full batch");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output_wait(&bridge,
+                                                             queue_byte,
+                                                             sizeof(queue_byte) - 1u,
+                                                             0),
+                          "shutdown-aware output enqueue should succeed when room is available");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "shutdown-aware output enqueue should remain commit-ready");
+
+    winxterm_bridge_set_output_paused(&bridge, true);
+    static const uint8_t paused_output[] = "paused output\n";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge,
+                                                         paused_output,
+                                                         sizeof(paused_output) - 1u),
+                          "bridge should accept output while output commit is paused");
+    content_changed = true;
+    more_pending = true;
+    presentation_changed = true;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "paused output commit should be a no-op, not a failure");
+    winxterm_smoke_expect(state,
+                          !content_changed && !more_pending && !presentation_changed,
+                          "paused output should not be reported as committed or repeatedly pending");
+    winxterm_bridge_set_output_paused(&bridge, false);
+    winxterm_smoke_expect(state,
+                          (winxterm_bridge_take_frame_request(&bridge) & WINXTERM_FRAME_CAUSE_CONTENT) != 0u,
+                          "unpausing queued output should request a content frame");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed) &&
+                              content_changed,
+                          "unpaused queued output should commit");
+
+    static const uint8_t title_bell[] = "\x1b]0;smoke-title\x07\x07";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, title_bell, sizeof(title_bell) - 1u),
+                          "bridge should enqueue presentation output");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit presentation output");
+    winxterm_smoke_expect(state,
+                          presentation_changed &&
+                              strcmp(bridge.terminal_title, "smoke-title") == 0 &&
+                              !winxterm_bridge_take_bell(&bridge),
+                          "title should update and bell should stay suppressed by default");
+
+    static const uint8_t bell_on[] = "\x1b]9001;winxterm;v=1;id=8;cmd=set-bell;value=on\a\x07";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, bell_on, sizeof(bell_on) - 1u),
+                          "bridge should enqueue set-bell on control");
+    presentation_changed = false;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit set-bell on control");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=8;status=ok") &&
+                              winxterm_bridge_bell_enabled(&bridge) &&
+                              presentation_changed &&
+                              winxterm_bridge_take_bell(&bridge),
+                          "set-bell on should allow a following BEL to blink");
+    winxterm_bridge_clear_input(&bridge);
+
+    static const uint8_t bell_off[] = "\x1b]9001;winxterm;v=1;id=9;cmd=set-bell;value=off\a\x07";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, bell_off, sizeof(bell_off) - 1u),
+                          "bridge should enqueue set-bell off control");
+    presentation_changed = true;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit set-bell off control");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=9;status=ok") &&
+                              !winxterm_bridge_bell_enabled(&bridge) &&
+                              !winxterm_bridge_take_bell(&bridge),
+                          "set-bell off should suppress a following BEL");
+    winxterm_bridge_clear_input(&bridge);
+
+    winxterm_bridge_set_unpainted_line_limit(&bridge, 1u);
+    WinxtermUtf8Decoder budget_decoder;
+    winxterm_utf8_decoder_init(&budget_decoder);
+    static const uint8_t budget_first[] = "budget one\n";
+    winxterm_smoke_expect(state,
+                          winxterm_client_write_bytes_with_policy(&bridge,
+                                                                  &budget_decoder,
+                                                                  budget_first,
+                                                                  sizeof(budget_first) - 1u,
+                                                                  0,
+                                                                  true),
+                          "client write should wait for available unpainted budget");
+    winxterm_smoke_expect(state,
+                          bridge.unpainted_lines == 1u,
+                          "client write should count queued unpainted output lines");
+    HANDLE blocked_budget_event = CreateEventW(0, TRUE, TRUE, 0);
+    winxterm_smoke_expect(state,
+                          blocked_budget_event != 0,
+                          "budget smoke shutdown event should initialize");
+    static const uint8_t budget_blocked[] = "budget blocked\n";
+    size_t output_before_blocked_write = bridge.output_count;
+    if (blocked_budget_event != 0) {
+        winxterm_smoke_expect(state,
+                              !winxterm_client_write_bytes_with_policy(&bridge,
+                                                                       &budget_decoder,
+                                                                       budget_blocked,
+                                                                       sizeof(budget_blocked) - 1u,
+                                                                       blocked_budget_event,
+                                                                       true),
+                              "client write should stop waiting when shutdown is signaled");
+        CloseHandle(blocked_budget_event);
+    }
+    winxterm_smoke_expect(state,
+                          bridge.output_count == output_before_blocked_write,
+                          "budget-blocked client write should not enqueue output");
+    winxterm_bridge_mark_painted(&bridge);
+    winxterm_smoke_expect(state,
+                          bridge.unpainted_lines == 0u,
+                          "mark painted should release unpainted budget");
+    static const uint8_t budget_second[] = "budget two\n";
+    winxterm_smoke_expect(state,
+                          winxterm_client_write_bytes_with_policy(&bridge,
+                                                                  &budget_decoder,
+                                                                  budget_second,
+                                                                  sizeof(budget_second) - 1u,
+                                                                  0,
+                                                                  true),
+                          "client write should resume after painted budget release");
+    winxterm_smoke_expect(state,
+                          bridge.unpainted_lines == 1u,
+                          "resumed client write should count new unpainted line");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        0u,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed) &&
+                              content_changed &&
+                              !more_pending,
+                          "budget smoke output should drain after budget checks");
+    winxterm_bridge_mark_painted(&bridge);
+
+    static const uint8_t split_output[] = "first line\nsecond line\n";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge,
+                                                         split_output,
+                                                         sizeof(split_output) - 1u),
+                          "bridge should enqueue split render output");
+    content_changed = false;
+    more_pending = false;
+    presentation_changed = false;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        6u,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed) &&
+                              content_changed &&
+                              more_pending,
+                          "partial output commit should report pending text before render");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        0u,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed) &&
+                              content_changed &&
+                              !more_pending &&
+                              winxterm_smoke_screen_contains_text(&bridge.screen, "second line"),
+                          "remaining split output should commit before final render");
+
+    winxterm_bridge_resize_terminal(&bridge, 100, 30);
+    winxterm_bridge_resize_terminal(&bridge, 101, 31);
+    int columns = 0;
+    int rows = 0;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_peek_pending_resize(&bridge, &columns, &rows) &&
+                              columns == 101 &&
+                              rows == 31,
+                          "bridge should peek coalesced pending resize");
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.resize_request_count == 2u &&
+                              diagnostics.resize_coalesced_count == 1u &&
+                              diagnostics.resize_taken_count == 1u &&
+                              diagnostics.resize_applied_count == 0u,
+                          "resize diagnostics should record peeked but unapplied resize");
+    columns = 0;
+    rows = 0;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_peek_pending_resize(&bridge, &columns, &rows) &&
+                              columns == 101 &&
+                              rows == 31,
+                          "unacknowledged pending resize should remain available");
+    winxterm_bridge_resize_terminal(&bridge, 102, 32);
+    winxterm_smoke_expect(state,
+                          !winxterm_bridge_ack_pending_resize(&bridge, 101, 31),
+                          "older resize ack should not clear newer pending resize");
+    columns = 0;
+    rows = 0;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_peek_pending_resize(&bridge, &columns, &rows) &&
+                              columns == 102 &&
+                              rows == 32,
+                          "newer pending resize should survive older ack");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_ack_pending_resize(&bridge, 102, 32),
+                          "matching resize ack should clear pending resize");
+    winxterm_smoke_expect(state,
+                          !winxterm_bridge_peek_pending_resize(&bridge, &columns, &rows),
+                          "acked resize should exhaust pending resize");
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.resize_request_count == 3u &&
+                              diagnostics.resize_coalesced_count == 2u &&
+                              diagnostics.resize_taken_count == 3u &&
+                              diagnostics.resize_applied_count == 2u,
+                          "resize diagnostics should record ack-based coalescing");
+
+    winxterm_bridge_request_display_scale(&bridge, 2u);
+    winxterm_bridge_request_display_scale(&bridge, 3u);
+    unsigned int display_scale = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_take_pending_display_scale(&bridge, &display_scale) &&
+                              display_scale == 3u &&
+                              !winxterm_bridge_take_pending_display_scale(&bridge, &display_scale),
+                          "bridge should return coalesced pending display scale");
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.scale_request_count == 2u &&
+                              diagnostics.scale_coalesced_count == 1u &&
+                              diagnostics.scale_taken_count == 1u,
+                          "scale diagnostics should record latest-scale coalescing");
+
+    winxterm_bridge_set_host_starting(&bridge);
+    winxterm_bridge_set_host_child(&bridge, 1234u, L"child.exe");
+    WinxtermHostChildInfo child;
+    memset(&child, 0, sizeof(child));
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_copy_child_info(&bridge, &child) &&
+                              child.running &&
+                              child.process_id == 1234u &&
+                              wcscmp(child.display_name, L"child.exe") == 0,
+                          "bridge should copy direct child close-dialog info");
+    winxterm_bridge_request_headless(&bridge);
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_is_headless(&bridge),
+                          "bridge should enter headless mode");
+    static const uint8_t headless_output[] = "one\ntwo\n";
+    winxterm_bridge_note_headless_output(&bridge,
+                                         headless_output,
+                                         sizeof(headless_output) - 1u);
+    winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
+    winxterm_smoke_expect(state,
+                          diagnostics.headless_output_bytes == sizeof(headless_output) - 1u &&
+                              diagnostics.headless_output_lines == 2u,
+                          "headless diagnostics should count drained output");
+    uint8_t *transcript = 0;
+    size_t transcript_count = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_copy_transcript(&bridge, &transcript, &transcript_count),
+                          "bridge should copy raw output transcript");
+    winxterm_smoke_expect(state,
+                          transcript != 0 &&
+                              transcript_count >= sizeof(headless_output) - 1u &&
+                              memcmp(transcript + transcript_count - (sizeof(headless_output) - 1u),
+                                     headless_output,
+                                     sizeof(headless_output) - 1u) == 0,
+                          "raw output transcript should preserve latest headless bytes");
+    free(transcript);
+    winxterm_bridge_request_terminate(&bridge);
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_terminate_requested(&bridge),
+                          "bridge should record terminate request");
+
+    winxterm_bridge_dispose(&bridge);
+}
+
+static bool winxterm_smoke_join_path(const wchar_t *directory,
+                                     const wchar_t *name,
+                                     wchar_t *out,
+                                     size_t out_count)
+{
+    if (directory == 0 || name == 0 || out == 0 || out_count == 0u) {
+        return false;
+    }
+    int written = _snwprintf_s(out, out_count, _TRUNCATE, L"%ls\\%ls", directory, name);
+    return written >= 0;
+}
+
+static bool winxterm_smoke_write_file(const wchar_t *path, const char *text)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    DWORD byte_count = text != 0 ? (DWORD)strlen(text) : 0u;
+    BOOL ok = WriteFile(file, text, byte_count, &written, 0);
+    CloseHandle(file);
+    return ok != 0 && written == byte_count;
+}
+
+static bool winxterm_smoke_path_exists(const wchar_t *path)
+{
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void winxterm_smoke_remove_tree(const wchar_t *path)
+{
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0u) {
+        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(path);
+        return;
+    }
+    wchar_t pattern[WINXTERM_SMOKE_PATH_CAPACITY];
+    if (!winxterm_smoke_join_path(path, L"*", pattern, WINXTERM_SMOKE_PATH_CAPACITY)) {
+        return;
+    }
+    WIN32_FIND_DATAW data;
+    HANDLE find = FindFirstFileW(pattern, &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+                continue;
+            }
+            wchar_t child[WINXTERM_SMOKE_PATH_CAPACITY];
+            if (winxterm_smoke_join_path(path, data.cFileName, child, WINXTERM_SMOKE_PATH_CAPACITY)) {
+                winxterm_smoke_remove_tree(child);
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    RemoveDirectoryW(path);
+}
+
+static bool winxterm_smoke_make_temp_dir(wchar_t *path, size_t path_count)
+{
+    wchar_t temp_path[WINXTERM_SMOKE_PATH_CAPACITY];
+    DWORD temp_length = GetTempPathW(WINXTERM_SMOKE_PATH_CAPACITY, temp_path);
+    if (temp_length == 0u || temp_length >= WINXTERM_SMOKE_PATH_CAPACITY) {
+        return false;
+    }
+    wchar_t temp_file[WINXTERM_SMOKE_PATH_CAPACITY];
+    if (GetTempFileNameW(temp_path, L"wxt", 0, temp_file) == 0u) {
+        return false;
+    }
+    DeleteFileW(temp_file);
+    if (!CreateDirectoryW(temp_file, 0)) {
+        return false;
+    }
+    wcsncpy_s(path, path_count, temp_file, _TRUNCATE);
+    return true;
+}
+
+static void winxterm_smoke_test_screen_and_text(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "screen should initialize");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_map_codepoint_to_glyph(0x41u) == 0x41u,
+                          "Latin-1 codepoint should map directly");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_map_codepoint_to_glyph(0x20acu) == WINXTERM_DYNAMIC_GLYPH_INDEX,
+                          "non-Latin-1 codepoint should map to dynamic glyph rendering");
+
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    const uint8_t bytes[] = {'a', 'b', '\r', 'c', '\n', 0xe2u, 0x82u, 0xacu};
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen, &decoder, bytes, sizeof(bytes)),
+                          "UTF-8 text should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'c' &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->codepoint == (uint32_t)'b',
+                          "carriage return should overwrite the current grid row");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 1, 0)->glyph_index == WINXTERM_DYNAMIC_GLYPH_INDEX,
+                          "UTF-8 non-Latin-1 output should use dynamic glyph rendering");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_smoke_expect(state, screen.cursor_row == 0 && screen.cursor_col == 0, "clear should reset cursor");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)' ',
+                          "clear should blank the active grid");
+
+    winxterm_utf8_decoder_init(&decoder);
+    static const char sgr_bytes[] = "\x1b[40mA\x1b[42mB\x1b[44mC\x1b[41mD\x1b[48;5;196mE\x1b[48;2;1;2;3mF";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)sgr_bytes,
+                                                   sizeof(sgr_bytes) - 1u),
+                          "SGR background colors should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->background_rgb == 0x00000000u &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->background_rgb == 0x00008000u &&
+                              winxterm_screen_cell_at(&screen, 0, 2)->background_rgb == 0x00000080u &&
+                              winxterm_screen_cell_at(&screen, 0, 3)->background_rgb == 0x00800000u &&
+                              winxterm_screen_cell_at(&screen, 0, 4)->background_rgb == 0x00ff0000u &&
+                              winxterm_screen_cell_at(&screen, 0, 5)->background_rgb == 0x00010203u,
+                          "SGR background colors should become grid cell attributes");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char visual_sgr[] =
+        "\x1b[1;3;4;7;9;53mA"
+        "\x1b[22;23;24;27;29;55mB"
+        "\x1b[31m\x1b[#{" "\x1b[32mC" "\x1b[#}D";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)visual_sgr,
+                                                   sizeof(visual_sgr) - 1u),
+                          "extended SGR attributes should feed into screen");
+    uint32_t a_flags = winxterm_screen_cell_at(&screen, 0, 0)->attribute_flags;
+    winxterm_smoke_expect(state,
+                          (a_flags & (WINXTERM_SCREEN_CELL_BOLD |
+                                      WINXTERM_SCREEN_CELL_ITALIC |
+                                      WINXTERM_SCREEN_CELL_UNDERLINE |
+                                      WINXTERM_SCREEN_CELL_INVERSE |
+                                      WINXTERM_SCREEN_CELL_CROSSED_OUT |
+                                      WINXTERM_SCREEN_CELL_OVERLINE)) ==
+                              (WINXTERM_SCREEN_CELL_BOLD |
+                               WINXTERM_SCREEN_CELL_ITALIC |
+                               WINXTERM_SCREEN_CELL_UNDERLINE |
+                               WINXTERM_SCREEN_CELL_INVERSE |
+                               WINXTERM_SCREEN_CELL_CROSSED_OUT |
+                               WINXTERM_SCREEN_CELL_OVERLINE),
+                          "SGR visual flags should be stored on cells");
+    winxterm_smoke_expect(state,
+                          (winxterm_screen_cell_at(&screen, 0, 1)->attribute_flags &
+                           WINXTERM_SCREEN_CELL_VISUAL_MASK) == 0u,
+                          "SGR reset submodes should clear visual flags");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 2)->foreground_palette_index == 2u &&
+                              winxterm_screen_cell_at(&screen, 0, 3)->foreground_palette_index == 1u,
+                          "SGR push/pop should restore indexed foreground state");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char palette_bytes[] =
+        "\x1b]4;1;#112233\x07"
+        "\x1b[31mA"
+        "\x1b]10;#010203\x07"
+        "\x1b[39mB";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)palette_bytes,
+                                                   sizeof(palette_bytes) - 1u),
+                          "OSC palette/default colors should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->foreground_rgb == 0x00112233u &&
+                              (winxterm_screen_cell_at(&screen, 0, 0)->color_flags &
+                               WINXTERM_SCREEN_COLOR_FOREGROUND_INDEXED) != 0u,
+                          "OSC 4 should mutate indexed foreground colors for future cells");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 1)->foreground_rgb == 0x00010203u &&
+                              (winxterm_screen_cell_at(&screen, 0, 1)->color_flags &
+                               WINXTERM_SCREEN_COLOR_FOREGROUND_DEFAULT) != 0u,
+                          "OSC 10 should mutate default foreground for future default cells");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const uint8_t unicode_bytes[] = {'A', 0xccu, 0x81u, 0xe4u, 0xb8u, 0xadu, 'B'};
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen, &decoder, unicode_bytes, sizeof(unicode_bytes)),
+                          "combining and Unicode fallback should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->combining_count == 1u &&
+                              winxterm_screen_cell_at(&screen, 0, 0)->combining_codepoints[0] == 0x0301u,
+                          "combining marks should attach to the preceding base cell");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 1)->width == 1u &&
+                              !winxterm_screen_cell_at(&screen, 0, 2)->continuation &&
+                              winxterm_screen_cell_at(&screen, 0, 2)->codepoint == (uint32_t)'B',
+                          "Unicode fallback should occupy one cell");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char dec_graphics[] = "\x1b(0qx\x1b(B";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)dec_graphics,
+                                                   sizeof(dec_graphics) - 1u),
+                          "DEC special graphics should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == 0x2500u &&
+                              winxterm_screen_cell_at(&screen, 0, 0)->glyph_index == WINXTERM_DYNAMIC_GLYPH_INDEX &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->codepoint == 0x2502u &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->glyph_index == WINXTERM_DYNAMIC_GLYPH_INDEX,
+                          "DEC graphics should keep Unicode codepoints for TTF fallback");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char csi_bytes[] = "abc\x1b[2;5HZ\x1b[1K\x1b[2;3r\x1b[?6h\x1b[Hq\x1b[?6l";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)csi_bytes,
+                                                   sizeof(csi_bytes) - 1u),
+                          "CSI cursor, erase, scroll region and origin mode should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 1, 4)->codepoint == (uint32_t)' ',
+                          "erase-to-beginning should clear the addressed row");
+    winxterm_smoke_expect(state,
+                          screen.scroll_top == 1 && screen.scroll_bottom == 2 && !screen.origin_mode,
+                          "scroll region and origin mode should update screen state");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 1, 0)->codepoint == (uint32_t)'q',
+                          "origin-mode cursor addressing should be relative to scroll region");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char progress_rewrite[] =
+        "before\r\n"
+        "[1/3] first\r\x1b[2K[2/3] second\r\x1b[2K[3/3] done";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)progress_rewrite,
+                                                   sizeof(progress_rewrite) - 1u),
+                          "progress-line rewrite should feed into screen");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'b' &&
+                              winxterm_screen_cell_at(&screen, 1, 0)->codepoint == (uint32_t)'[' &&
+                              winxterm_screen_cell_at(&screen, 1, 1)->codepoint == (uint32_t)'3',
+                          "progress-line rewrite should preserve previous active rows");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char visual_erase[] = "\x1b[34;44;4mX\x1b[2J";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)visual_erase,
+                                                   sizeof(visual_erase) - 1u),
+                          "erase display with visual attributes should feed into screen");
+    const WinxtermScreenCell *erased = winxterm_screen_cell_at(&screen, 0, 0);
+    winxterm_smoke_expect(state,
+                          erased != 0 &&
+                              erased->codepoint == (uint32_t)' ' &&
+                              (erased->attribute_flags & WINXTERM_SCREEN_CELL_VISUAL_MASK) == 0u &&
+                              (erased->color_flags & WINXTERM_SCREEN_COLOR_FOREGROUND_DEFAULT) != 0u &&
+                              (erased->color_flags & WINXTERM_SCREEN_COLOR_BACKGROUND_INDEXED) != 0u &&
+                              erased->background_palette_index == 4u,
+                          "erase display should keep background color but drop underline/foreground visuals");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char alt_bytes[] = "P\x1b[?1049hA\x1b[?1049l";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)alt_bytes,
+                                                   sizeof(alt_bytes) - 1u),
+                          "alternate screen sequence should feed into screen");
+    winxterm_smoke_expect(state,
+                          !screen.alternate_active &&
+                              winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'P',
+                          "alternate screen should not overwrite primary grid");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_parser_strings(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "string parser screen should initialize");
+
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    static const char dcs_ignore[] = "A\x1bPunsupported payload\x1b\\B";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)dcs_ignore,
+                                                   sizeof(dcs_ignore) - 1u),
+                          "unsupported DCS should be safely ignored");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'A' &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->codepoint == (uint32_t)'B',
+                          "unsupported DCS payload should not leak printable bytes");
+    const WinxtermParserDiagnostics *diagnostics = winxterm_text_diagnostics(&decoder);
+    winxterm_smoke_expect(state,
+                          diagnostics != 0 && diagnostics->ignored_strings != 0u,
+                          "unsupported DCS should increment ignored string diagnostics");
+
+    winxterm_utf8_decoder_init(&decoder);
+    WinxtermProtocolCapture capture = {0};
+    capture.screen = &screen;
+    static const char c1_osc[] = "\x9d" "0;c1-title" "\x9c";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes_to_sink(&decoder,
+                                                           (const uint8_t *)c1_osc,
+                                                           sizeof(c1_osc) - 1u,
+                                                           winxterm_smoke_protocol_sink,
+                                                           &capture),
+                          "C1 OSC should parse and terminate on ST");
+    winxterm_smoke_expect(state,
+                          capture.op_count >= 2u &&
+                              capture.ops[0].type == WINXTERM_TERMINAL_OP_TITLE &&
+                              memcmp(capture.ops[0].data.title.text, "c1-title", 8u) == 0,
+                          "C1 OSC title should emit title operation");
+
+    winxterm_utf8_decoder_init(&decoder);
+    char overflow[WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY + 32u];
+    memset(overflow, 'A', sizeof(overflow));
+    overflow[0] = 0x1b;
+    overflow[1] = ']';
+    overflow[2] = '8';
+    overflow[3] = ';';
+    overflow[sizeof(overflow) - 2u] = 0x07;
+    overflow[sizeof(overflow) - 1u] = '\0';
+    capture.op_count = 0u;
+    capture.reply_count = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes_to_sink(&decoder,
+                                                           (const uint8_t *)overflow,
+                                                           sizeof(overflow) - 1u,
+                                                           winxterm_smoke_protocol_sink,
+                                                           &capture),
+                          "overflowing OSC should finish safely");
+    diagnostics = winxterm_text_diagnostics(&decoder);
+    winxterm_smoke_expect(state,
+                          diagnostics != 0 && diagnostics->string_overflow != 0u,
+                          "overflowing OSC should increment string overflow diagnostics");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_mode_registry(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "mode registry screen should initialize");
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    static const char modes[] = "\x1b[?1h\x1b[?2004h\x1b[?1s\x1b[?1l\x1b[?1r\x1b[?2004l";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)modes,
+                                                   sizeof(modes) - 1u),
+                          "mode set reset save restore should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_mode_enabled(&screen, WINXTERM_TERMINAL_MODE_APPLICATION_CURSOR),
+                          "private mode restore should restore application cursor mode");
+    winxterm_smoke_expect(state,
+                          !winxterm_screen_mode_enabled(&screen, WINXTERM_TERMINAL_MODE_BRACKETED_PASTE),
+                          "bracketed paste should reset through shared mode registry");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_query_replies(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "query reply screen should initialize");
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    WinxtermProtocolCapture capture = {0};
+    capture.screen = &screen;
+    static const char queries[] =
+        "\x1b[2;3H"
+        "\x1b[c"
+        "\x1b[>c"
+        "\x1b[5n"
+        "\x1b[6n"
+        "\x1b[?2004$p"
+        "\x1b[>0q"
+        "\x1b[>4q"
+        "\x1b[>1q"
+        "\x1bP$qm\x1b\\";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes_to_sink(&decoder,
+                                                           (const uint8_t *)queries,
+                                                           sizeof(queries) - 1u,
+                                                           winxterm_smoke_protocol_sink,
+                                                           &capture),
+                          "query sequences should feed into protocol sink");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1b[?1;2c", 7u),
+                          "primary DA reply should be emitted");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1b[>0;410;0c", 11u),
+                          "secondary DA reply should be emitted");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1b[0n", 4u),
+                          "DSR ready reply should be emitted");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1b[2;3R", 6u),
+                          "CPR reply should use current cursor position");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1b[?2004;2$y", 11u),
+                          "DECRQM should report known reset private modes");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "Winxterm 0.1.0", 14u),
+                          "XTVERSION should report winxterm identity");
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_replies_contain(&capture, "\x1bP1$rm\x1b\\", 7u),
+                          "DECRQSS SGR query should get a success reply");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_osc_policy(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "OSC policy screen should initialize");
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    WinxtermProtocolCapture capture = {0};
+    capture.screen = &screen;
+    static const char osc_bytes[] =
+        "\x1b]0;main-title\x07"
+        "\x1b]1;icon-title\x07"
+        "\x1b]52;c;AAAA\x07"
+        "\x1b]8;;https://example.invalid\x1b\\"
+        "\x1b]bad\x07";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes_to_sink(&decoder,
+                                                           (const uint8_t *)osc_bytes,
+                                                           sizeof(osc_bytes) - 1u,
+                                                           winxterm_smoke_protocol_sink,
+                                                           &capture),
+                          "OSC policy fixtures should feed");
+    bool saw_title = false;
+    bool saw_icon = false;
+    bool saw_denied = false;
+    bool saw_unsupported = false;
+    bool saw_malformed = false;
+    for (size_t i = 0u; i < capture.op_count; ++i) {
+        if (capture.ops[i].type == WINXTERM_TERMINAL_OP_TITLE) {
+            saw_title = true;
+        } else if (capture.ops[i].type == WINXTERM_TERMINAL_OP_OSC) {
+            saw_icon = saw_icon ||
+                (capture.ops[i].data.osc.command == WINXTERM_TERMINAL_OSC_ICON_TITLE &&
+                 capture.ops[i].data.osc.outcome == WINXTERM_TERMINAL_OSC_ACCEPTED_NO_CONSUMER);
+            saw_denied = saw_denied ||
+                capture.ops[i].data.osc.outcome == WINXTERM_TERMINAL_OSC_DENIED_SENSITIVE;
+            saw_unsupported = saw_unsupported ||
+                capture.ops[i].data.osc.outcome == WINXTERM_TERMINAL_OSC_UNSUPPORTED;
+            saw_malformed = saw_malformed ||
+                capture.ops[i].data.osc.outcome == WINXTERM_TERMINAL_OSC_MALFORMED;
+        }
+    }
+    winxterm_smoke_expect(state, saw_title, "OSC 0 should still emit title");
+    winxterm_smoke_expect(state, saw_icon, "OSC 1 should be accepted without a local consumer");
+    winxterm_smoke_expect(state, saw_denied, "OSC 52 should be denied by policy");
+    winxterm_smoke_expect(state, saw_unsupported, "OSC 8 should be unsupported until hyperlink metadata exists");
+    winxterm_smoke_expect(state, saw_malformed, "malformed OSC should produce a policy diagnostic op");
+    const WinxtermParserDiagnostics *diagnostics = winxterm_text_diagnostics(&decoder);
+    winxterm_smoke_expect(state,
+                          diagnostics != 0 &&
+                              diagnostics->denied_osc != 0u &&
+                              diagnostics->unsupported_osc != 0u &&
+                              diagnostics->malformed_sequences != 0u,
+                          "OSC policy should update parser diagnostics");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_reset_sequences(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 3), "reset screen should initialize");
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    static const char alignment[] = "\x1b#8";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)alignment,
+                                                   sizeof(alignment) - 1u),
+                          "DECALN should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 2, 9)->codepoint == (uint32_t)'E',
+                          "DECALN should fill the visible grid with E");
+
+    static const char soft_reset[] = "\x1b[?2004h\x1b[!p";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)soft_reset,
+                                                   sizeof(soft_reset) - 1u),
+                          "DECSTR should feed");
+    winxterm_smoke_expect(state,
+                          !winxterm_screen_mode_enabled(&screen, WINXTERM_TERMINAL_MODE_BRACKETED_PASTE) &&
+                              winxterm_screen_cell_at(&screen, 2, 9)->codepoint == (uint32_t)'E',
+                          "DECSTR should reset modes without clearing visible contents");
+
+    static const char controls_and_hard_reset[] = "\x1b G\x1b F\x1b" "c";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)controls_and_hard_reset,
+                                                   sizeof(controls_and_hard_reset) - 1u),
+                          "S8C1T S7C1T and RIS should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)' ' &&
+                              !screen.alternate_active &&
+                              screen.auto_wrap,
+                          "RIS should clear screen state and restore defaults");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_screen_layout_extensions(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 10, 4), "layout extension screen should initialize");
+
+    WinxtermUtf8Decoder decoder;
+    winxterm_utf8_decoder_init(&decoder);
+    static const char cursor_tabs[] = "\x1b[3G\x1bH\x1b[1G\x1b[IZ";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)cursor_tabs,
+                                                   sizeof(cursor_tabs) - 1u),
+                          "HPA, HTS and CHT should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 2)->codepoint == (uint32_t)'Z',
+                          "custom tab stop should move the cursor to the set column");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char reverse_wrap[] = "\x1b[?45h\x1b[2;1H\bR";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)reverse_wrap,
+                                                   sizeof(reverse_wrap) - 1u),
+                          "reverse-wrap backspace should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 9)->codepoint == (uint32_t)'R',
+                          "reverse-wrap should move from the left edge to the previous row");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char margins[] = "\x1b[2;5sabcdef";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)margins,
+                                                   sizeof(margins) - 1u),
+                          "horizontal margins should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)' ' &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->codepoint == (uint32_t)'a' &&
+                              winxterm_screen_cell_at(&screen, 0, 4)->codepoint == (uint32_t)'d' &&
+                              winxterm_screen_cell_at(&screen, 1, 1)->codepoint == (uint32_t)'e',
+                          "printing should clip and wrap within left-right margins");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char alt_modes[] = "P\x1b[?47hA\x1b[?47l\x1b[2;3H\x1b[?1048h\x1b[1;1H\x1b[?1048l";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)alt_modes,
+                                                   sizeof(alt_modes) - 1u),
+                          "alternate and 1048 cursor modes should feed");
+    winxterm_smoke_expect(state,
+                          !screen.alternate_active &&
+                              winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'P' &&
+                              screen.cursor_row == 1 && screen.cursor_col == 2,
+                          "47 should preserve primary contents and 1048 should restore cursor");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char protected_rects[] =
+        "\x1b[1\"qP\x1b[0\"qN\x1b[?2J"
+        "\x1b[88;2;2;2;4$x"
+        "\x1b[2;2;2;4;1;3;1$v";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)protected_rects,
+                                                   sizeof(protected_rects) - 1u),
+                          "protected text and rectangle operations should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'P' &&
+                              winxterm_screen_cell_at(&screen, 0, 1)->codepoint == (uint32_t)' ' &&
+                              winxterm_screen_cell_at(&screen, 1, 1)->codepoint == (uint32_t)'X' &&
+                              winxterm_screen_cell_at(&screen, 2, 0)->codepoint == (uint32_t)'X',
+                          "selective erase should preserve protected cells and rectangles should mutate cells");
+
+    winxterm_screen_clear_current_session(&screen);
+    winxterm_utf8_decoder_init(&decoder);
+    static const char dec_graphics[] = "\x1b(0q\x1b(B";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)dec_graphics,
+                                                   sizeof(dec_graphics) - 1u),
+                          "DEC special graphics charset should feed");
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == 0x2500u,
+                          "DEC special graphics q should map to a stable line-drawing codepoint");
+    winxterm_screen_dispose(&screen);
+
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 4, 2), "resize reflow screen should initialize");
+    winxterm_utf8_decoder_init(&decoder);
+    static const char wrapped[] = "abcdefghijkl";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)wrapped,
+                                                   sizeof(wrapped) - 1u),
+                          "wrapped text should feed before resize");
+    winxterm_screen_resize(&screen, 2, 2);
+    winxterm_smoke_expect(state,
+                          screen.scrollback_count >= 2u &&
+                              screen.scrollback_lines[0].columns == 2 &&
+                              screen.scrollback_lines[0].soft_wrapped &&
+                              screen.scrollback_lines[0].cells[0].codepoint == (uint32_t)'a' &&
+                              screen.scrollback_lines[1].cells[0].codepoint == (uint32_t)'c',
+                          "soft-wrapped scrollback should reflow to the new width");
+    winxterm_screen_dispose(&screen);
+
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 4, 4), "visible reflow screen should initialize");
+    winxterm_utf8_decoder_init(&decoder);
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)wrapped,
+                                                   8u),
+                          "wrapped visible text should feed before resize");
+    winxterm_screen_resize(&screen, 8, 4);
+    winxterm_smoke_expect(state,
+                          winxterm_screen_cell_at(&screen, 0, 0)->codepoint == (uint32_t)'a' &&
+                              winxterm_screen_cell_at(&screen, 0, 7)->codepoint == (uint32_t)'h' &&
+                              winxterm_screen_cell_at(&screen, 1, 0)->codepoint == (uint32_t)' ',
+                          "soft-wrapped visible rows should reflow to the new width");
+    winxterm_smoke_expect(state,
+                          screen.cursor_row == 0 && screen.cursor_col == 7,
+                          "visible-row reflow should keep the cursor with the logical line");
+    WinxtermUxState hit_ux;
+    WinxtermUxPosition hit_position;
+    winxterm_ux_init(&hit_ux);
+    winxterm_smoke_expect(state,
+                          winxterm_ux_hit_test(&hit_ux,
+                                               &screen,
+                                               2 * WINXTERM_CELL_WIDTH_PIXELS * 2 + 1,
+                                               WINXTERM_CELL_HEIGHT_PIXELS * 2 + 1,
+                                               2u,
+                                               &hit_position) &&
+                              hit_position.kind == WINXTERM_UX_ROW_PRIMARY_VISIBLE &&
+                              hit_position.row == 1u &&
+                              hit_position.column == 2,
+                          "scale-aware hit test should map physical pixels to logical cells");
+    winxterm_screen_dispose(&screen);
+}
+
+static void winxterm_smoke_test_keyboard_encoding(WinxtermSmokeState *state)
+{
+    uint8_t sequence[WINXTERM_INPUT_MAX_SEQUENCE];
+    WinxtermInputModifiers none = {0};
+    size_t length = winxterm_input_encode_char(L'A', none, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state, length == 1u && sequence[0] == 'A', "printable input should encode as UTF-8");
+
+    WinxtermInputModifiers alt = {0};
+    alt.alt = true;
+    length = winxterm_input_encode_char(L'x', alt, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 2u && sequence[0] == 0x1bu && sequence[1] == 'x',
+                          "Alt printable input should use ESC prefix");
+
+    WinxtermInputModifiers ctrl = {0};
+    ctrl.ctrl = true;
+    length = winxterm_input_encode_virtual_key(VK_RIGHT, ctrl, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 6u && memcmp(sequence, "\x1b[1;5C", 6u) == 0,
+                          "Ctrl+Right should encode xterm modifier sequence");
+
+    length = winxterm_input_encode_virtual_key(VK_BACK, ctrl, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 1u && sequence[0] == 0x17u,
+                          "Ctrl+Backspace should encode word erase control");
+
+    length = winxterm_input_encode_virtual_key(VK_F5, none, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 5u && memcmp(sequence, "\x1b[15~", 5u) == 0,
+                          "function keys should encode CSI tilde sequences");
+
+    WinxtermModeState modes;
+    winxterm_mode_state_reset_hard(&modes);
+    modes.application_cursor = true;
+    length = winxterm_input_encode_virtual_key_with_modes(VK_UP, none, &modes, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 3u && memcmp(sequence, "\x1bOA", 3u) == 0,
+                          "application cursor mode should encode cursor keys as SS3");
+
+    winxterm_mode_state_reset_hard(&modes);
+    modes.application_keypad = true;
+    length = winxterm_input_encode_virtual_key_with_modes(VK_NUMPAD1, none, &modes, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 3u && memcmp(sequence, "\x1bOq", 3u) == 0,
+                          "application keypad mode should encode numpad keys as SS3");
+}
+
+typedef struct WinxtermSmokeMacroCaptureState {
+    unsigned int screenshot_count;
+    unsigned int screendump_count;
+    unsigned int render_barrier_count;
+    unsigned int wait_redraw_count;
+    unsigned int wait_redraw_process_count;
+    unsigned int wait_redraw_ready_after;
+    const wchar_t *screenshot_path;
+    const wchar_t *screendump_path;
+} WinxtermSmokeMacroCaptureState;
+
+static bool winxterm_smoke_macro_write_screenshot(void *context, const wchar_t *path)
+{
+    WinxtermSmokeMacroCaptureState *state = (WinxtermSmokeMacroCaptureState *)context;
+    if (state == 0) {
+        return false;
+    }
+    ++state->screenshot_count;
+    state->screenshot_path = path;
+    return true;
+}
+
+static bool winxterm_smoke_macro_write_screendump(void *context, const wchar_t *path)
+{
+    WinxtermSmokeMacroCaptureState *state = (WinxtermSmokeMacroCaptureState *)context;
+    if (state == 0) {
+        return false;
+    }
+    ++state->screendump_count;
+    state->screendump_path = path;
+    return true;
+}
+
+static bool winxterm_smoke_macro_render_barrier(void *context)
+{
+    WinxtermSmokeMacroCaptureState *state = (WinxtermSmokeMacroCaptureState *)context;
+    if (state == 0) {
+        return false;
+    }
+    ++state->render_barrier_count;
+    return true;
+}
+
+static bool winxterm_smoke_macro_wait_redraw(void *context, bool process, bool *ready)
+{
+    WinxtermSmokeMacroCaptureState *state = (WinxtermSmokeMacroCaptureState *)context;
+    if (state == 0 || ready == 0) {
+        return false;
+    }
+    ++state->wait_redraw_count;
+    if (process) {
+        ++state->wait_redraw_process_count;
+    }
+    *ready = state->wait_redraw_count >= state->wait_redraw_ready_after;
+    return true;
+}
+
+static void winxterm_smoke_test_macro_parser(WinxtermSmokeState *state)
+{
+    WinxtermMacro *macro = 0;
+    winxterm_smoke_expect(state, winxterm_macro_create(&macro), "macro runtime should allocate");
+    if (macro == 0) {
+        return;
+    }
+
+    static const char script[] =
+        "typestring echo \";\"; comment without leading space\n"
+        "enterstring echo  \\; ; comment after escaped semicolon\n"
+        "typestring sometext   ; comment with consumed delimiter space\n"
+        "typestring hello \\\n"
+        "world; continuation should remove newline\n"
+        "set typedelayms 7\n"
+        "keydown KEY_LEFT_ALT\n"
+        "keypress KEY_ENTER 7 9\n"
+        "keyup KEY_LEFT_ALT 3\n"
+        "waitms 11\n"
+        "waitredraw\n"
+        "waitredraw -w\n"
+        "waithost 123\n"
+        "screenshot first.png\n"
+        "screendump grid.txt\n"
+        "histdump hist.log\n"
+        "maximize\n"
+        "minimize\n"
+        "restore\n"
+        "exit\n";
+    wchar_t error[256];
+    error[0] = L'\0';
+    winxterm_smoke_expect(state,
+                          winxterm_macro_parse_text_utf8(macro,
+                                                         script,
+                                                         sizeof(script) - 1u,
+                                                         error,
+                                                         sizeof(error) / sizeof(error[0])),
+                          "macro parser should accept representative script");
+    winxterm_smoke_expect(state,
+                          winxterm_macro_command_count(macro) == 19u,
+                          "macro parser should produce expected command count");
+
+    const WinxtermMacroCommand *command = winxterm_macro_command_at(macro, 0u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_TYPE_STRING &&
+                              wcscmp(command->text, L"echo \";\"") == 0,
+                          "macro parser should ignore quoted semicolon terminators");
+    command = winxterm_macro_command_at(macro, 1u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_ENTER_STRING &&
+                              wcscmp(command->text, L"echo  \\;") == 0,
+                          "macro parser should preserve escaped semicolons in payload");
+    command = winxterm_macro_command_at(macro, 2u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              wcscmp(command->text, L"sometext  ") == 0,
+                          "macro parser should consume only delimiter space before semicolon");
+    command = winxterm_macro_command_at(macro, 3u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              wcscmp(command->text, L"hello world") == 0,
+                          "macro parser should join continued lines without newline");
+    command = winxterm_macro_command_at(macro, 4u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_SET_TYPE_DELAY &&
+                              command->first_ms == 7u,
+                          "macro parser should parse typedelayms");
+    command = winxterm_macro_command_at(macro, 7u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_KEY_UP &&
+                              command->virtual_key == VK_LMENU &&
+                              command->first_ms == 3u,
+                          "macro parser should parse keyup waitms");
+    command = winxterm_macro_command_at(macro, 9u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_WAIT_REDRAW &&
+                              command->first_ms == 0u,
+                          "macro parser should parse passive waitredraw");
+    command = winxterm_macro_command_at(macro, 10u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_WAIT_REDRAW &&
+                              command->first_ms == 1u,
+                          "macro parser should parse pumping waitredraw");
+    command = winxterm_macro_command_at(macro, 11u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_WAIT_HOST &&
+                              command->first_ms == 123u,
+                          "macro parser should parse waithost timeout");
+    command = winxterm_macro_command_at(macro, 12u);
+    winxterm_smoke_expect(state,
+                          command != 0 &&
+                              command->kind == WINXTERM_MACRO_COMMAND_SCREENSHOT &&
+                              wcscmp(command->text, L"first.png") == 0,
+                          "macro parser should preserve png screenshot filenames");
+
+    WPARAM key = 0;
+    winxterm_smoke_expect(state,
+                          winxterm_macro_key_name_to_virtual_key(L"KEY_ARROW_UP", &key) &&
+                              key == VK_UP,
+                          "macro key map should include arrow keys");
+    winxterm_smoke_expect(state,
+                          winxterm_macro_key_name_to_virtual_key(L"KEY_RETURN", &key) &&
+                              key == VK_RETURN,
+                          "macro key map should include return aliases");
+    wchar_t not_found[WINXTERM_LOG_PATH_CAPACITY + 64u];
+    winxterm_smoke_expect(state,
+                          winxterm_macro_format_not_found_message(L"missing-macro-file.macro",
+                                                                  not_found,
+                                                                  sizeof(not_found) / sizeof(not_found[0])) &&
+                              wcsstr(not_found, L"\"Macro: ") == not_found &&
+                              wcsstr(not_found, L"missing-macro-file.macro") != 0 &&
+                              wcsstr(not_found, L"\" was not found.") != 0,
+                          "macro not-found diagnostic should include canonical macro filename");
+    static const char bad_script[] = "dumpscreen C:\\Users\\example\\first.txt\n";
+    wchar_t parse_error[256];
+    parse_error[0] = L'\0';
+    winxterm_smoke_expect(state,
+                          !winxterm_macro_parse_text_utf8(macro,
+                                                          bad_script,
+                                                          sizeof(bad_script) - 1u,
+                                                          parse_error,
+                                                          sizeof(parse_error) / sizeof(parse_error[0])) &&
+                              wcscmp(parse_error,
+                                     L"Macro error on line 1: dumpscreen C:\\Users\\example\\first.txt") == 0,
+                          "macro parser errors should report the full unparsed line");
+
+    winxterm_macro_destroy(macro);
+}
+
+static void winxterm_smoke_test_macro_capture_commands(WinxtermSmokeState *state)
+{
+    WinxtermMacro *macro = 0;
+    winxterm_smoke_expect(state, winxterm_macro_create(&macro), "macro capture runtime should allocate");
+    if (macro == 0) {
+        return;
+    }
+
+    static const char script[] =
+        "waitredraw\n"
+        "waitredraw -w\n"
+        "screenshot first.bmp\n"
+        "screendump first.txt\n";
+    wchar_t error[256];
+    error[0] = L'\0';
+    winxterm_smoke_expect(state,
+                          winxterm_macro_parse_text_utf8(macro,
+                                                         script,
+                                                         sizeof(script) - 1u,
+                                                         error,
+                                                         sizeof(error) / sizeof(error[0])),
+                          "macro capture commands should parse");
+
+    WinxtermSmokeMacroCaptureState capture;
+    memset(&capture, 0, sizeof(capture));
+    capture.wait_redraw_ready_after = 2u;
+    WinxtermMacroCallbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.context = &capture;
+    callbacks.write_screenshot = winxterm_smoke_macro_write_screenshot;
+    callbacks.write_screendump = winxterm_smoke_macro_write_screendump;
+    callbacks.wait_redraw = winxterm_smoke_macro_wait_redraw;
+    callbacks.render_barrier = winxterm_smoke_macro_render_barrier;
+
+    DWORD delay = winxterm_macro_step(macro, &callbacks);
+    winxterm_smoke_expect(state,
+                          delay != WINXTERM_MACRO_DONE_DELAY &&
+                              capture.wait_redraw_count == 1u &&
+                              capture.wait_redraw_process_count == 0u &&
+                              capture.screenshot_count == 0u &&
+                              capture.screendump_count == 0u,
+                          "macro waitredraw should pause playback while unsettled");
+
+    delay = winxterm_macro_step(macro, &callbacks);
+    winxterm_smoke_expect(state,
+                          delay == WINXTERM_MACRO_DONE_DELAY &&
+                              capture.wait_redraw_count == 3u &&
+                              capture.wait_redraw_process_count == 1u &&
+                              capture.screenshot_count == 1u &&
+                              capture.screendump_count == 1u &&
+                              capture.render_barrier_count == 0u &&
+                              capture.screenshot_path != 0 &&
+                              wcscmp(capture.screenshot_path, L"first.bmp") == 0 &&
+                              capture.screendump_path != 0 &&
+                              wcscmp(capture.screendump_path, L"first.txt") == 0,
+                          "macro capture commands should not force render barriers");
+
+    winxterm_macro_destroy(macro);
+}
+
+static void winxterm_smoke_test_daily_ux_helpers(WinxtermSmokeState *state)
+{
+    WinxtermScreen screen;
+    WinxtermUtf8Decoder decoder;
+    winxterm_smoke_expect(state, winxterm_screen_init(&screen, 4, 2), "UX screen should initialize");
+    winxterm_utf8_decoder_init(&decoder);
+    static const char history_text[] = "abcd\nefgh\nijkl";
+    winxterm_smoke_expect(state,
+                          winxterm_text_feed_bytes(&screen,
+                                                   &decoder,
+                                                   (const uint8_t *)history_text,
+                                                   sizeof(history_text) - 1u),
+                          "UX history text should feed");
+
+    WinxtermUxState ux;
+    winxterm_ux_init(&ux);
+    winxterm_ux_note_screen_changed(&ux, &screen);
+    winxterm_ux_scroll_to_top(&ux, &screen);
+    winxterm_smoke_expect(state,
+                          ux.viewport.line_offset_from_bottom == winxterm_screen_scrollback_count(&screen),
+                          "viewport should scroll to oldest available history");
+    size_t first_row = winxterm_ux_primary_first_row(&ux, &screen);
+    WinxtermScreenRowView row;
+    winxterm_smoke_expect(state,
+                          winxterm_screen_get_primary_view_row(&screen, first_row, &row) &&
+                              row.cells[0].codepoint == (uint32_t)'a',
+                          "viewport first row should resolve into scrollback");
+    winxterm_ux_scroll_to_bottom(&ux);
+    winxterm_smoke_expect(state,
+                          winxterm_ux_primary_first_row(&ux, &screen) ==
+                              winxterm_screen_default_primary_first_row(&screen, 0u),
+                          "viewport bottom should use live screen rows");
+
+    WinxtermUxPosition start = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 0};
+    WinxtermUxPosition end = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 1};
+    winxterm_ux_begin_selection(&ux, start);
+    winxterm_ux_update_selection(&ux, end);
+    winxterm_ux_finish_selection(&ux);
+    char *selection = 0;
+    size_t selection_length = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_ux_extract_selection_utf8(&ux, &screen, &selection, &selection_length) &&
+                              selection_length == 2u,
+                          "selection extraction should produce UTF-8 bytes");
+    free(selection);
+    winxterm_screen_dispose(&screen);
+
+    winxterm_smoke_expect(state,
+                          winxterm_screen_init(&screen, 8, 3),
+                          "mouse UX helper screen should initialize");
+    if (screen.primary_cells != 0 && screen.primary_line_meta != 0) {
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[0], screen.columns, "ab cd");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns],
+                                       screen.columns,
+                                       "ef g");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns * 2u],
+                                       screen.columns,
+                                       "hijk");
+        screen.primary_line_meta[0].soft_wrapped = true;
+        screen.primary_line_meta[1].soft_wrapped = false;
+        screen.primary_line_meta[2].soft_wrapped = false;
+
+        winxterm_ux_init(&ux);
+        WinxtermUxPosition word_position = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 4};
+        selection = 0;
+        selection_length = 0u;
+        winxterm_smoke_expect(state,
+                              winxterm_ux_select_non_space_run_at(&ux, &screen, word_position) &&
+                                  winxterm_ux_extract_selection_utf8(&ux, &screen, &selection, &selection_length) &&
+                                  selection_length == 2u &&
+                                  memcmp(selection, "cd", 2u) == 0,
+                              "double-click selection should copy a non-space run");
+        free(selection);
+
+        winxterm_ux_clear_selection(&ux);
+        WinxtermUxPosition space_position = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 2};
+        winxterm_smoke_expect(state,
+                              !winxterm_ux_select_non_space_run_at(&ux, &screen, space_position) &&
+                                  !winxterm_ux_has_selection(&ux),
+                              "double-click selection should ignore spaces");
+
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[0], screen.columns, "abcdefgh");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns],
+                                       screen.columns,
+                                       "ij kl");
+        screen.primary_line_meta[0].soft_wrapped = true;
+        screen.primary_line_meta[1].soft_wrapped = false;
+        WinxtermUxPosition wrapped_word_position = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 1u, 1};
+        selection = 0;
+        selection_length = 0u;
+        winxterm_smoke_expect(state,
+                              winxterm_ux_select_non_space_run_at(&ux, &screen, wrapped_word_position) &&
+                                  winxterm_ux_extract_selection_utf8(&ux, &screen, &selection, &selection_length) &&
+                                  selection_length == 10u &&
+                                  memcmp(selection, "abcdefghij", 10u) == 0,
+                              "double-click selection should follow soft-wrapped real lines");
+        free(selection);
+
+        selection = 0;
+        selection_length = 0u;
+        winxterm_smoke_expect(state,
+                              winxterm_ux_select_real_line_at(&ux, &screen, wrapped_word_position) &&
+                                  winxterm_ux_extract_selection_utf8(&ux, &screen, &selection, &selection_length) &&
+                                  selection_length == 13u &&
+                                  memcmp(selection, "abcdefghij kl", 13u) == 0,
+                              "triple-click selection should copy the full real line without newline");
+        free(selection);
+
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[0], screen.columns, "a cd");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns],
+                                       screen.columns,
+                                       "e gh");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns * 2u],
+                                       screen.columns,
+                                       "i kl");
+        screen.primary_line_meta[0].soft_wrapped = false;
+        screen.primary_line_meta[1].soft_wrapped = false;
+        screen.primary_line_meta[2].soft_wrapped = false;
+        WinxtermUxPosition box_start = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 1};
+        WinxtermUxPosition box_end = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 2u, 3};
+        winxterm_ux_begin_selection_mode(&ux, box_start, WINXTERM_SELECTION_RECTANGULAR);
+        winxterm_ux_update_selection(&ux, box_end);
+        winxterm_ux_finish_selection(&ux);
+        WinxtermScreenSelectionRange box_range = winxterm_ux_render_selection(&ux, &screen);
+        selection = 0;
+        selection_length = 0u;
+        winxterm_smoke_expect(state,
+                              box_range.enabled && box_range.rectangular &&
+                                  box_range.start_column == 1 && box_range.end_column == 3 &&
+                                  winxterm_ux_extract_selection_utf8(&ux, &screen, &selection, &selection_length) &&
+                                  selection_length == 9u &&
+                                  memcmp(selection, "cd gh kl ", 9u) == 0,
+                              "rectangular selection should trim rows and join them with spaces");
+        free(selection);
+        selection = 0;
+        selection_length = 0u;
+        winxterm_smoke_expect(state,
+                              winxterm_ux_extract_selection_utf8_format(
+                                  &ux,
+                                  &screen,
+                                  WINXTERM_SELECTION_COPY_RECTANGULAR_PRESERVE_ROWS,
+                                  &selection,
+                                  &selection_length) &&
+                                  selection_length == 11u &&
+                                  memcmp(selection, " cd\n gh\n kl", 11u) == 0,
+                              "legacy rectangular selection should preserve selected spaces and row breaks");
+        free(selection);
+    }
+    winxterm_screen_dispose(&screen);
+
+    winxterm_smoke_expect(state,
+                          winxterm_screen_init(&screen, 4, 4),
+                          "partial viewport screen should initialize");
+    if (screen.primary_cells != 0 && screen.primary_line_meta != 0) {
+        screen.scrollback_count = 2u;
+        screen.scrollback_capacity = 2u;
+        screen.scrollback_lines = (WinxtermScreenLine *)calloc(screen.scrollback_capacity,
+                                                              sizeof(*screen.scrollback_lines));
+        bool seeded = screen.scrollback_lines != 0 &&
+            winxterm_smoke_set_scrollback_line(&screen, 0u, "1111", false) &&
+            winxterm_smoke_set_scrollback_line(&screen, 1u, "2222", false);
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[0], screen.columns, "aaaa");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns],
+                                       screen.columns,
+                                       "bbbb");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns * 2u],
+                                       screen.columns,
+                                       "cccc");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns * 3u],
+                                       screen.columns,
+                                       "dddd");
+        winxterm_smoke_expect(state, seeded, "partial viewport history should seed");
+
+        WinxtermScreenRenderSnapshot snapshot;
+        winxterm_smoke_expect(state,
+                              winxterm_screen_render_snapshot_init(&snapshot,
+                                                                   &screen,
+                                                                   screen.columns * WINXTERM_CELL_WIDTH_PIXELS,
+                                                                   2 * WINXTERM_CELL_HEIGHT_PIXELS,
+                                                                   WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                                                                   false,
+                                                                   0),
+                              "partial viewport snapshot should initialize");
+        if (snapshot.cells != 0) {
+            winxterm_smoke_expect(state,
+                                  snapshot.rows == 2 &&
+                                      snapshot.first_row == 4u &&
+                                      snapshot.cells[0].codepoint == (uint32_t)'c' &&
+                                      snapshot.cells[(size_t)snapshot.columns].codepoint == (uint32_t)'d',
+                                  "partial bottom snapshot should render bottom live rows");
+        }
+        winxterm_screen_render_snapshot_dispose(&snapshot);
+
+        winxterm_ux_init(&ux);
+        winxterm_ux_note_screen_changed_for_rows(&ux, &screen, 2);
+        winxterm_smoke_expect(state,
+                              winxterm_ux_primary_first_row_for_rows(&ux, &screen, 2) == 4u,
+                              "partial viewport bottom should start at bottom visible rows");
+        winxterm_ux_scroll_lines_for_rows(&ux, &screen, 2, 1);
+        winxterm_smoke_expect(state,
+                              winxterm_ux_primary_first_row_for_rows(&ux, &screen, 2) == 3u,
+                              "partial viewport one-line scroll should move one row up");
+        winxterm_ux_scroll_to_top_for_rows(&ux, &screen, 2);
+        winxterm_smoke_expect(state,
+                              ux.viewport.line_offset_from_bottom == 4u &&
+                                  winxterm_ux_primary_first_row_for_rows(&ux, &screen, 2) == 0u,
+                              "partial viewport top should use total rows minus visible rows");
+        winxterm_ux_scroll_to_bottom(&ux);
+        WinxtermUxPosition partial_hit;
+        winxterm_smoke_expect(state,
+                              winxterm_ux_hit_test_cells(&ux,
+                                                         &screen,
+                                                         WINXTERM_CELL_WIDTH_PIXELS + 1,
+                                                         WINXTERM_CELL_HEIGHT_PIXELS + 1,
+                                                         1u,
+                                                         4,
+                                                         2,
+                                                         &partial_hit) &&
+                                  partial_hit.kind == WINXTERM_UX_ROW_PRIMARY_VISIBLE &&
+                                  partial_hit.row == 3u &&
+                                  partial_hit.column == 1,
+                              "partial viewport hit test should map to rendered bottom rows");
+        winxterm_smoke_expect(state,
+                              !winxterm_ux_hit_test_cells(&ux,
+                                                          &screen,
+                                                          0,
+                                                          2 * WINXTERM_CELL_HEIGHT_PIXELS,
+                                                          1u,
+                                                          4,
+                                                          2,
+                                                          &partial_hit),
+                              "partial viewport hit test should reject clipped rows");
+    }
+    winxterm_screen_dispose(&screen);
+
+    winxterm_smoke_expect(state,
+                          winxterm_screen_init(&screen, 6, 2),
+                          "bottom-anchor resize screen should initialize");
+    if (screen.primary_cells != 0 && screen.primary_line_meta != 0) {
+        screen.scrollback_count = 2u;
+        screen.scrollback_capacity = 2u;
+        screen.scrollback_lines = (WinxtermScreenLine *)calloc(screen.scrollback_capacity,
+                                                              sizeof(*screen.scrollback_lines));
+        bool seeded = screen.scrollback_lines != 0 &&
+            winxterm_smoke_set_scrollback_line(&screen, 0u, "abcdef", true) &&
+            winxterm_smoke_set_scrollback_line(&screen, 1u, "ghijkl", false);
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[0], screen.columns, "mnopqr");
+        winxterm_smoke_fill_text_cells(&screen.primary_cells[(size_t)screen.columns],
+                                       screen.columns,
+                                       "stuvwx");
+        screen.primary_line_meta[0].soft_wrapped = false;
+        screen.primary_line_meta[1].soft_wrapped = false;
+        winxterm_smoke_expect(state, seeded, "bottom-anchor resize history should seed");
+
+        winxterm_ux_init(&ux);
+        winxterm_ux_note_screen_changed(&ux, &screen);
+        winxterm_ux_scroll_to_top(&ux, &screen);
+        WinxtermScreenPrimaryAnchor anchor = ux.viewport.bottom_anchor;
+        winxterm_smoke_expect(state,
+                              ux.viewport.bottom_anchor_valid,
+                              "scrolled viewport should capture a bottom anchor");
+
+        winxterm_ux_capture_resize_anchor(&ux, &screen);
+        winxterm_screen_resize(&screen, 3, 2);
+        winxterm_ux_restore_resize_anchor(&ux, &screen);
+
+        size_t anchor_row = 0u;
+        size_t first_anchor_row = winxterm_ux_primary_first_row(&ux, &screen);
+        WinxtermScreenRowView top_row;
+        WinxtermScreenRowView bottom_row;
+        bool anchor_resolved =
+            winxterm_screen_primary_global_row_from_anchor(&screen, &anchor, &anchor_row);
+        winxterm_smoke_expect(state,
+                              anchor_resolved &&
+                                  first_anchor_row + (size_t)(screen.rows - 1) == anchor_row,
+                              "narrow resize should keep the anchor on the last visible row");
+        winxterm_smoke_expect(state,
+                              winxterm_screen_get_primary_view_row(&screen,
+                                                                   first_anchor_row,
+                                                                   &top_row) &&
+                                  winxterm_screen_get_primary_view_row(&screen,
+                                                                       first_anchor_row + 1u,
+                                                                       &bottom_row) &&
+                                  top_row.cells[0].codepoint == (uint32_t)'g' &&
+                                  bottom_row.cells[0].codepoint == (uint32_t)'j',
+                              "narrow resize should push wrapped text above the anchored row");
+
+        winxterm_ux_scroll_to_top_for_rows(&ux, &screen, 1);
+        anchor = ux.viewport.bottom_anchor;
+        winxterm_smoke_expect(state,
+                              ux.viewport.bottom_anchor_valid,
+                              "partial scrolled viewport should capture a one-row bottom anchor");
+        winxterm_ux_capture_resize_anchor_for_rows(&ux, &screen, 1);
+        winxterm_screen_resize(&screen, 4, 2);
+        winxterm_ux_restore_resize_anchor_for_rows(&ux, &screen, 1);
+        anchor_resolved =
+            winxterm_screen_primary_global_row_from_anchor(&screen, &anchor, &anchor_row);
+        first_anchor_row = winxterm_ux_primary_first_row_for_rows(&ux, &screen, 1);
+        winxterm_smoke_expect(state,
+                              anchor_resolved && first_anchor_row == anchor_row,
+                              "partial resize should keep the anchor on the only visible row");
+    }
+    winxterm_screen_dispose(&screen);
+
+    char *paste = 0;
+    size_t paste_length = 0u;
+    static const char paste_input[] = "a\r\nb\rc";
+    winxterm_smoke_expect(state,
+                          winxterm_clipboard_prepare_paste(paste_input,
+                                                           sizeof(paste_input) - 1u,
+                                                           true,
+                                                           &paste,
+                                                           &paste_length) &&
+                              paste_length == 17u &&
+                              memcmp(paste, "\x1b[200~a\nb\nc\x1b[201~", 17u) == 0,
+                          "bracketed paste helper should normalize line endings and wrap");
+    free(paste);
+    paste = 0;
+    paste_length = 0u;
+
+    static const char prompt_paste_input[] = "echo 1\r\necho 2\r\necho 3";
+    winxterm_smoke_expect(state,
+                          winxterm_clipboard_prepare_paste(prompt_paste_input,
+                                                           sizeof(prompt_paste_input) - 1u,
+                                                           false,
+                                                           &paste,
+                                                           &paste_length) &&
+                              paste_length == 20u &&
+                              memcmp(paste, "echo 1\necho 2\necho 3", 20u) == 0,
+                          "paste helper should preserve unterminated final input line");
+    free(paste);
+
+    WinxtermModeState modes;
+    winxterm_mode_state_reset_hard(&modes);
+    modes.mouse_normal = true;
+    modes.mouse_sgr = true;
+    WinxtermMouseEvent event;
+    memset(&event, 0, sizeof(event));
+    event.kind = WINXTERM_MOUSE_EVENT_PRESS;
+    event.button = WINXTERM_MOUSE_BUTTON_LEFT;
+    event.column = 2;
+    event.row = 3;
+    event.modifiers.ctrl = true;
+    uint8_t sequence[WINXTERM_INPUT_MAX_SEQUENCE];
+    size_t length = winxterm_mouse_encode_event(&modes, &event, sequence, sizeof(sequence));
+    winxterm_smoke_expect(state,
+                          length == 10u && memcmp(sequence, "\x1b[<16;3;4M", 10u) == 0,
+                          "SGR mouse helper should encode 1-based coordinates and modifiers");
+
+    winxterm_ux_init(&ux);
+    winxterm_ux_start_bell(&ux, 1000u);
+    winxterm_smoke_expect(state,
+                          winxterm_ux_bell_active(&ux, 1000u) &&
+                              winxterm_ux_bell_title_prefix(&ux, 1250u)[0] == L' ',
+                          "bell helper should blink title prefix on 250ms phases");
+    winxterm_smoke_expect(state,
+                          !winxterm_ux_bell_active(&ux, 3000u),
+                          "bell helper should stop after two seconds");
+}
+
+static bool winxterm_smoke_cell_has_non_background_pixels(const uint32_t *pixels,
+                                                          int bitmap_width,
+                                                          int cell_x,
+                                                          int cell_y,
+                                                          uint8_t width_cells,
+                                                          uint32_t background_rgb)
+{
+    if (pixels == 0 || bitmap_width <= 0 || width_cells == 0u) {
+        return false;
+    }
+    int origin_x = cell_x * WINXTERM_CELL_WIDTH_PIXELS;
+    int origin_y = cell_y * WINXTERM_CELL_HEIGHT_PIXELS;
+    int width_pixels = (int)width_cells * WINXTERM_CELL_WIDTH_PIXELS;
+    uint32_t background = winxterm_render_bgra_from_rgb(background_rgb);
+    for (int row = 0; row < WINXTERM_CELL_HEIGHT_PIXELS; ++row) {
+        const uint32_t *src = pixels + (size_t)(origin_y + row) * (size_t)bitmap_width + (size_t)origin_x;
+        for (int col = 0; col < width_pixels; ++col) {
+            if (src[col] != background) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool winxterm_smoke_fallback_bitmap_has_alpha(const WinxtermGlyphFallbackBitmap *bitmap)
+{
+    if (bitmap == 0 || bitmap->width_pixels <= 0 || bitmap->height_pixels <= 0) {
+        return false;
+    }
+    for (int row = 0; row < bitmap->height_pixels; ++row) {
+        const uint8_t *alpha = bitmap->alpha + (size_t)row * WINXTERM_FALLBACK_MAX_WIDTH_PIXELS;
+        for (int col = 0; col < bitmap->width_pixels; ++col) {
+            if (alpha[col] != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void winxterm_smoke_test_renderers(WinxtermSmokeState *state)
+{
+    const int width = WINXTERM_INITIAL_PIXEL_WIDTH;
+    const int height = WINXTERM_INITIAL_PIXEL_HEIGHT;
+    size_t pixel_count = (size_t)width * (size_t)height;
+    uint32_t *spans = (uint32_t *)malloc(pixel_count * sizeof(*spans));
+    uint32_t *row_masks = (uint32_t *)malloc(pixel_count * sizeof(*row_masks));
+    uint32_t *precolored = (uint32_t *)malloc(pixel_count * sizeof(*precolored));
+    WinxtermRenderContext context;
+    winxterm_render_context_init(&context);
+    (void)winxterm_render_context_load_fallback_fonts(&context, GetModuleHandleW(0), 0);
+
+    winxterm_smoke_expect(state,
+                          spans != 0 && row_masks != 0 && precolored != 0,
+                          "renderer smoke buffers should allocate");
+    winxterm_smoke_expect(state,
+                          winxterm_glyph_fallback_select_font(0x1f600u) ==
+                              WINXTERM_GLYPH_FALLBACK_FONT_EMOJI &&
+                              winxterm_glyph_fallback_select_font(0x2211u) ==
+                                  WINXTERM_GLYPH_FALLBACK_FONT_MATH &&
+                              winxterm_glyph_fallback_select_font(0x20acu) ==
+                                  WINXTERM_GLYPH_FALLBACK_FONT_GENERAL,
+                          "fallback font policy should classify emoji, math and general glyphs");
+    winxterm_smoke_expect(state,
+                          winxterm_render_context_fallback_ready(&context),
+                          "renderer should load startup TTF fallback fonts");
+    const WinxtermGlyphFallbackBitmap *emoji_bitmap =
+        winxterm_glyph_fallback_get_glyph(context.glyph_fallback, 0x1f600u, 0, 0u, 2u);
+    winxterm_smoke_expect(state,
+                          emoji_bitmap != 0 &&
+                              emoji_bitmap->width_pixels == WINXTERM_CELL_WIDTH_PIXELS &&
+                              emoji_bitmap->height_pixels == WINXTERM_CELL_HEIGHT_PIXELS &&
+                              emoji_bitmap->color_pixels &&
+                              winxterm_smoke_fallback_bitmap_has_alpha(emoji_bitmap),
+                          "emoji fallback should rasterize as a visible one-cell color bitmap");
+    if (spans != 0 && row_masks != 0 && precolored != 0) {
+        winxterm_render_clear(spans, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
+        winxterm_render_clear(row_masks, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
+        winxterm_render_clear(precolored, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
+        winxterm_render_draw_glyph(&context,
+                                   spans,
+                                   width,
+                                   height,
+                                   0,
+                                   0,
+                                   (uint32_t)'A',
+                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
+                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
+                                   WINXTERM_RENDER_BACKEND_SPANS);
+        winxterm_render_draw_glyph(&context,
+                                   row_masks,
+                                   width,
+                                   height,
+                                   0,
+                                   0,
+                                   (uint32_t)'A',
+                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
+                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
+                                   WINXTERM_RENDER_BACKEND_ROW_MASKS);
+        winxterm_render_draw_glyph(&context,
+                                   precolored,
+                                   width,
+                                   height,
+                                   0,
+                                   0,
+                                   (uint32_t)'A',
+                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
+                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
+                                   WINXTERM_RENDER_BACKEND_PRECLORED_CACHE);
+        winxterm_smoke_expect(state,
+                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0,
+                              "span and row-mask renderers should match");
+        winxterm_smoke_expect(state,
+                              memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
+                              "span and precolored renderers should match");
+        winxterm_smoke_expect(state,
+                              context.precolored_count == 1u,
+                              "precolored renderer should cache first glyph/color pair");
+
+        WinxtermScreen screen;
+        WinxtermUtf8Decoder decoder;
+        winxterm_smoke_expect(state,
+                              winxterm_screen_init(&screen, WINXTERM_TERMINAL_COLUMNS, WINXTERM_TERMINAL_ROWS),
+                              "decorated renderer screen should initialize");
+        winxterm_utf8_decoder_init(&decoder);
+        static const char decorated[] = "\x1b[4;7;9;53mA\x1b[48;5;1m B";
+        winxterm_smoke_expect(state,
+                              winxterm_text_feed_bytes(&screen,
+                                                       &decoder,
+                                                       (const uint8_t *)decorated,
+                                                       sizeof(decorated) - 1u),
+                              "decorated renderer fixture should feed");
+        winxterm_screen_render(&screen,
+                               &context,
+                               spans,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_SPANS,
+                               false);
+        winxterm_screen_render(&screen,
+                               &context,
+                               row_masks,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                               false);
+        winxterm_screen_render(&screen,
+                               &context,
+                               precolored,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_PRECLORED_CACHE,
+                               false);
+        winxterm_smoke_expect(state,
+                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0,
+                              "decorated span and row-mask screen renderers should match");
+        winxterm_smoke_expect(state,
+                              memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
+                              "decorated span and precolored screen renderers should match");
+        WinxtermScreenRenderSnapshot snapshot;
+        winxterm_smoke_expect(state,
+                              winxterm_screen_render_snapshot_init(&snapshot,
+                                                                   &screen,
+                                                                   width,
+                                                                   height,
+                                                                   WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                                                                   false,
+                                                                   0),
+                              "decorated renderer snapshot should initialize");
+        if (snapshot.cells != 0) {
+            winxterm_render_clear(precolored, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
+            winxterm_screen_render_snapshot_range(&snapshot,
+                                                  &context,
+                                                  precolored,
+                                                  0,
+                                                  snapshot.rows / 2);
+            winxterm_screen_render_snapshot_range(&snapshot,
+                                                  &context,
+                                                  precolored,
+                                                  snapshot.rows / 2,
+                                                  snapshot.rows - snapshot.rows / 2);
+            winxterm_smoke_expect(state,
+                                  memcmp(row_masks, precolored, pixel_count * sizeof(*row_masks)) == 0,
+                                  "snapshot row-range renderer should match full screen renderer");
+        }
+        winxterm_screen_render_snapshot_dispose(&snapshot);
+        winxterm_smoke_expect(state,
+                              winxterm_screen_render_snapshot_init_rows(&snapshot,
+                                                                        &screen,
+                                                                        WINXTERM_CELL_WIDTH_PIXELS,
+                                                                        WINXTERM_CELL_HEIGHT_PIXELS * 4,
+                                                                        WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                                                                        false,
+                                                                        0,
+                                                                        2,
+                                                                        1),
+                              "row-offset renderer snapshot should initialize");
+        if (snapshot.cells != 0) {
+            const uint32_t marker_rgb = 0x00010203u;
+            uint32_t marker = winxterm_render_bgra_from_rgb(marker_rgb);
+            size_t small_pixel_count = (size_t)WINXTERM_CELL_WIDTH_PIXELS *
+                                       (size_t)WINXTERM_CELL_HEIGHT_PIXELS * 4u;
+            for (size_t i = 0u; i < small_pixel_count; ++i) {
+                precolored[i] = marker;
+            }
+            winxterm_screen_render_snapshot(&snapshot, &context, precolored);
+            winxterm_smoke_expect(state,
+                                  precolored[(size_t)WINXTERM_CELL_WIDTH_PIXELS *
+                                             (size_t)WINXTERM_CELL_HEIGHT_PIXELS] == marker,
+                                  "row-offset snapshot render should not clear rows above the rendered band");
+        }
+        winxterm_screen_render_snapshot_dispose(&snapshot);
+        winxterm_screen_dispose(&screen);
+
+        WinxtermScreen fallback_screen;
+        WinxtermUtf8Decoder fallback_decoder;
+        winxterm_smoke_expect(state,
+                              winxterm_screen_init(&fallback_screen,
+                                                   WINXTERM_TERMINAL_COLUMNS,
+                                                   WINXTERM_TERMINAL_ROWS),
+                              "fallback renderer screen should initialize");
+        winxterm_utf8_decoder_init(&fallback_decoder);
+        static const char fallback_text[] = "\xe2\x82\xac\xe2\x88\x91\xf0\x9f\x98\x80";
+        winxterm_smoke_expect(state,
+                              winxterm_text_feed_bytes(&fallback_screen,
+                                                       &fallback_decoder,
+                                                       (const uint8_t *)fallback_text,
+                                                       sizeof(fallback_text) - 1u),
+                              "fallback renderer fixture should feed");
+        winxterm_smoke_expect(state,
+                              winxterm_screen_cell_at(&fallback_screen, 0, 0)->glyph_index ==
+                                  WINXTERM_DYNAMIC_GLYPH_INDEX &&
+                                  winxterm_screen_cell_at(&fallback_screen, 0, 1)->glyph_index ==
+                                      WINXTERM_DYNAMIC_GLYPH_INDEX &&
+                                  winxterm_screen_cell_at(&fallback_screen, 0, 2)->glyph_index ==
+                                      WINXTERM_DYNAMIC_GLYPH_INDEX &&
+                                  winxterm_screen_cell_at(&fallback_screen, 0, 2)->width == 1u &&
+                                  !winxterm_screen_cell_at(&fallback_screen, 0, 3)->continuation,
+                              "non-bitmap Unicode should retain dynamic glyph keys and one-cell layout");
+        size_t fallback_cached_before = winxterm_render_context_fallback_cached_count(&context);
+        winxterm_screen_render(&fallback_screen,
+                               &context,
+                               spans,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_SPANS,
+                               false);
+        winxterm_smoke_expect(state,
+                              winxterm_smoke_cell_has_non_background_pixels(spans,
+                                                                            width,
+                                                                            2,
+                                                                            0,
+                                                                            1u,
+                                                                            WINXTERM_DEFAULT_BACKGROUND_RGB),
+                              "emoji fallback should draw visible pixels in its screen cell");
+        winxterm_screen_render(&fallback_screen,
+                               &context,
+                               row_masks,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                               false);
+        winxterm_screen_render(&fallback_screen,
+                               &context,
+                               precolored,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_PRECLORED_CACHE,
+                               false);
+        winxterm_smoke_expect(state,
+                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0 &&
+                                  memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
+                              "fallback glyph rendering should be backend-equivalent");
+        winxterm_smoke_expect(state,
+                              winxterm_render_context_fallback_cached_count(&context) > fallback_cached_before,
+                              "fallback renderer should cache first TTF glyph rasterization");
+        size_t fallback_cached_after = winxterm_render_context_fallback_cached_count(&context);
+        winxterm_screen_render(&fallback_screen,
+                               &context,
+                               spans,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_SPANS,
+                               false);
+        winxterm_smoke_expect(state,
+                              winxterm_render_context_fallback_cached_count(&context) == fallback_cached_after,
+                              "fallback renderer should reuse cached glyph bitmaps");
+        winxterm_screen_dispose(&fallback_screen);
+
+        WinxtermScreen variation_screen;
+        WinxtermUtf8Decoder variation_decoder;
+        winxterm_smoke_expect(state,
+                              winxterm_screen_init(&variation_screen,
+                                                   WINXTERM_TERMINAL_COLUMNS,
+                                                   WINXTERM_TERMINAL_ROWS),
+                              "variation selector screen should initialize");
+        winxterm_utf8_decoder_init(&variation_decoder);
+        static const char variation_text[] = "\xe2\x98\xba\xef\xb8\x8f";
+        winxterm_smoke_expect(state,
+                              winxterm_text_feed_bytes(&variation_screen,
+                                                       &variation_decoder,
+                                                       (const uint8_t *)variation_text,
+                                                       sizeof(variation_text) - 1u),
+                              "emoji variation selector fixture should feed");
+        winxterm_smoke_expect(state,
+                              winxterm_screen_cell_at(&variation_screen, 0, 0)->codepoint == 0x263au &&
+                                  winxterm_screen_cell_at(&variation_screen, 0, 0)->combining_count == 1u &&
+                                  winxterm_screen_cell_at(&variation_screen, 0, 0)->combining_codepoints[0] ==
+                                      0xfe0fu &&
+                                  winxterm_screen_cell_at(&variation_screen, 0, 1)->codepoint == (uint32_t)' ',
+                              "emoji variation selectors should attach to the base cell");
+        winxterm_screen_render(&variation_screen,
+                               &context,
+                               spans,
+                               width,
+                               height,
+                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
+                               false);
+        winxterm_screen_dispose(&variation_screen);
+    }
+
+    winxterm_render_context_dispose(&context);
+    free(spans);
+    free(row_masks);
+    free(precolored);
+}
+
+int winxterm_smoke_run(void)
+{
+    WinxtermSmokeState state = {0};
+
+    winxterm_smoke_test_render_constants(&state);
+    winxterm_smoke_test_font_contract(&state);
+    winxterm_smoke_test_log_names(&state);
+    winxterm_smoke_test_window_placement(&state);
+    winxterm_smoke_test_grouped_u64_format(&state);
+    winxterm_smoke_test_options(&state);
+    winxterm_smoke_test_bridge_hardening(&state);
+    winxterm_smoke_test_screen_and_text(&state);
+    winxterm_smoke_test_parser_strings(&state);
+    winxterm_smoke_test_mode_registry(&state);
+    winxterm_smoke_test_query_replies(&state);
+    winxterm_smoke_test_osc_policy(&state);
+    winxterm_smoke_test_reset_sequences(&state);
+    winxterm_smoke_test_screen_layout_extensions(&state);
+    winxterm_smoke_test_keyboard_encoding(&state);
+    winxterm_smoke_test_macro_parser(&state);
+    winxterm_smoke_test_macro_capture_commands(&state);
+    winxterm_smoke_test_daily_ux_helpers(&state);
+    winxterm_smoke_test_renderers(&state);
+
+    return state.failures == 0 ? 0 : 1;
+}

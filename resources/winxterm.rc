@@ -1,0 +1,7 @@
+#include "resource.h"
+
+IDI_WINXTERM ICON "winxterm.ico"
+
+IDR_WINXTERM_FONT_GENERAL RCDATA "ttf/Noto_Sans/static/NotoSans-Regular.ttf"
+IDR_WINXTERM_FONT_EMOJI RCDATA "ttf/Noto_Color_Emoji/NotoColorEmoji-Regular.ttf"
+IDR_WINXTERM_FONT_MATH RCDATA "ttf/Noto_Sans_Math/NotoSansMath-Regular.ttf"

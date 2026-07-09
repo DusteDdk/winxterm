@@ -1,0 +1,25 @@
+# Build outputs
+/build*/
+/dist*/
+
+# Local editor/tool metadata
+/.cursor/
+/.vscode/
+/.vs/
+*.swp
+*.swo
+
+# Local binaries and logs
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.tlog
+*.recipe
+winxterm-debug-*.txt
+
+# Local scratch files
+/test.bmp
+/testfile.txt
+/*.tmp

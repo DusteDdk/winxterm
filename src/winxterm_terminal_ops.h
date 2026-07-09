@@ -1,0 +1,263 @@
+#ifndef WINXTERM_TERMINAL_OPS_H
+#define WINXTERM_TERMINAL_OPS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define WINXTERM_TERMINAL_MAX_PARAMS 16u
+#define WINXTERM_TERMINAL_TITLE_CAPACITY 256u
+#define WINXTERM_TERMINAL_REPLY_CAPACITY 256u
+#define WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY 4096u
+
+typedef enum WinxtermTerminalOpType {
+    WINXTERM_TERMINAL_OP_PRINT = 0,
+    WINXTERM_TERMINAL_OP_CONTROL,
+    WINXTERM_TERMINAL_OP_CURSOR_UP,
+    WINXTERM_TERMINAL_OP_CURSOR_DOWN,
+    WINXTERM_TERMINAL_OP_CURSOR_FORWARD,
+    WINXTERM_TERMINAL_OP_CURSOR_BACK,
+    WINXTERM_TERMINAL_OP_CURSOR_POSITION,
+    WINXTERM_TERMINAL_OP_ERASE_DISPLAY,
+    WINXTERM_TERMINAL_OP_ERASE_LINE,
+    WINXTERM_TERMINAL_OP_INSERT_CHARS,
+    WINXTERM_TERMINAL_OP_DELETE_CHARS,
+    WINXTERM_TERMINAL_OP_INSERT_LINES,
+    WINXTERM_TERMINAL_OP_DELETE_LINES,
+    WINXTERM_TERMINAL_OP_SCROLL_UP,
+    WINXTERM_TERMINAL_OP_SCROLL_DOWN,
+    WINXTERM_TERMINAL_OP_SET_SCROLL_REGION,
+    WINXTERM_TERMINAL_OP_SAVE_CURSOR,
+    WINXTERM_TERMINAL_OP_RESTORE_CURSOR,
+    WINXTERM_TERMINAL_OP_SET_MODE,
+    WINXTERM_TERMINAL_OP_RESET_MODE,
+    WINXTERM_TERMINAL_OP_SAVE_MODE,
+    WINXTERM_TERMINAL_OP_RESTORE_MODE,
+    WINXTERM_TERMINAL_OP_RESET_ATTRIBUTES,
+    WINXTERM_TERMINAL_OP_SET_FOREGROUND,
+    WINXTERM_TERMINAL_OP_SET_BACKGROUND,
+    WINXTERM_TERMINAL_OP_SET_FOREGROUND_INDEX,
+    WINXTERM_TERMINAL_OP_SET_BACKGROUND_INDEX,
+    WINXTERM_TERMINAL_OP_RESET_FOREGROUND,
+    WINXTERM_TERMINAL_OP_RESET_BACKGROUND,
+    WINXTERM_TERMINAL_OP_SET_TEXT_ATTRIBUTES,
+    WINXTERM_TERMINAL_OP_RESET_TEXT_ATTRIBUTES,
+    WINXTERM_TERMINAL_OP_PUSH_ATTRIBUTES,
+    WINXTERM_TERMINAL_OP_POP_ATTRIBUTES,
+    WINXTERM_TERMINAL_OP_TITLE,
+    WINXTERM_TERMINAL_OP_BELL,
+    WINXTERM_TERMINAL_OP_RESIZE,
+    WINXTERM_TERMINAL_OP_QUERY,
+    WINXTERM_TERMINAL_OP_REPLY_BYTES,
+    WINXTERM_TERMINAL_OP_OSC,
+    WINXTERM_TERMINAL_OP_RESET,
+    WINXTERM_TERMINAL_OP_DECALN,
+    WINXTERM_TERMINAL_OP_CURSOR_HORIZONTAL_ABSOLUTE,
+    WINXTERM_TERMINAL_OP_CURSOR_VERTICAL_ABSOLUTE,
+    WINXTERM_TERMINAL_OP_CURSOR_NEXT_LINE,
+    WINXTERM_TERMINAL_OP_CURSOR_PREVIOUS_LINE,
+    WINXTERM_TERMINAL_OP_CURSOR_TAB_FORWARD,
+    WINXTERM_TERMINAL_OP_CURSOR_TAB_BACK,
+    WINXTERM_TERMINAL_OP_TAB_SET,
+    WINXTERM_TERMINAL_OP_TAB_CLEAR,
+    WINXTERM_TERMINAL_OP_INDEX,
+    WINXTERM_TERMINAL_OP_NEXT_LINE,
+    WINXTERM_TERMINAL_OP_REVERSE_INDEX,
+    WINXTERM_TERMINAL_OP_ERASE_CHARS,
+    WINXTERM_TERMINAL_OP_REPEAT_CHAR,
+    WINXTERM_TERMINAL_OP_SET_HORIZONTAL_MARGINS,
+    WINXTERM_TERMINAL_OP_INSERT_COLUMNS,
+    WINXTERM_TERMINAL_OP_DELETE_COLUMNS,
+    WINXTERM_TERMINAL_OP_SCROLL_LEFT,
+    WINXTERM_TERMINAL_OP_SCROLL_RIGHT,
+    WINXTERM_TERMINAL_OP_SET_PROTECTED,
+    WINXTERM_TERMINAL_OP_SELECTIVE_ERASE_DISPLAY,
+    WINXTERM_TERMINAL_OP_SELECTIVE_ERASE_LINE,
+    WINXTERM_TERMINAL_OP_RECT_ERASE,
+    WINXTERM_TERMINAL_OP_RECT_FILL,
+    WINXTERM_TERMINAL_OP_RECT_COPY,
+    WINXTERM_TERMINAL_OP_RECT_ATTR,
+    WINXTERM_TERMINAL_OP_CURSOR_STYLE,
+    WINXTERM_TERMINAL_OP_SET_CHARSET
+} WinxtermTerminalOpType;
+
+typedef enum WinxtermTerminalControl {
+    WINXTERM_TERMINAL_CONTROL_BS = 0x08,
+    WINXTERM_TERMINAL_CONTROL_TAB = 0x09,
+    WINXTERM_TERMINAL_CONTROL_LF = 0x0a,
+    WINXTERM_TERMINAL_CONTROL_CR = 0x0d
+} WinxtermTerminalControl;
+
+typedef enum WinxtermTerminalEraseMode {
+    WINXTERM_TERMINAL_ERASE_TO_END = 0,
+    WINXTERM_TERMINAL_ERASE_TO_BEGINNING = 1,
+    WINXTERM_TERMINAL_ERASE_ALL = 2,
+    WINXTERM_TERMINAL_ERASE_SAVED_LINES = 3
+} WinxtermTerminalEraseMode;
+
+typedef enum WinxtermTerminalMode {
+    WINXTERM_TERMINAL_MODE_APPLICATION_CURSOR = 1,
+    WINXTERM_TERMINAL_MODE_REVERSE_VIDEO = 5,
+    WINXTERM_TERMINAL_MODE_ORIGIN = 6,
+    WINXTERM_TERMINAL_MODE_AUTOWRAP = 7,
+    WINXTERM_TERMINAL_MODE_CURSOR_VISIBLE = 25,
+    WINXTERM_TERMINAL_MODE_REVERSE_WRAP = 45,
+    WINXTERM_TERMINAL_MODE_LEFT_RIGHT_MARGIN = 69,
+    WINXTERM_TERMINAL_MODE_ALT_SCREEN = 47,
+    WINXTERM_TERMINAL_MODE_ALT_SCREEN_1047 = 1047,
+    WINXTERM_TERMINAL_MODE_SAVE_CURSOR_1048 = 1048,
+    WINXTERM_TERMINAL_MODE_ALT_SCREEN_1049 = 1049,
+    WINXTERM_TERMINAL_MODE_FOCUS_REPORT = 1004,
+    WINXTERM_TERMINAL_MODE_MOUSE_X10 = 9,
+    WINXTERM_TERMINAL_MODE_MOUSE_NORMAL = 1000,
+    WINXTERM_TERMINAL_MODE_MOUSE_BUTTON_EVENT = 1002,
+    WINXTERM_TERMINAL_MODE_MOUSE_ANY_EVENT = 1003,
+    WINXTERM_TERMINAL_MODE_MOUSE_SGR = 1006,
+    WINXTERM_TERMINAL_MODE_BRACKETED_PASTE = 2004,
+    WINXTERM_TERMINAL_MODE_SYNCHRONIZED_OUTPUT = 2026,
+    WINXTERM_TERMINAL_MODE_APPLICATION_KEYPAD = 100000,
+    WINXTERM_TERMINAL_MODE_EIGHT_BIT_CONTROLS = 100001
+} WinxtermTerminalMode;
+
+typedef enum WinxtermTerminalTabClearMode {
+    WINXTERM_TERMINAL_TAB_CLEAR_CURRENT = 0,
+    WINXTERM_TERMINAL_TAB_CLEAR_ALL = 3
+} WinxtermTerminalTabClearMode;
+
+typedef enum WinxtermTerminalCursorStyle {
+    WINXTERM_TERMINAL_CURSOR_STYLE_DEFAULT = 0,
+    WINXTERM_TERMINAL_CURSOR_STYLE_BLINK_BLOCK = 1,
+    WINXTERM_TERMINAL_CURSOR_STYLE_STEADY_BLOCK = 2,
+    WINXTERM_TERMINAL_CURSOR_STYLE_BLINK_UNDERLINE = 3,
+    WINXTERM_TERMINAL_CURSOR_STYLE_STEADY_UNDERLINE = 4,
+    WINXTERM_TERMINAL_CURSOR_STYLE_BLINK_BAR = 5,
+    WINXTERM_TERMINAL_CURSOR_STYLE_STEADY_BAR = 6
+} WinxtermTerminalCursorStyle;
+
+typedef enum WinxtermTerminalCharset {
+    WINXTERM_TERMINAL_CHARSET_ASCII = 0,
+    WINXTERM_TERMINAL_CHARSET_DEC_SPECIAL_GRAPHICS = 1
+} WinxtermTerminalCharset;
+
+typedef enum WinxtermTerminalQueryType {
+    WINXTERM_TERMINAL_QUERY_PRIMARY_DA = 0,
+    WINXTERM_TERMINAL_QUERY_SECONDARY_DA,
+    WINXTERM_TERMINAL_QUERY_DSR_STATUS,
+    WINXTERM_TERMINAL_QUERY_CPR,
+    WINXTERM_TERMINAL_QUERY_DECRQM,
+    WINXTERM_TERMINAL_QUERY_DECRQSS,
+    WINXTERM_TERMINAL_QUERY_XTVERSION,
+    WINXTERM_TERMINAL_QUERY_XTQMODKEYS,
+    WINXTERM_TERMINAL_QUERY_XTQFMTKEYS
+} WinxtermTerminalQueryType;
+
+typedef enum WinxtermTerminalOscCommand {
+    WINXTERM_TERMINAL_OSC_TITLE_AND_ICON = 0,
+    WINXTERM_TERMINAL_OSC_ICON_TITLE = 1,
+    WINXTERM_TERMINAL_OSC_TITLE = 2,
+    WINXTERM_TERMINAL_OSC_PALETTE = 4,
+    WINXTERM_TERMINAL_OSC_HYPERLINK = 8,
+    WINXTERM_TERMINAL_OSC_FOREGROUND = 10,
+    WINXTERM_TERMINAL_OSC_BACKGROUND = 11,
+    WINXTERM_TERMINAL_OSC_SELECTION = 52,
+    WINXTERM_TERMINAL_OSC_WINXTERM_CONTROL = 9001,
+    WINXTERM_TERMINAL_OSC_UNKNOWN = -1
+} WinxtermTerminalOscCommand;
+
+typedef enum WinxtermTerminalOscOutcome {
+    WINXTERM_TERMINAL_OSC_ACCEPTED = 0,
+    WINXTERM_TERMINAL_OSC_ACCEPTED_NO_CONSUMER,
+    WINXTERM_TERMINAL_OSC_DENIED_SENSITIVE,
+    WINXTERM_TERMINAL_OSC_UNSUPPORTED,
+    WINXTERM_TERMINAL_OSC_MALFORMED,
+    WINXTERM_TERMINAL_OSC_OVERFLOW
+} WinxtermTerminalOscOutcome;
+
+typedef enum WinxtermTerminalResetKind {
+    WINXTERM_TERMINAL_RESET_SOFT = 0,
+    WINXTERM_TERMINAL_RESET_HARD
+} WinxtermTerminalResetKind;
+
+typedef struct WinxtermTerminalOp {
+    WinxtermTerminalOpType type;
+    size_t source_byte_count;
+    bool private_mode;
+    union {
+        uint32_t codepoint;
+        uint32_t rgb;
+        uint32_t flags;
+        int count;
+        struct {
+            int row;
+            int column;
+        } cursor;
+        struct {
+            int top;
+            int bottom;
+        } scroll_region;
+        struct {
+            int left;
+            int right;
+        } horizontal_margins;
+        struct {
+            WinxtermTerminalTabClearMode mode;
+        } tab_clear;
+        struct {
+            WinxtermTerminalEraseMode mode;
+        } erase;
+        struct {
+            int top;
+            int left;
+            int bottom;
+            int right;
+            int dest_top;
+            int dest_left;
+            uint32_t codepoint;
+            uint32_t flags;
+            bool set_flags;
+        } rectangle;
+        struct {
+            WinxtermTerminalMode mode;
+        } mode;
+        struct {
+            WinxtermTerminalCursorStyle style;
+        } cursor_style;
+        struct {
+            int slot;
+            WinxtermTerminalCharset charset;
+        } charset;
+        struct {
+            int columns;
+            int rows;
+        } resize;
+        struct {
+            WinxtermTerminalQueryType type;
+            char private_marker;
+            int param;
+            char request[WINXTERM_TERMINAL_REPLY_CAPACITY];
+            size_t request_length;
+        } query;
+        struct {
+            uint8_t bytes[WINXTERM_TERMINAL_REPLY_CAPACITY];
+            size_t length;
+        } reply;
+        struct {
+            WinxtermTerminalOscCommand command;
+            WinxtermTerminalOscOutcome outcome;
+            char payload[WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY];
+            size_t payload_length;
+        } osc;
+        struct {
+            WinxtermTerminalResetKind kind;
+        } reset;
+        struct {
+            char text[WINXTERM_TERMINAL_TITLE_CAPACITY];
+            size_t length;
+        } title;
+        WinxtermTerminalControl control;
+    } data;
+} WinxtermTerminalOp;
+
+typedef bool (*WinxtermTerminalOpSink)(void *context, const WinxtermTerminalOp *op);
+
+#endif
