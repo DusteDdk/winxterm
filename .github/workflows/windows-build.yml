@@ -31,3 +31,44 @@ jobs:
             dist-fast-release/dstshell.exe
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Release tagged build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build with Visual Studio 2022
+        shell: bash
+        run: bash ./build-fast-release.sh
+
+      - name: Package Windows executables
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $packageDirectory = "winxterm-$env:TAG_NAME"
+          $archive = "$packageDirectory.zip"
+
+          New-Item -ItemType Directory -Path $packageDirectory | Out-Null
+          Copy-Item "dist-fast-release/winxterm.exe" $packageDirectory
+          Copy-Item "dist-fast-release/dstshell.exe" $packageDirectory
+          Compress-Archive -Path $packageDirectory -DestinationPath $archive
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $archive = "winxterm-$env:TAG_NAME.zip"
+          gh release create $env:TAG_NAME $archive `
+            --verify-tag `
+            --title "winxterm $env:TAG_NAME" `
+            --generate-notes
