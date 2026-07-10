@@ -41,6 +41,35 @@ static bool winxterm_dstcmd_is_unc_rooted(const wchar_t *path)
     return path != 0 && winxterm_dstcmd_is_slash(path[0]) && winxterm_dstcmd_is_slash(path[1]);
 }
 
+static size_t winxterm_dstcmd_path_root_length(const wchar_t *path)
+{
+    if (path == 0 || path[0] == L'\0') {
+        return 0u;
+    }
+    if (winxterm_dstcmd_has_drive_root(path)) {
+        return 3u;
+    }
+    if (!winxterm_dstcmd_is_unc_rooted(path)) {
+        return 0u;
+    }
+
+    const wchar_t *p = path + 2u;
+    while (*p != L'\0' && !winxterm_dstcmd_is_slash(*p)) {
+        ++p;
+    }
+    if (*p == L'\0') {
+        return (size_t)(p - path);
+    }
+    ++p;
+    while (*p != L'\0' && !winxterm_dstcmd_is_slash(*p)) {
+        ++p;
+    }
+    if (*p == L'\0') {
+        return (size_t)(p - path);
+    }
+    return (size_t)(p - path) + 1u;
+}
+
 static bool winxterm_dstcmd_starts_with(const wchar_t *text, const wchar_t *prefix)
 {
     if (text == 0 || prefix == 0) {
@@ -315,6 +344,18 @@ bool winxterm_dstcmd_path_append_child(const wchar_t *directory,
                                        size_t out_count)
 {
     return winxterm_dstcmd_join_raw(directory, name, out, out_count);
+}
+
+void winxterm_dstcmd_path_trim_trailing_separators(wchar_t *path)
+{
+    if (path == 0) {
+        return;
+    }
+    size_t length = wcslen(path);
+    size_t root_length = winxterm_dstcmd_path_root_length(path);
+    while (length > root_length && winxterm_dstcmd_is_slash(path[length - 1u])) {
+        path[--length] = L'\0';
+    }
 }
 
 bool winxterm_dstcmd_path_set_attributes_scratch(WinxtermDstcmdScratch *scratch,

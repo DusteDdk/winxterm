@@ -83,6 +83,7 @@ bool winxterm_dstcmd_path_append_child(const wchar_t *directory,
                                        const wchar_t *name,
                                        wchar_t *out,
                                        size_t out_count);
+void winxterm_dstcmd_path_trim_trailing_separators(wchar_t *path);
 const wchar_t *winxterm_dstcmd_path_basename(const wchar_t *path);
 bool winxterm_dstcmd_path_to_display(const wchar_t *path, wchar_t *out, size_t out_count);
 bool winxterm_dstcmd_path_to_native(const wchar_t *path, wchar_t *out, size_t out_count);

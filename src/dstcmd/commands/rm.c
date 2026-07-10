@@ -749,6 +749,7 @@ static int winxterm_dstcmd_remove_path(WinxtermDstcmdShell *shell,
         free(native_path);
         return 1;
     }
+    winxterm_dstcmd_path_trim_trailing_separators(native_path);
     if (shell != 0) {
         return winxterm_dstcmd_rm_start_async_directory(shell, native_path, path, info.attributes, force);
     }

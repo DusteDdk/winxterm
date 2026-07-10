@@ -3685,6 +3685,7 @@ bool winxterm_dstcmd_shell_set_cwd(WinxtermDstcmdShell *shell, const wchar_t *pa
         !winxterm_dstcmd_path_is_directory_scratch(&shell->scratch, resolved)) {
         goto cleanup;
     }
+    winxterm_dstcmd_path_trim_trailing_separators(resolved);
     if (shell->dir_cache.lock_initialized) {
         EnterCriticalSection(&shell->dir_cache.lock);
     }
@@ -8142,6 +8143,24 @@ static bool winxterm_dstcmd_smoke_run_long_paths(WinxtermDstcmdShell *shell)
     if (ok) {
         ok = winxterm_dstcmd_shell_submit_line(shell,
                                                L"rm -rf \"source dir\" \"moved dir\" \"alpha file.txt\"") == 0 &&
+             winxterm_dstcmd_job_pool_wait_idle(&shell->jobs, 5000u);
+    }
+    if (ok) {
+        ok = winxterm_dstcmd_path_append_child(deep_dir,
+                                               L"trailing dir",
+                                               source_dir,
+                                               WINXTERM_DSTCMD_PATH_CAPACITY) &&
+             winxterm_dstcmd_smoke_create_directory(source_dir) &&
+             winxterm_dstcmd_path_append_child(source_dir,
+                                               L"payload.txt",
+                                               payload_path,
+                                               WINXTERM_DSTCMD_PATH_CAPACITY) &&
+             winxterm_dstcmd_smoke_write_file_bytes(payload_path,
+                                                    (const uint8_t *)payload_text,
+                                                    sizeof(payload_text) - 1u);
+    }
+    if (ok) {
+        ok = winxterm_dstcmd_shell_submit_line(shell, L"rm -rf \"trailing dir/\"") == 0 &&
              winxterm_dstcmd_job_pool_wait_idle(&shell->jobs, 5000u);
     }
 
