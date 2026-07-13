@@ -254,7 +254,7 @@ static int winxterm_dstcmd_host_send_request(WinxtermDstcmdShell *shell,
             return 1;
         }
     }
-    if (!winxterm_dstcmd_host_append(request, sizeof(request), &offset, "\a")) {
+    if (!winxterm_dstcmd_host_append(request, sizeof(request), &offset, "\x1b\\")) {
         return 1;
     }
     if (!winxterm_dstcmd_shell_write_utf8(shell, request)) {

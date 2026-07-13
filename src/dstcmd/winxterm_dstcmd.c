@@ -732,7 +732,7 @@ bool winxterm_dstcmd_shell_set_title_wide(WinxtermDstcmdShell *shell, const wcha
     }
     const char prefix[] = "\x1b]0;";
     size_t prefix_length = sizeof(prefix) - 1u;
-    size_t sequence_length = prefix_length + (size_t)utf8_count;
+    size_t sequence_length = prefix_length + (size_t)utf8_count + 1u;
     char *sequence = (char *)calloc(sequence_length + 1u, sizeof(*sequence));
     if (sequence == 0) {
         free(sanitized);
@@ -749,7 +749,8 @@ bool winxterm_dstcmd_shell_set_title_wide(WinxtermDstcmdShell *shell, const wcha
                                   0) > 0;
     free(sanitized);
     if (ok) {
-        sequence[prefix_length + (size_t)utf8_count - 1u] = '\a';
+        sequence[prefix_length + (size_t)utf8_count - 1u] = '\x1b';
+        sequence[prefix_length + (size_t)utf8_count] = '\\';
         ok = winxterm_dstcmd_shell_write_bytes(shell,
                                                (const uint8_t *)sequence,
                                                sequence_length);
@@ -8379,7 +8380,8 @@ static bool winxterm_dstcmd_smoke_run_alias(WinxtermDstcmdShell *shell)
         expected_title[offset++] = (char)0xa0u;
         expected_title[offset++] = (char)0x80u;
     }
-    expected_title[offset++] = '\a';
+    expected_title[offset++] = '\x1b';
+    expected_title[offset++] = '\\';
     expected_title[offset] = '\0';
 
     winxterm_dstcmd_smoke_clear_capture(shell);
