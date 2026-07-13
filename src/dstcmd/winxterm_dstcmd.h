@@ -3,6 +3,7 @@
 
 #include "dstcmd/api/scratch.h"
 #include "dstcmd/winxterm_dstcmd_jobs.h"
+#include "dstcmd/winxterm_dstcmd_job_client.h"
 #include "winxterm_diagnostics.h"
 
 #include <stdbool.h>
@@ -12,6 +13,7 @@
 
 typedef struct sqlite3 sqlite3;
 typedef struct sqlite3_stmt sqlite3_stmt;
+typedef struct WinxtermDstcmdArgv WinxtermDstcmdArgv;
 
 #define WINXTERM_DSTCMD_PATH_CAPACITY 32768u
 #define WINXTERM_DSTCMD_LINE_CAPACITY 4096u
@@ -108,6 +110,7 @@ typedef struct WinxtermDstcmdShell {
     DWORD original_error_console_mode;
     DWORD shell_error_console_mode;
     WinxtermDstcmdJobPool jobs;
+    WinxtermDstcmdJobClient job_client;
     WinxtermDstcmdDirCache dir_cache;
     wchar_t cwd[WINXTERM_DSTCMD_PATH_CAPACITY];
     wchar_t previous_cwd[WINXTERM_DSTCMD_PATH_CAPACITY];
@@ -217,6 +220,14 @@ void winxterm_dstcmd_shell_enter_line_editor_mode(WinxtermDstcmdShell *shell);
 void winxterm_dstcmd_shell_enter_foreground_child_mode(WinxtermDstcmdShell *shell);
 void winxterm_dstcmd_shell_restore_original_console_modes(WinxtermDstcmdShell *shell);
 int winxterm_dstcmd_shell_submit_line(WinxtermDstcmdShell *shell, const wchar_t *line);
+int winxterm_dstcmd_shell_run_background_line(WinxtermDstcmdShell *shell,
+                                              const wchar_t *line,
+                                              bool connectable_stdin,
+                                              uint64_t *job_id);
+bool winxterm_dstcmd_shell_expand_alias(WinxtermDstcmdShell *shell,
+                                       WinxtermDstcmdArgv *argv,
+                                       wchar_t *error,
+                                       size_t error_count);
 bool winxterm_dstcmd_shell_set_cwd(WinxtermDstcmdShell *shell, const wchar_t *path);
 const wchar_t *winxterm_dstcmd_shell_cwd(const WinxtermDstcmdShell *shell);
 const WinxtermDstcmdAlias *winxterm_dstcmd_shell_find_alias(const WinxtermDstcmdShell *shell,

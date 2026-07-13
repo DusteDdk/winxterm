@@ -64,5 +64,15 @@ bool winxterm_dstcmd_exec_uses_interactive_client(const WinxtermDstcmdExecStage 
 int winxterm_dstcmd_exec_run(WinxtermDstcmdShell *shell,
                              const WinxtermDstcmdExecStage *stages,
                              size_t stage_count);
+int winxterm_dstcmd_exec_run_managed_background(WinxtermDstcmdShell *shell,
+                                                const WinxtermDstcmdArgv *argv,
+                                                bool connectable_stdin,
+                                                uint64_t *job_id);
+int winxterm_dstcmd_exec_run_managed_foreground(WinxtermDstcmdShell *shell,
+                                                const WinxtermDstcmdArgv *argv,
+                                                uint64_t *job_id);
+int winxterm_dstcmd_exec_run_managed_stages_background(
+    WinxtermDstcmdShell *shell, const WinxtermDstcmdExecStage *stages,
+    size_t stage_count, bool connectable_stdin, uint64_t *job_id);
 
 #endif

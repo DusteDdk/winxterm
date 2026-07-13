@@ -6,6 +6,11 @@
 #include "winxterm_client.h"
 #include "winxterm_clipboard.h"
 #include "winxterm_input.h"
+#include "winxterm_job_channel.h"
+#include "winxterm_job_journal.h"
+#include "winxterm_job_plan.h"
+#include "winxterm_job_manager.h"
+#include "winxterm_job_protocol.h"
 #include "winxterm_log.h"
 #include "winxterm_macro.h"
 #include "winxterm_modes.h"
@@ -16,6 +21,9 @@
 #include "winxterm_scale.h"
 #include "winxterm_screen.h"
 #include "winxterm_text.h"
+#include "winxterm_terminal_session.h"
+#include "winxterm_transfer_format.h"
+#include "dstcmd/winxterm_dstcmd_job_client.h"
 #include "winxterm_ux.h"
 #include "winxterm_window_placement.h"
 
@@ -39,6 +47,91 @@ typedef struct WinxtermProtocolCapture {
     size_t reply_count;
 } WinxtermProtocolCapture;
 
+typedef struct WinxtermJobStressContext {
+    WinxtermJobManager *manager;
+    uint64_t requester_id;
+    uint64_t job_id;
+    volatile LONG failures;
+} WinxtermJobStressContext;
+
+static DWORD WINAPI winxterm_smoke_job_snapshot_thread(void *context)
+{
+    WinxtermJobStressContext *stress = (WinxtermJobStressContext *)context;
+    for (size_t i = 0u; i < 2000u; ++i) {
+        WinxtermManagedJobSnapshot *snapshot = 0;
+        size_t count = 0u;
+        if (!winxterm_job_manager_snapshot(stress->manager, stress->requester_id,
+                                           &snapshot, &count) || count == 0u) {
+            InterlockedIncrement(&stress->failures);
+        }
+        winxterm_job_manager_snapshot_dispose(snapshot);
+    }
+    return 0u;
+}
+
+static DWORD WINAPI winxterm_smoke_job_metadata_thread(void *context)
+{
+    WinxtermJobStressContext *stress = (WinxtermJobStressContext *)context;
+    for (size_t i = 0u; i < 2000u; ++i) {
+        if (!winxterm_job_manager_set_output(stress->manager, stress->job_id,
+                                             i % 4096u, (i % 97u) == 0u)) {
+            InterlockedIncrement(&stress->failures);
+        }
+    }
+    return 0u;
+}
+
+typedef struct WinxtermJobMockHost {
+    HANDLE request_read;
+    HANDLE reply_write;
+    volatile LONG failures;
+} WinxtermJobMockHost;
+
+static DWORD WINAPI winxterm_smoke_job_mock_host_thread(void *context)
+{
+    WinxtermJobMockHost *host = (WinxtermJobMockHost *)context;
+    WinxtermJobFrame request;
+    if (!winxterm_job_channel_read(host->request_read, &request) ||
+        request.header.type != WINXTERM_JOB_MESSAGE_CAPABILITIES) {
+        InterlockedIncrement(&host->failures);
+        return 1u;
+    }
+    uint8_t event_payload[96];
+    size_t event_length = 0u;
+    bool ok = winxterm_job_tlv_append_u32(event_payload, sizeof(event_payload), &event_length,
+                                         WINXTERM_JOB_TLV_EVENT_KIND,
+                                         WINXTERM_JOB_EVENT_FOREGROUND_CHANGED) &&
+              winxterm_job_tlv_append_u64(event_payload, sizeof(event_payload), &event_length,
+                                         WINXTERM_JOB_TLV_JOB_ID, 7u) &&
+              winxterm_job_tlv_append_u32(event_payload, sizeof(event_payload), &event_length,
+                                         WINXTERM_JOB_TLV_STATE,
+                                         WINXTERM_JOB_FOREGROUND) &&
+              winxterm_job_tlv_append_u32(event_payload, sizeof(event_payload), &event_length,
+                                         WINXTERM_JOB_TLV_EXIT_CODE, 0u);
+    WinxtermJobFrameHeader event_header = {
+        WINXTERM_JOB_PROTOCOL_VERSION, WINXTERM_JOB_MESSAGE_EVENT, 0u, 0u,
+        (uint32_t)event_length
+    };
+    uint8_t reply_payload[32];
+    size_t reply_length = 0u;
+    ok = ok && winxterm_job_tlv_append_u32(reply_payload, sizeof(reply_payload), &reply_length,
+                                          WINXTERM_JOB_TLV_STATUS, ERROR_SUCCESS) &&
+         winxterm_job_tlv_append_u32(reply_payload, sizeof(reply_payload), &reply_length,
+                                    WINXTERM_JOB_TLV_FLAGS,
+                                    WINXTERM_JOB_CAPABILITY_LIST |
+                                    WINXTERM_JOB_CAPABILITY_EVENTS);
+    WinxtermJobFrameHeader reply_header = {
+        WINXTERM_JOB_PROTOCOL_VERSION, WINXTERM_JOB_MESSAGE_REPLY, 0u,
+        request.header.request_id, (uint32_t)reply_length
+    };
+    if (!ok || !winxterm_job_channel_write(host->reply_write, &event_header, event_payload) ||
+        !winxterm_job_channel_write(host->reply_write, &reply_header, reply_payload)) {
+        InterlockedIncrement(&host->failures);
+    }
+    winxterm_job_frame_dispose(&request);
+    return 0u;
+}
+
 static void winxterm_smoke_expect(WinxtermSmokeState *state, bool condition, const char *message)
 {
     if (condition) {
@@ -49,6 +142,451 @@ static void winxterm_smoke_expect(WinxtermSmokeState *state, bool condition, con
     OutputDebugStringA("winxterm smoke failure: ");
     OutputDebugStringA(message);
     OutputDebugStringA("\n");
+}
+
+static void winxterm_smoke_test_job_control_contracts(WinxtermSmokeState *state)
+{
+    wchar_t transfer_bytes[64], transfer_duration[64], transfer_speed[64];
+    winxterm_transfer_format_bytes(1536u, transfer_bytes, 64u);
+    winxterm_transfer_format_duration(500000000ull, transfer_duration, 64u);
+    winxterm_transfer_format_speed(1536u, 500000000ull, transfer_speed, 64u);
+    winxterm_smoke_expect(state,
+                          wcscmp(transfer_bytes, L"1.50 KiB") == 0 &&
+                              wcscmp(transfer_duration, L"500 ms") == 0 &&
+                              wcscmp(transfer_speed, L"3.00 KiB/s") == 0,
+                          "managed and fallback redirects should share exact summary formatting");
+
+    WinxtermJobCoordinator coordinator;
+    winxterm_job_coordinator_init(&coordinator, 2u);
+    uint32_t coordinator_action = 0u;
+    uint64_t coordinator_job = 0u;
+    uint8_t *coordinator_view = (uint8_t *)malloc(1u);
+    uint8_t *taken_view = 0;
+    size_t taken_view_count = 0u;
+    winxterm_job_coordinator_set_active_session(&coordinator, 9u);
+    winxterm_smoke_expect(state,
+                          winxterm_job_coordinator_enqueue(&coordinator, 1u, 11u) &&
+                              winxterm_job_coordinator_enqueue(&coordinator, 2u, 12u) &&
+                              !winxterm_job_coordinator_enqueue(&coordinator, 3u, 13u) &&
+                              winxterm_job_coordinator_take(&coordinator,
+                                                            &coordinator_action,
+                                                            &coordinator_job) &&
+                              coordinator_action == 1u && coordinator_job == 11u &&
+                              coordinator_view != 0 &&
+                              winxterm_job_coordinator_publish_view(
+                                  &coordinator, 11u, coordinator_view, 1u) &&
+                              winxterm_job_coordinator_take_view(
+                                  &coordinator, &coordinator_job, &taken_view,
+                                  &taken_view_count) &&
+                              coordinator_job == 11u && taken_view == coordinator_view &&
+                              taken_view_count == 1u &&
+                              winxterm_job_coordinator_active_session(&coordinator) == 9u,
+                          "bridge-owned coordinator should bound and serialize native commands");
+    WinxtermJobCoordinatorClient coordinator_client;
+    memset(&coordinator_client, 0, sizeof(coordinator_client));
+    coordinator_client.requester_id = 77u;
+    InitializeCriticalSection(&coordinator_client.reply_lock);
+    coordinator_client.reply_lock_initialized = true;
+    HANDLE coordinator_read = 0;
+    bool coordinator_pipe = CreatePipe(&coordinator_read,
+                                       &coordinator_client.reply_write, 0, 0) != FALSE;
+    WinxtermJobFrameHeader coordinator_event_header = {
+        WINXTERM_JOB_PROTOCOL_VERSION, WINXTERM_JOB_MESSAGE_EVENT, 0u, 0u, 0u
+    };
+    if (coordinator_pipe &&
+        winxterm_job_coordinator_add_client(&coordinator, &coordinator_client)) {
+        winxterm_job_coordinator_broadcast(&coordinator, &coordinator_event_header,
+                                           0, 0, 0);
+    }
+    WinxtermJobFrame coordinator_event;
+    memset(&coordinator_event, 0, sizeof(coordinator_event));
+    bool coordinator_broadcast_ok = coordinator_pipe &&
+        winxterm_job_channel_read(coordinator_read, &coordinator_event) &&
+        coordinator_event.header.type == WINXTERM_JOB_MESSAGE_EVENT;
+    winxterm_job_frame_dispose(&coordinator_event);
+    EnterCriticalSection(&coordinator_client.reply_lock);
+    for (size_t i = 0u; coordinator_broadcast_ok && i < 300u; ++i) {
+        winxterm_job_coordinator_broadcast(&coordinator, &coordinator_event_header,
+                                           0, 0, 0);
+    }
+    LeaveCriticalSection(&coordinator_client.reply_lock);
+    bool coordinator_resync = false;
+    for (size_t i = 0u; coordinator_broadcast_ok && !coordinator_resync && i < 260u; ++i) {
+        memset(&coordinator_event, 0, sizeof(coordinator_event));
+        if (!winxterm_job_channel_read(coordinator_read, &coordinator_event)) {
+            coordinator_broadcast_ok = false;
+            break;
+        }
+        WinxtermJobTlvReader event_reader;
+        WinxtermJobTlv event_tlv;
+        winxterm_job_tlv_reader_init(&event_reader, coordinator_event.payload,
+                                     coordinator_event.header.payload_length);
+        while (winxterm_job_tlv_next(&event_reader, &event_tlv)) {
+            uint32_t kind = 0u;
+            if (event_tlv.type == WINXTERM_JOB_TLV_EVENT_KIND &&
+                winxterm_job_tlv_read_u32(&event_tlv, &kind) &&
+                kind == WINXTERM_JOB_EVENT_RESYNC_REQUIRED) coordinator_resync = true;
+        }
+        winxterm_job_frame_dispose(&coordinator_event);
+    }
+    WinxtermJobCoordinatorClient *detached_clients =
+        winxterm_job_coordinator_detach_clients(&coordinator);
+    winxterm_smoke_expect(state,
+                          coordinator_broadcast_ok && coordinator_resync &&
+                              detached_clients == &coordinator_client,
+                          "coordinator should queue broadcasts and report event overflow by resync");
+    winxterm_job_coordinator_stop_client(&coordinator_client);
+    if (coordinator_read != 0) CloseHandle(coordinator_read);
+    if (coordinator_client.reply_write != 0) CloseHandle(coordinator_client.reply_write);
+    DeleteCriticalSection(&coordinator_client.reply_lock);
+    if (taken_view != coordinator_view) free(coordinator_view);
+    free(taken_view);
+    winxterm_job_coordinator_dispose(&coordinator);
+
+    WinxtermTerminalSession session;
+    winxterm_smoke_expect(state,
+                          winxterm_terminal_session_init(&session, 12, 4, true) &&
+                              session.screen_stored && session.screen.columns == 12 &&
+                              session.screen.rows == 4,
+                          "managed terminal sessions should own initialized screen state");
+    static const uint8_t session_output[] = "session transcript";
+    uint8_t *session_copy = 0;
+    size_t session_copy_count = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_terminal_session_record(
+                              &session, session_output, sizeof(session_output) - 1u) &&
+                              winxterm_terminal_session_copy_transcript(
+                                  &session, &session_copy, &session_copy_count) &&
+                              session_copy_count == sizeof(session_output) - 1u &&
+                              memcmp(session_copy, session_output, session_copy_count) == 0,
+                          "managed terminal sessions should retain independent transcript snapshots");
+    free(session_copy);
+    winxterm_terminal_session_dispose(&session);
+
+    uint8_t payload[64];
+    size_t payload_length = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_job_tlv_append_u64(payload, sizeof(payload), &payload_length,
+                                                     WINXTERM_JOB_TLV_JOB_ID, 0x123456789abcdef0ull),
+                          "job protocol should append an id TLV");
+    WinxtermJobFrameHeader source = {WINXTERM_JOB_PROTOCOL_VERSION,
+                                    WINXTERM_JOB_MESSAGE_FOREGROUND, 7u, 99u,
+                                    (uint32_t)payload_length};
+    uint8_t encoded[WINXTERM_JOB_PROTOCOL_HEADER_SIZE];
+    WinxtermJobFrameHeader decoded;
+    winxterm_smoke_expect(state,
+                          winxterm_job_frame_encode_header(&source, encoded) &&
+                              winxterm_job_frame_decode_header(encoded, sizeof(encoded), &decoded) &&
+                              decoded.type == source.type && decoded.flags == source.flags &&
+                              decoded.request_id == source.request_id &&
+                              decoded.payload_length == source.payload_length,
+                          "job protocol header should round trip");
+    encoded[0] ^= 1u;
+    winxterm_smoke_expect(state,
+                          !winxterm_job_frame_decode_header(encoded, sizeof(encoded), &decoded),
+                          "job protocol should reject a bad magic value");
+    WinxtermJobTlvReader reader;
+    WinxtermJobTlv tlv;
+    uint64_t id = 0u;
+    winxterm_job_tlv_reader_init(&reader, payload, payload_length);
+    winxterm_smoke_expect(state,
+                          winxterm_job_tlv_next(&reader, &tlv) &&
+                              tlv.type == WINXTERM_JOB_TLV_JOB_ID &&
+                              winxterm_job_tlv_read_u64(&tlv, &id) && id == 0x123456789abcdef0ull,
+                          "job protocol TLV should round trip");
+
+    SECURITY_ATTRIBUTES security;
+    memset(&security, 0, sizeof(security));
+    security.nLength = sizeof(security);
+    HANDLE channel_read = 0;
+    HANDLE channel_write = 0;
+    bool channel_created = CreatePipe(&channel_read, &channel_write, &security, 0) != 0;
+    WinxtermJobFrame channel_frame;
+    memset(&channel_frame, 0, sizeof(channel_frame));
+    winxterm_smoke_expect(state,
+                          channel_created &&
+                              winxterm_job_channel_write(channel_write, &source, payload) &&
+                              winxterm_job_channel_read(channel_read, &channel_frame) &&
+                              channel_frame.header.request_id == source.request_id &&
+                              channel_frame.header.payload_length == payload_length &&
+                              memcmp(channel_frame.payload, payload, payload_length) == 0,
+                          "job channel should preserve a framed pipe message");
+    winxterm_job_frame_dispose(&channel_frame);
+    if (channel_read != 0) CloseHandle(channel_read);
+
+    SECURITY_ATTRIBUTES mock_security;
+    memset(&mock_security, 0, sizeof(mock_security));
+    mock_security.nLength = sizeof(mock_security);
+    mock_security.bInheritHandle = TRUE;
+    WinxtermJobMockHost mock_host;
+    memset(&mock_host, 0, sizeof(mock_host));
+    HANDLE mock_client_request = 0;
+    HANDLE mock_client_reply = 0;
+    bool mock_pipes = CreatePipe(&mock_host.request_read, &mock_client_request,
+                                 &mock_security, 0) != FALSE &&
+                      CreatePipe(&mock_client_reply, &mock_host.reply_write,
+                                 &mock_security, 0) != FALSE;
+    wchar_t mock_protocol[32], mock_request[64], mock_reply[64], mock_self[32];
+    bool mock_environment = mock_pipes &&
+        swprintf_s(mock_protocol, 32, L"%u", WINXTERM_JOB_PROTOCOL_VERSION) > 0 &&
+        swprintf_s(mock_request, 64, L"%llu",
+                   (unsigned long long)(uintptr_t)mock_client_request) > 0 &&
+        swprintf_s(mock_reply, 64, L"%llu",
+                   (unsigned long long)(uintptr_t)mock_client_reply) > 0 &&
+        swprintf_s(mock_self, 32, L"%u", 7u) > 0 &&
+        SetEnvironmentVariableW(WINXTERM_JOB_ENV_PROTOCOL, mock_protocol) &&
+        SetEnvironmentVariableW(WINXTERM_JOB_ENV_REQUEST_HANDLE, mock_request) &&
+        SetEnvironmentVariableW(WINXTERM_JOB_ENV_REPLY_HANDLE, mock_reply) &&
+        SetEnvironmentVariableW(WINXTERM_JOB_ENV_SELF_ID, mock_self);
+    HANDLE mock_thread = mock_environment ?
+        CreateThread(0, 0, winxterm_smoke_job_mock_host_thread, &mock_host, 0, 0) : 0;
+    WinxtermDstcmdJobClient mock_client;
+    memset(&mock_client, 0, sizeof(mock_client));
+    if (mock_thread != 0) winxterm_dstcmd_job_client_init(&mock_client);
+    (void)SetEnvironmentVariableW(WINXTERM_JOB_ENV_PROTOCOL, 0);
+    (void)SetEnvironmentVariableW(WINXTERM_JOB_ENV_REQUEST_HANDLE, 0);
+    (void)SetEnvironmentVariableW(WINXTERM_JOB_ENV_REPLY_HANDLE, 0);
+    (void)SetEnvironmentVariableW(WINXTERM_JOB_ENV_SELF_ID, 0);
+    WinxtermDstcmdJobEvent mock_event;
+    bool mock_event_ready = mock_client.event_ready != 0 &&
+        WaitForSingleObject(mock_client.event_ready, 1000u) == WAIT_OBJECT_0;
+    bool mock_ok = mock_thread != 0 &&
+        winxterm_dstcmd_job_client_available(&mock_client) &&
+        (winxterm_dstcmd_job_client_capabilities(&mock_client) &
+         (WINXTERM_JOB_CAPABILITY_LIST | WINXTERM_JOB_CAPABILITY_EVENTS)) ==
+            (WINXTERM_JOB_CAPABILITY_LIST | WINXTERM_JOB_CAPABILITY_EVENTS) &&
+        mock_event_ready &&
+        winxterm_dstcmd_job_client_poll_event(&mock_client, &mock_event) &&
+        mock_event.kind == WINXTERM_JOB_EVENT_FOREGROUND_CHANGED &&
+        mock_event.job_id == 7u;
+    if (mock_host.reply_write != 0) {
+        CloseHandle(mock_host.reply_write);
+        mock_host.reply_write = 0;
+    }
+    bool mock_channel_loss = mock_client.reader_thread != 0 &&
+        WaitForSingleObject(mock_client.reader_thread, 1000u) == WAIT_OBJECT_0 &&
+        !winxterm_dstcmd_job_client_available(&mock_client);
+    bool mock_discovered = mock_client.lock_initialized;
+    winxterm_dstcmd_job_client_dispose(&mock_client);
+    if (mock_thread != 0) {
+        (void)WaitForSingleObject(mock_thread, 1000u);
+        CloseHandle(mock_thread);
+    }
+    if (mock_host.request_read != 0) CloseHandle(mock_host.request_read);
+    if (mock_host.reply_write != 0) CloseHandle(mock_host.reply_write);
+    /* The client owns and closes its pipe ends after successful discovery. */
+    if (!mock_discovered) {
+        if (mock_client_request != 0) CloseHandle(mock_client_request);
+        if (mock_client_reply != 0) CloseHandle(mock_client_reply);
+    }
+    winxterm_smoke_expect(state, mock_ok && mock_channel_loss && mock_host.failures == 0,
+                          "mock host should interleave events, correlate replies, and report channel loss");
+    if (channel_write != 0) CloseHandle(channel_write);
+
+    channel_read = 0;
+    channel_write = 0;
+    channel_created = CreatePipe(&channel_read, &channel_write, &security, 0) != 0;
+    WinxtermJobFrameHeader truncated_header = source;
+    truncated_header.payload_length = 8u;
+    uint8_t truncated_encoded[WINXTERM_JOB_PROTOCOL_HEADER_SIZE];
+    DWORD truncated_written = 0u;
+    bool truncated_prepared = channel_created &&
+        winxterm_job_frame_encode_header(&truncated_header, truncated_encoded) &&
+        WriteFile(channel_write, truncated_encoded, sizeof(truncated_encoded),
+                  &truncated_written, 0) &&
+        WriteFile(channel_write, payload, 2u, &truncated_written, 0);
+    if (channel_write != 0) { CloseHandle(channel_write); channel_write = 0; }
+    memset(&channel_frame, 0, sizeof(channel_frame));
+    winxterm_smoke_expect(state,
+                          truncated_prepared &&
+                              !winxterm_job_channel_read(channel_read, &channel_frame),
+                          "job channel should reject a frame truncated by channel loss");
+    winxterm_job_frame_dispose(&channel_frame);
+    if (channel_read != 0) CloseHandle(channel_read);
+
+    WinxtermJobManager manager;
+    winxterm_smoke_expect(state, winxterm_job_manager_init(&manager),
+                          "job manager should initialize");
+    uint64_t root = winxterm_job_manager_add(&manager, 0u, WINXTERM_JOB_FOREGROUND);
+    uint64_t child = winxterm_job_manager_add(&manager, root, WINXTERM_JOB_FOREGROUND);
+    uint64_t grandchild = winxterm_job_manager_add(&manager, child, WINXTERM_JOB_FOREGROUND);
+    WinxtermManagedJobSnapshot *job_snapshot = 0;
+    size_t job_snapshot_count = 0u;
+    winxterm_smoke_expect(state,
+                          root == 1u && child == 2u && grandchild == 3u &&
+                              winxterm_job_manager_foreground_id(&manager) == grandchild &&
+                              winxterm_job_manager_authorized(&manager, root, grandchild) &&
+                              !winxterm_job_manager_authorized(&manager, grandchild, root),
+                          "job manager should assign ids, stack foreground jobs, and authorize ancestors");
+    winxterm_smoke_expect(state,
+                          winxterm_job_manager_set_process(&manager, child, 42u, L"child.exe") &&
+                              winxterm_job_manager_snapshot(&manager, root, &job_snapshot,
+                                                           &job_snapshot_count) &&
+                              job_snapshot_count == 3u &&
+                              job_snapshot[1].process_id == 42u &&
+                              wcscmp(job_snapshot[1].display_name, L"child.exe") == 0,
+                          "job manager snapshots should copy synchronized metadata");
+    winxterm_job_manager_snapshot_dispose(job_snapshot);
+    WinxtermJobStressContext stress = {&manager, root, child, 0};
+    HANDLE stress_threads[2] = {
+        CreateThread(0, 0, winxterm_smoke_job_snapshot_thread, &stress, 0, 0),
+        CreateThread(0, 0, winxterm_smoke_job_metadata_thread, &stress, 0, 0)
+    };
+    bool stress_started = stress_threads[0] != 0 && stress_threads[1] != 0;
+    if (stress_threads[0] != 0) (void)WaitForSingleObject(stress_threads[0], INFINITE);
+    if (stress_threads[1] != 0) (void)WaitForSingleObject(stress_threads[1], INFINITE);
+    if (stress_threads[0] != 0) CloseHandle(stress_threads[0]);
+    if (stress_threads[1] != 0) CloseHandle(stress_threads[1]);
+    winxterm_smoke_expect(state, stress_started && stress.failures == 0,
+                          "job snapshots and metadata updates should remain synchronized under stress");
+    winxterm_smoke_expect(state,
+                          winxterm_job_manager_foreground(&manager, child) &&
+                              winxterm_job_manager_foreground_id(&manager) == child,
+                          "foregrounding an existing job should not duplicate its stack entry");
+    winxterm_smoke_expect(state,
+                          winxterm_job_manager_exit(&manager, child, 4u) &&
+                              winxterm_job_manager_foreground_id(&manager) == grandchild,
+                          "exiting the foreground job should restore the newest live job");
+    WinxtermManagedJobSnapshot kill_snapshot;
+    winxterm_smoke_expect(state,
+                          winxterm_job_manager_stopping(&manager, grandchild) &&
+                              winxterm_job_manager_cancel_stopping(&manager, grandchild) &&
+                              winxterm_job_manager_snapshot_one(&manager, grandchild,
+                                                                &kill_snapshot) &&
+                              kill_snapshot.state == WINXTERM_JOB_FOREGROUND,
+                          "cancelling kill escalation should restore foreground job state");
+    winxterm_smoke_expect(state,
+                          !winxterm_job_manager_remove(&manager, root, child),
+                          "a job with an owned descendant should not be removable");
+    winxterm_smoke_expect(state,
+                          winxterm_job_manager_exit(&manager, grandchild, 0u) &&
+                              winxterm_job_manager_remove(&manager, root, grandchild) &&
+                              winxterm_job_manager_remove(&manager, root, child),
+                          "an ancestor should remove exited leaf jobs in dependency order");
+    winxterm_job_manager_dispose(&manager);
+
+    WinxtermJobManager large_manager;
+    bool large_ok = winxterm_job_manager_init(&large_manager);
+    uint64_t large_root = large_ok ?
+        winxterm_job_manager_add(&large_manager, 0u, WINXTERM_JOB_FOREGROUND) : 0u;
+    uint64_t last_large_id = large_root;
+    for (size_t i = 0u; large_ok && i < 2048u; ++i) {
+        last_large_id = winxterm_job_manager_add(&large_manager, large_root,
+                                                 WINXTERM_JOB_BACKGROUND);
+        large_ok = last_large_id == (uint64_t)i + 2u &&
+                   winxterm_job_manager_exit(&large_manager, last_large_id,
+                                             (uint32_t)(i & 0xffu));
+    }
+    WinxtermManagedJobSnapshot *large_snapshot = 0;
+    size_t large_count = 0u;
+    large_ok = large_ok &&
+        winxterm_job_manager_snapshot(&large_manager, large_root,
+                                      &large_snapshot, &large_count) &&
+        large_count == 2049u && last_large_id == 2049u &&
+        winxterm_job_manager_clean(&large_manager, large_root) == 2048u;
+    winxterm_smoke_expect(state, large_ok,
+                          "job manager should preserve monotonic ids and snapshots at high job counts");
+    winxterm_job_manager_snapshot_dispose(large_snapshot);
+    winxterm_job_manager_dispose(&large_manager);
+
+    WinxtermJobJournal journal;
+    uint8_t journal_input[] = {1u, 2u, 3u, 4u, 5u, 6u};
+    uint8_t consumed[3];
+    uint8_t *view = 0;
+    size_t view_length = 0u;
+    uint64_t view_next = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_job_journal_init(&journal, 6u) &&
+                              winxterm_job_journal_append(&journal, journal_input, 6u) &&
+                              winxterm_job_journal_backpressured(&journal) &&
+                              winxterm_job_journal_snapshot(&journal, 0u, &view,
+                                                            &view_length, &view_next) &&
+                              view_length == 6u && view_next == 6u &&
+                              memcmp(view, journal_input, 6u) == 0,
+                          "job journal views should be non-destructive at the output limit");
+    free(view);
+    view = 0;
+    winxterm_smoke_expect(state,
+                          winxterm_job_journal_consume(&journal, consumed, sizeof(consumed)) == 3u &&
+                              memcmp(consumed, journal_input, 3u) == 0 &&
+                              !winxterm_job_journal_backpressured(&journal) &&
+                              winxterm_job_journal_append(&journal, journal_input, 3u) &&
+                              winxterm_job_journal_snapshot(&journal, 3u, &view,
+                                                            &view_length, &view_next) &&
+                              view_length == 6u &&
+                              memcmp(view, journal_input + 3u, 3u) == 0 &&
+                              memcmp(view + 3u, journal_input, 3u) == 0,
+                          "job journal consumption should release capacity without replaying bytes");
+    free(view);
+    winxterm_job_journal_dispose(&journal);
+
+    WinxtermJobJournal stable_journal;
+    uint8_t stable_bytes[8];
+    size_t stable_length = 0u;
+    uint64_t stable_next = 0u;
+    bool stable_more = false;
+    winxterm_smoke_expect(state,
+                          winxterm_job_journal_init(&stable_journal, 16u) &&
+                              winxterm_job_journal_append(&stable_journal, journal_input, 3u) &&
+                              winxterm_job_journal_append(&stable_journal, journal_input + 3u, 3u) &&
+                              winxterm_job_journal_copy_snapshot(&stable_journal, 0u, 3u,
+                                                                 stable_bytes, sizeof(stable_bytes),
+                                                                 &stable_length, &stable_next,
+                                                                 &stable_more) &&
+                              stable_length == 3u && stable_next == 3u && !stable_more &&
+                              memcmp(stable_bytes, journal_input, 3u) == 0,
+                          "job journal pagination should preserve its captured end offset");
+    winxterm_job_journal_dispose(&stable_journal);
+
+    WinxtermJobJournal sparse_journal;
+    winxterm_smoke_expect(state,
+                          winxterm_job_journal_init(&sparse_journal,
+                                                    WINXTERM_JOB_OUTPUT_LIMIT) &&
+                              winxterm_job_journal_committed(&sparse_journal) == 0u &&
+                              winxterm_job_journal_append(&sparse_journal,
+                                                          journal_input, 1u) &&
+                              winxterm_job_journal_committed(&sparse_journal) != 0u &&
+                              winxterm_job_journal_committed(&sparse_journal) <
+                                  WINXTERM_JOB_OUTPUT_LIMIT,
+                          "large job journals should reserve their limit and commit incrementally");
+    winxterm_job_journal_dispose(&sparse_journal);
+
+    char *plan_arguments[] = {"tool.exe", "--value", "two words"};
+    WinxtermJobPlanStage plan_stage;
+    memset(&plan_stage, 0, sizeof(plan_stage));
+    plan_stage.arguments = plan_arguments;
+    plan_stage.argument_count = 3u;
+    plan_stage.stdin_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    plan_stage.stdout_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    plan_stage.stderr_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    WinxtermJobExecutionPlan source_plan;
+    memset(&source_plan, 0, sizeof(source_plan));
+    source_plan.cwd = "C:\\work";
+    source_plan.stages = &plan_stage;
+    source_plan.stage_count = 1u;
+    uint8_t *plan_payload = 0;
+    uint32_t plan_payload_length = 0u;
+    WinxtermJobExecutionPlan decoded_plan;
+    memset(&decoded_plan, 0, sizeof(decoded_plan));
+    winxterm_smoke_expect(state,
+                          winxterm_job_plan_encode(&source_plan, &plan_payload,
+                                                  &plan_payload_length) &&
+                              winxterm_job_plan_decode(plan_payload, plan_payload_length,
+                                                      &decoded_plan) &&
+                              decoded_plan.stage_count == 1u &&
+                              decoded_plan.stages[0].argument_count == 3u &&
+                              strcmp(decoded_plan.stages[0].arguments[2], "two words") == 0,
+                          "execution plans should round-trip typed stages and arguments");
+    winxterm_job_plan_dispose(&decoded_plan);
+    if (plan_payload_length >= 8u) {
+        plan_payload[6] = 0xffu;
+        plan_payload[7] = 0x7fu;
+        winxterm_smoke_expect(state,
+                              !winxterm_job_plan_decode(plan_payload, plan_payload_length,
+                                                       &decoded_plan),
+                              "execution-plan decoding should reject malformed bounded TLVs");
+    }
+    free(plan_payload);
 }
 
 static bool winxterm_smoke_bytes_contain(const uint8_t *haystack,
@@ -645,6 +1183,36 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
     if (bridge.input_buffer == 0) {
         return;
     }
+    winxterm_bridge_set_active_session(&bridge, 42u);
+    winxterm_smoke_expect(state, winxterm_bridge_active_session(&bridge) == 42u,
+                          "bridge should publish active session identity atomically");
+    static const uint8_t old_session_input[] = {'o', 'l', 'd'};
+    static const uint8_t new_session_input[] = {'n', 'e', 'w'};
+    uint8_t *saved_session_input = 0;
+    size_t saved_session_input_count = 0u;
+    uint8_t routed_session_input[4];
+    bool input_switched = winxterm_bridge_queue_input(
+        &bridge, old_session_input, sizeof(old_session_input)) &&
+        winxterm_bridge_switch_input_session(&bridge, 42u, 0, 0u,
+                                             &saved_session_input,
+                                             &saved_session_input_count) &&
+        saved_session_input_count == 0u &&
+        winxterm_bridge_switch_input_session(&bridge, 43u,
+                                             new_session_input,
+                                             sizeof(new_session_input),
+                                             &saved_session_input,
+                                             &saved_session_input_count) &&
+        saved_session_input_count == sizeof(old_session_input) &&
+        memcmp(saved_session_input, old_session_input, sizeof(old_session_input)) == 0 &&
+        winxterm_bridge_read_session_input(&bridge, 42u, routed_session_input,
+                                           sizeof(routed_session_input)) == 0u &&
+        winxterm_bridge_read_session_input(&bridge, 43u, routed_session_input,
+                                           sizeof(routed_session_input)) ==
+            sizeof(new_session_input) &&
+        memcmp(routed_session_input, new_session_input, sizeof(new_session_input)) == 0;
+    free(saved_session_input);
+    winxterm_smoke_expect(state, input_switched,
+                          "input switching should retain old bytes and route pending target bytes");
 
     static const uint8_t control_query[] = "\x1b]9001;winxterm;v=1;id=7;cmd=query\a";
     winxterm_smoke_expect(state,
@@ -1083,12 +1651,13 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                           "scale diagnostics should record latest-scale coalescing");
 
     winxterm_bridge_set_host_starting(&bridge);
-    winxterm_bridge_set_host_child(&bridge, 1234u, L"child.exe");
+    winxterm_bridge_set_host_child(&bridge, 1234u, L"child.exe", true);
     WinxtermHostChildInfo child;
     memset(&child, 0, sizeof(child));
     winxterm_smoke_expect(state,
                           winxterm_bridge_copy_child_info(&bridge, &child) &&
                               child.running &&
+                              child.is_shell &&
                               child.process_id == 1234u &&
                               wcscmp(child.display_name, L"child.exe") == 0,
                           "bridge should copy direct child close-dialog info");
@@ -1122,6 +1691,26 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
     winxterm_smoke_expect(state,
                           winxterm_bridge_terminate_requested(&bridge),
                           "bridge should record terminate request");
+
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_request_job_action(
+                              &bridge, WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND, 7u) &&
+                              winxterm_bridge_request_job_action(
+                                  &bridge, WINXTERM_BRIDGE_JOB_ACTION_BACKGROUND, 8u),
+                          "bridge should queue multiple native job actions");
+    WinxtermBridgeJobAction job_action = WINXTERM_BRIDGE_JOB_ACTION_NONE;
+    uint64_t action_job_id = 0u;
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_take_job_action(&bridge, &job_action, &action_job_id) &&
+                              job_action == WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND &&
+                              action_job_id == 7u,
+                          "bridge should preserve native job action FIFO order");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_take_job_action(&bridge, &job_action, &action_job_id) &&
+                              job_action == WINXTERM_BRIDGE_JOB_ACTION_BACKGROUND &&
+                              action_job_id == 8u &&
+                              !winxterm_bridge_take_job_action(&bridge, &job_action, &action_job_id),
+                          "bridge should drain every queued native job action exactly once");
 
     winxterm_bridge_dispose(&bridge);
 }
@@ -2802,6 +3391,7 @@ int winxterm_smoke_run(void)
     winxterm_smoke_test_window_placement(&state);
     winxterm_smoke_test_grouped_u64_format(&state);
     winxterm_smoke_test_options(&state);
+    winxterm_smoke_test_job_control_contracts(&state);
     winxterm_smoke_test_bridge_hardening(&state);
     winxterm_smoke_test_screen_and_text(&state);
     winxterm_smoke_test_parser_strings(&state);

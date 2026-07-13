@@ -356,6 +356,9 @@ bool winxterm_bridge_init(WinxtermBridge *bridge, WinxtermLog *log, int columns,
     }
 
     memset(bridge, 0, sizeof(*bridge));
+    if (!winxterm_job_manager_init(&bridge->job_manager)) {
+        return false;
+    }
     bridge->log = log;
     bridge->backend = WINXTERM_DEFAULT_RENDER_BACKEND;
     bridge->unpainted_line_limit = WINXTERM_DEFAULT_UNPAINTED_LINE_LIMIT;
@@ -490,6 +493,8 @@ bool winxterm_bridge_init(WinxtermBridge *bridge, WinxtermLog *log, int columns,
         bridge->screen_lock_initialized = false;
         return false;
     }
+    winxterm_job_coordinator_init(&bridge->job_coordinator,
+                                  WINXTERM_BRIDGE_JOB_ACTION_QUEUE_LIMIT);
     return true;
 }
 
@@ -498,6 +503,8 @@ void winxterm_bridge_dispose(WinxtermBridge *bridge)
     if (bridge == 0) {
         return;
     }
+    winxterm_job_manager_dispose(&bridge->job_manager);
+    winxterm_job_coordinator_dispose(&bridge->job_coordinator);
 
     free(bridge->input_buffer);
     bridge->input_buffer = 0;
@@ -893,6 +900,64 @@ bool winxterm_bridge_queue_reply(WinxtermBridge *bridge, const uint8_t *bytes, s
     return winxterm_bridge_queue_input(bridge, bytes, byte_count);
 }
 
+bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
+                                          uint64_t session_id,
+                                          const uint8_t *pending_bytes,
+                                          size_t pending_count,
+                                          uint8_t **previous_bytes,
+                                          size_t *previous_count)
+{
+    if (previous_bytes != 0) *previous_bytes = 0;
+    if (previous_count != 0) *previous_count = 0u;
+    if (bridge == 0 || previous_bytes == 0 || previous_count == 0 ||
+        (pending_bytes == 0 && pending_count != 0u) ||
+        pending_count > WINXTERM_BRIDGE_INPUT_MAX_CAPACITY) return false;
+
+    EnterCriticalSection(&bridge->input_lock);
+    if (bridge->input_session_id == 0u && pending_count == 0u) {
+        bridge->input_session_id = session_id;
+        LeaveCriticalSection(&bridge->input_lock);
+        return true;
+    }
+    uint8_t *saved = bridge->input_count != 0u ?
+        (uint8_t *)malloc(bridge->input_count) : 0;
+    bool ok = bridge->input_count == 0u || saved != 0;
+    if (ok && bridge->input_capacity < pending_count) {
+        ok = winxterm_bridge_grow_input_locked(bridge, pending_count);
+    }
+    if (ok) {
+        size_t saved_count = bridge->input_count;
+        for (size_t i = 0u; i < saved_count; ++i) {
+            saved[i] = bridge->input_buffer[(bridge->input_head + i) % bridge->input_capacity];
+        }
+        bridge->input_head = 0u;
+        bridge->input_tail = 0u;
+        bridge->input_count = 0u;
+        for (size_t i = 0u; i < pending_count; ++i) {
+            bridge->input_buffer[bridge->input_tail] = pending_bytes[i];
+            bridge->input_tail = (bridge->input_tail + 1u) % bridge->input_capacity;
+            ++bridge->input_count;
+        }
+        bridge->input_session_id = session_id;
+        *previous_bytes = saved;
+        *previous_count = saved_count;
+        saved = 0;
+        if (bridge->input_count > bridge->input_high_water) {
+            bridge->input_high_water = bridge->input_count;
+        }
+        if (bridge->input_ready_event != 0) {
+            if (bridge->input_count != 0u || bridge->pending_resize) {
+                SetEvent(bridge->input_ready_event);
+            } else {
+                ResetEvent(bridge->input_ready_event);
+            }
+        }
+    }
+    LeaveCriticalSection(&bridge->input_lock);
+    free(saved);
+    return ok;
+}
+
 static bool winxterm_bridge_grow_output_locked(WinxtermBridge *bridge, size_t required_capacity)
 {
     if (bridge == 0 || required_capacity > WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY) {
@@ -1019,6 +1084,68 @@ bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge, const uint8_t *bytes
     return winxterm_bridge_enqueue_output_with_unpainted_lines(bridge, bytes, byte_count, 0u);
 }
 
+void winxterm_bridge_set_active_session(WinxtermBridge *bridge, uint64_t session_id)
+{
+    if (bridge == 0) return;
+    winxterm_job_coordinator_set_active_session(&bridge->job_coordinator, session_id);
+}
+
+uint64_t winxterm_bridge_active_session(WinxtermBridge *bridge)
+{
+    return bridge != 0 ?
+        winxterm_job_coordinator_active_session(&bridge->job_coordinator) : 0u;
+}
+
+bool winxterm_bridge_request_job_action(WinxtermBridge *bridge,
+                                       WinxtermBridgeJobAction action, uint64_t job_id)
+{
+    if (bridge == 0 || action == WINXTERM_BRIDGE_JOB_ACTION_NONE || job_id == 0u) return false;
+    bool accepted = winxterm_job_coordinator_enqueue(
+        &bridge->job_coordinator, (uint32_t)action, job_id);
+    if (accepted && bridge->input_ready_event != 0) SetEvent(bridge->input_ready_event);
+    return accepted;
+}
+
+bool winxterm_bridge_take_job_action(WinxtermBridge *bridge,
+                                    WinxtermBridgeJobAction *action, uint64_t *job_id)
+{
+    if (bridge == 0 || action == 0 || job_id == 0) return false;
+    uint32_t raw_action = 0u;
+    bool available = winxterm_job_coordinator_take(
+        &bridge->job_coordinator, &raw_action, job_id);
+    if (available) *action = (WinxtermBridgeJobAction)raw_action;
+    return available;
+}
+
+bool winxterm_bridge_publish_job_view(WinxtermBridge *bridge, uint64_t job_id,
+                                      uint8_t *bytes, size_t byte_count)
+{
+    if (bridge == 0 || job_id == 0u || (bytes == 0 && byte_count != 0u)) return false;
+    bool accepted = winxterm_job_coordinator_publish_view(
+        &bridge->job_coordinator, job_id, bytes, byte_count);
+    if (accepted && bridge->hwnd != 0) {
+        PostMessageW(bridge->hwnd, WINXTERM_WM_JOB_VIEW, 0, 0);
+    }
+    return accepted;
+}
+
+bool winxterm_bridge_take_job_view(WinxtermBridge *bridge, uint64_t *job_id,
+                                   uint8_t **bytes, size_t *byte_count)
+{
+    if (bridge == 0 || job_id == 0 || bytes == 0 || byte_count == 0) return false;
+    return winxterm_job_coordinator_take_view(
+        &bridge->job_coordinator, job_id, bytes, byte_count);
+}
+
+bool winxterm_bridge_request_job_ui(WinxtermBridge *bridge)
+{
+    if (bridge == 0) return false;
+    EnterCriticalSection(&bridge->input_lock);
+    HWND hwnd = bridge->hwnd;
+    LeaveCriticalSection(&bridge->input_lock);
+    return hwnd != 0 && PostMessageW(hwnd, WINXTERM_WM_JOB_UI, 0, 0) != FALSE;
+}
+
 bool winxterm_bridge_enqueue_output_wait(WinxtermBridge *bridge,
                                          const uint8_t *bytes,
                                          size_t byte_count,
@@ -1119,6 +1246,25 @@ size_t winxterm_bridge_read_input(WinxtermBridge *bridge, uint8_t *buffer, size_
     }
     if (bridge->input_ready_event != 0 && bridge->input_count == 0u && !bridge->pending_resize) {
         ResetEvent(bridge->input_ready_event);
+    }
+    LeaveCriticalSection(&bridge->input_lock);
+    return copied;
+}
+
+size_t winxterm_bridge_read_session_input(WinxtermBridge *bridge, uint64_t session_id,
+                                          uint8_t *buffer, size_t buffer_capacity)
+{
+    if (bridge == 0 || session_id == 0u || buffer == 0 || buffer_capacity == 0u) return 0u;
+    size_t copied = 0u;
+    EnterCriticalSection(&bridge->input_lock);
+    if (bridge->input_session_id == session_id) {
+        while (copied < buffer_capacity && bridge->input_count != 0u) {
+            buffer[copied++] = bridge->input_buffer[bridge->input_head];
+            bridge->input_head = (bridge->input_head + 1u) % bridge->input_capacity;
+            --bridge->input_count;
+        }
+        if (bridge->input_ready_event != 0 && bridge->input_count == 0u &&
+            !bridge->pending_resize) ResetEvent(bridge->input_ready_event);
     }
     LeaveCriticalSection(&bridge->input_lock);
     return copied;
@@ -1464,6 +1610,7 @@ void winxterm_bridge_set_host_starting(WinxtermBridge *bridge)
     EnterCriticalSection(&bridge->input_lock);
     bridge->host_state = WINXTERM_HOST_STATE_STARTING;
     bridge->host_child_running = false;
+    bridge->host_child_is_shell = false;
     bridge->host_headless = false;
     bridge->host_terminate_requested = false;
     bridge->host_child_process_id = 0;
@@ -1472,7 +1619,8 @@ void winxterm_bridge_set_host_starting(WinxtermBridge *bridge)
     winxterm_log_writef(bridge->log, "host state: starting");
 }
 
-void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id, const wchar_t *display_name)
+void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id,
+                                    const wchar_t *display_name, bool is_shell)
 {
     if (bridge == 0) {
         return;
@@ -1482,6 +1630,7 @@ void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id, co
     bridge->host_state = bridge->host_headless ?
         WINXTERM_HOST_STATE_RUNNING_HEADLESS : WINXTERM_HOST_STATE_RUNNING_VISIBLE;
     bridge->host_child_running = true;
+    bridge->host_child_is_shell = is_shell;
     bridge->host_child_process_id = process_id;
     if (display_name != 0 && display_name[0] != L'\0') {
         wcsncpy_s(bridge->host_child_display_name,
@@ -1521,6 +1670,7 @@ void winxterm_bridge_clear_host_child(WinxtermBridge *bridge, WinxtermHostState 
     EnterCriticalSection(&bridge->input_lock);
     bridge->host_state = final_state;
     bridge->host_child_running = false;
+    bridge->host_child_is_shell = false;
     bridge->host_headless = false;
     bridge->host_terminate_requested = false;
     bridge->host_child_process_id = 0;
@@ -1537,6 +1687,7 @@ bool winxterm_bridge_copy_child_info(WinxtermBridge *bridge, WinxtermHostChildIn
 
     EnterCriticalSection(&bridge->input_lock);
     info->running = bridge->host_child_running;
+    info->is_shell = bridge->host_child_is_shell;
     info->state = bridge->host_state;
     info->process_id = bridge->host_child_process_id;
     wcsncpy_s(info->display_name,

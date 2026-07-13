@@ -8,6 +8,7 @@
 #include "dstcmd/commands/export.h"
 #include "dstcmd/commands/help.h"
 #include "dstcmd/commands/highlight.h"
+#include "dstcmd/commands/job.h"
 #include "dstcmd/commands/ls.h"
 #include "dstcmd/commands/mv.h"
 #include "dstcmd/commands/playmacro.h"
@@ -27,6 +28,7 @@ static const WinxtermDstcmdCommandEntry winxterm_dstcmd_commands[] = {
     {L"export", winxterm_dstcmd_cmd_export, L"[VARNAME=value]..."},
     {L"help", winxterm_dstcmd_cmd_help, L"[COMMAND]..."},
     {L"highlight", winxterm_dstcmd_cmd_highlight, L"[-i] STRING..."},
+    {L"job", winxterm_dstcmd_cmd_job, L"[ls]"},
     {L"ls", winxterm_dstcmd_cmd_ls, L"[-ltah] [PATH]..."},
     {L"mv", winxterm_dstcmd_cmd_mv, L"[-f] SOURCE... DESTINATION"},
     {L"playmacro", winxterm_dstcmd_cmd_playmacro, L"FILENAME"},

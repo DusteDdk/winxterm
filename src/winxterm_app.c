@@ -18,6 +18,12 @@
 #include <wincodec.h>
 #include <windowsx.h>
 
+struct WinxtermAppSessionUx {
+    uint64_t session_id;
+    WinxtermUxState state;
+    WinxtermAppSessionUx *next;
+};
+
 static const wchar_t WINXTERM_WINDOW_CLASS_NAME[] = L"WinxtermMainWindow";
 static const wchar_t WINXTERM_WINDOW_TITLE[] = L"XTerm for Windows";
 static const UINT_PTR WINXTERM_CURSOR_TIMER_ID = 1u;
@@ -57,12 +63,12 @@ enum {
     WINXTERM_CLOSE_DIALOG_MARGIN = 16,
     WINXTERM_CLOSE_DIALOG_GAP = 12,
     WINXTERM_CLOSE_DIALOG_INTRO_HEIGHT = 36,
-    WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT = 28,
+    WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT = 150,
     WINXTERM_CLOSE_DIALOG_CHECK_HEIGHT = 24,
     WINXTERM_CLOSE_DIALOG_BUTTON_WIDTH = 80,
     WINXTERM_CLOSE_DIALOG_BUTTON_HEIGHT = 26,
     WINXTERM_CLOSE_DIALOG_MIN_CLIENT_WIDTH = 560,
-    WINXTERM_CLOSE_DIALOG_MIN_CLIENT_HEIGHT = 180
+    WINXTERM_CLOSE_DIALOG_MIN_CLIENT_HEIGHT = 320
 };
 
 typedef enum WinxtermCloseDecision {
@@ -81,7 +87,7 @@ typedef struct WinxtermCloseDialog {
     HWND cancel_button;
     bool done;
     WinxtermCloseDecision decision;
-    wchar_t child_text[WINXTERM_BRIDGE_CHILD_NAME_CAPACITY + 64u];
+    wchar_t child_text[65536];
 } WinxtermCloseDialog;
 
 typedef struct WinxtermRenderWorker {
@@ -129,6 +135,7 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
 static LRESULT CALLBACK winxterm_close_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes);
 static void winxterm_app_handle_macro_update(WinxtermApp *app);
+static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam);
 static SIZE winxterm_app_min_window_size(WinxtermApp *app);
 static void winxterm_app_snap_window_to_cells(WinxtermApp *app);
 
@@ -1664,6 +1671,11 @@ void winxterm_app_dispose(WinxtermApp *app)
     }
     winxterm_macro_destroy(app->macro);
     app->macro = 0;
+    while (app->session_ux != 0) {
+        WinxtermAppSessionUx *next = app->session_ux->next;
+        free(app->session_ux);
+        app->session_ux = next;
+    }
     if (app->bridge != 0) {
         winxterm_bridge_set_hwnd(app->bridge, 0);
     }
@@ -2255,6 +2267,68 @@ static void winxterm_app_handle_frame_due(WinxtermApp *app, HWND hwnd, unsigned 
     app->last_frame_tick = GetTickCount();
 }
 
+static WinxtermAppSessionUx *winxterm_app_session_ux(WinxtermApp *app,
+                                                     uint64_t session_id,
+                                                     bool create)
+{
+    WinxtermAppSessionUx *entry = app != 0 ? app->session_ux : 0;
+    while (entry != 0 && entry->session_id != session_id) entry = entry->next;
+    if (entry != 0 || !create || app == 0 || session_id == 0u) return entry;
+    entry = (WinxtermAppSessionUx *)calloc(1u, sizeof(*entry));
+    if (entry == 0) return 0;
+    entry->session_id = session_id;
+    winxterm_ux_init(&entry->state);
+    entry->next = app->session_ux;
+    app->session_ux = entry;
+    return entry;
+}
+
+static void winxterm_app_prune_session_ux(WinxtermApp *app, uint64_t keep_session_id)
+{
+    if (app == 0 || app->bridge == 0) return;
+    WinxtermAppSessionUx **link = &app->session_ux;
+    while (*link != 0) {
+        WinxtermManagedJobSnapshot snapshot;
+        if ((*link)->session_id != keep_session_id &&
+            !winxterm_job_manager_snapshot_one(&app->bridge->job_manager,
+                                               (*link)->session_id, &snapshot)) {
+            WinxtermAppSessionUx *removed = *link;
+            *link = removed->next;
+            free(removed);
+        } else {
+            link = &(*link)->next;
+        }
+    }
+}
+
+static void winxterm_app_sync_active_session_ux(WinxtermApp *app)
+{
+    if (app == 0 || app->bridge == 0) return;
+    uint64_t session_id = winxterm_bridge_active_session(app->bridge);
+    if (session_id == 0u || session_id == app->ux_session_id) return;
+
+    if (app->ux_session_id != 0u) {
+        WinxtermAppSessionUx *old = winxterm_app_session_ux(
+            app, app->ux_session_id, true);
+        if (old != 0) {
+            old->state = app->ux;
+            old->state.selection.selecting = false;
+        }
+    }
+    WinxtermAppSessionUx *target = winxterm_app_session_ux(app, session_id, true);
+    if (target != 0) app->ux = target->state;
+    else winxterm_ux_init(&app->ux);
+    app->ux_session_id = session_id;
+    winxterm_app_prune_session_ux(app, session_id);
+
+    /* Pointer gestures and transient overlays refer to the old screen's row
+       coordinates and must never leak into the newly presented session. */
+    app->left_click_pending = false;
+    app->hover_valid = false;
+    app->copy_overlay_active = false;
+    app->click_preview_kind = WINXTERM_CLICK_PREVIEW_NONE;
+}
+
 static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
 {
     if (app == 0 || app->bridge == 0 || hwnd == 0) {
@@ -2276,6 +2350,7 @@ static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
         return;
     }
 
+    winxterm_app_sync_active_session_ux(app);
     unsigned int causes = winxterm_bridge_take_frame_request(app->bridge);
     winxterm_app_handle_frame_due(app, hwnd, causes);
 }
@@ -3123,6 +3198,70 @@ static void winxterm_app_show_context_menu(WinxtermApp *app, LPARAM lparam)
     AppendMenuW(menu, MF_STRING, WINXTERM_MENU_CLEAR_SCROLLBACK, L"Clear scrollback");
     AppendMenuW(menu, MF_STRING, WINXTERM_MENU_RESET_TERMINAL, L"Reset terminal");
 
+    typedef struct WinxtermMenuJobCommand {
+        UINT id;
+        uint64_t job_id;
+        WinxtermBridgeJobAction action;
+    } WinxtermMenuJobCommand;
+    WinxtermManagedJobSnapshot *job_snapshot = 0;
+    size_t job_count = 0u;
+    WinxtermMenuJobCommand *job_commands = 0;
+    size_t job_command_count = 0u;
+    if (winxterm_job_manager_snapshot(&app->bridge->job_manager, 0u,
+                                      &job_snapshot, &job_count) && job_count != 0u) {
+        job_commands = (WinxtermMenuJobCommand *)calloc(job_count * 5u,
+                                                        sizeof(*job_commands));
+        HMENU jobs_menu = job_commands != 0 ? CreatePopupMenu() : 0;
+        for (size_t i = 0u; jobs_menu != 0 && i < job_count; ++i) {
+            WinxtermManagedJobSnapshot *job = job_snapshot + i;
+            HMENU job_menu = CreatePopupMenu();
+            if (job_menu == 0) continue;
+            const wchar_t *state = job->state == WINXTERM_JOB_STARTING ? L"starting" :
+                                   job->state == WINXTERM_JOB_FOREGROUND ? L"foreground" :
+                                   job->state == WINXTERM_JOB_BACKGROUND ? L"background" :
+                                   job->state == WINXTERM_JOB_STOPPING ? L"stopping" :
+                                   job->state == WINXTERM_JOB_EXITED ? L"exited" : L"failed";
+            wchar_t label[512];
+            if (swprintf_s(label, 512, L"%llu - %ls (%ls)",
+                           (unsigned long long)job->id,
+                           job->display_name[0] != L'\0' ? job->display_name : L"(unknown)",
+                           state) <= 0) {
+                DestroyMenu(job_menu);
+                continue;
+            }
+            bool live = job->state != WINXTERM_JOB_EXITED && job->state != WINXTERM_JOB_FAILED;
+            static const struct {
+                const wchar_t *label;
+                WinxtermBridgeJobAction action;
+            } actions[] = {
+                {L"Foreground", WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND},
+                {L"View", WINXTERM_BRIDGE_JOB_ACTION_VIEW},
+                {L"Background", WINXTERM_BRIDGE_JOB_ACTION_BACKGROUND},
+                {L"Close", WINXTERM_BRIDGE_JOB_ACTION_CLOSE},
+                {L"Force exit", WINXTERM_BRIDGE_JOB_ACTION_FORCE_EXIT}
+            };
+            for (size_t action_index = 0u; action_index < 5u; ++action_index) {
+                if (action_index == 4u) AppendMenuW(job_menu, MF_SEPARATOR, 0, 0);
+                UINT id = 2000u + (UINT)job_command_count;
+                bool enabled = actions[action_index].action ==
+                    WINXTERM_BRIDGE_JOB_ACTION_VIEW ? true : live;
+                if (actions[action_index].action == WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND) {
+                    enabled = live && !job->foreground;
+                } else if (actions[action_index].action == WINXTERM_BRIDGE_JOB_ACTION_BACKGROUND) {
+                    enabled = live && job->foreground;
+                }
+                AppendMenuW(job_menu, MF_STRING | (enabled ? MF_ENABLED : MF_GRAYED), id,
+                            actions[action_index].label);
+                job_commands[job_command_count].id = id;
+                job_commands[job_command_count].job_id = job->id;
+                job_commands[job_command_count].action = actions[action_index].action;
+                ++job_command_count;
+            }
+            AppendMenuW(jobs_menu, MF_POPUP, (UINT_PTR)job_menu, label);
+        }
+        if (jobs_menu != 0) AppendMenuW(menu, MF_POPUP, (UINT_PTR)jobs_menu, L"Jobs");
+    }
+
     HMENU scale_menu = CreatePopupMenu();
     if (scale_menu != 0) {
         unsigned int scale = winxterm_app_display_scale(app);
@@ -3187,8 +3326,21 @@ static void winxterm_app_show_context_menu(WinxtermApp *app, LPARAM lparam)
         point.x = GET_X_LPARAM(lparam);
         point.y = GET_Y_LPARAM(lparam);
     }
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, app->hwnd, 0);
+    UINT selected = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                                   point.x, point.y, 0, app->hwnd, 0);
+    bool handled = false;
+    for (size_t i = 0u; i < job_command_count; ++i) {
+        if (job_commands[i].id == selected) {
+            (void)winxterm_bridge_request_job_action(app->bridge, job_commands[i].action,
+                                                     job_commands[i].job_id);
+            handled = true;
+            break;
+        }
+    }
+    if (!handled && selected != 0u) winxterm_app_handle_command(app, (WPARAM)selected);
     DestroyMenu(menu);
+    free(job_commands);
+    winxterm_job_manager_snapshot_dispose(job_snapshot);
 }
 
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
@@ -3253,52 +3405,6 @@ static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
     }
 }
 
-static const wchar_t *winxterm_app_close_child_basename(const wchar_t *display_name)
-{
-    if (display_name == 0) {
-        return L"";
-    }
-
-    const wchar_t *base = display_name;
-    for (const wchar_t *p = display_name; *p != L'\0'; ++p) {
-        if (*p == L'\\' || *p == L'/' || *p == L':') {
-            base = p + 1;
-        }
-    }
-    return base;
-}
-
-static bool winxterm_app_close_child_matches_name(const wchar_t *display_name,
-                                                  const wchar_t *name)
-{
-    const wchar_t *base = winxterm_app_close_child_basename(display_name);
-    if (_wcsicmp(base, name) == 0) {
-        return true;
-    }
-
-    wchar_t executable_name[64];
-    if (swprintf_s(executable_name,
-                   sizeof(executable_name) / sizeof(executable_name[0]),
-                   L"%ls.exe",
-                   name) <= 0) {
-        return false;
-    }
-    return _wcsicmp(base, executable_name) == 0;
-}
-
-static bool winxterm_app_close_child_is_shell(const WinxtermHostChildInfo *child)
-{
-    if (child == 0 || !child->running) {
-        return false;
-    }
-
-    return winxterm_app_close_child_matches_name(child->display_name, L"dstshell") ||
-           winxterm_app_close_child_matches_name(child->display_name, L"cmd") ||
-           winxterm_app_close_child_matches_name(child->display_name, L"powershell") ||
-           winxterm_app_close_child_matches_name(child->display_name, L"pwsh") ||
-           winxterm_app_close_child_matches_name(child->display_name, L"bash");
-}
-
 static int winxterm_close_dialog_text_width(HWND owner, const wchar_t *text)
 {
     if (text == 0 || text[0] == L'\0') {
@@ -3350,19 +3456,24 @@ static void winxterm_close_dialog_layout(WinxtermCloseDialog *dialog, int width,
                      SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
     if (dialog->child_label != 0) {
+        int child_height = button_top - WINXTERM_CLOSE_DIALOG_GAP -
+            WINXTERM_CLOSE_DIALOG_CHECK_HEIGHT - WINXTERM_CLOSE_DIALOG_GAP - 60;
+        if (child_height < WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT) {
+            child_height = WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT;
+        }
         SetWindowPos(dialog->child_label,
                      0,
                      margin,
                      60,
                      content_width,
-                     WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT,
+                     child_height,
                      SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
     if (dialog->checkbox != 0) {
         SetWindowPos(dialog->checkbox,
                      0,
                      margin,
-                     102,
+                     button_top - WINXTERM_CLOSE_DIALOG_GAP - WINXTERM_CLOSE_DIALOG_CHECK_HEIGHT,
                      content_width,
                      WINXTERM_CLOSE_DIALOG_CHECK_HEIGHT,
                      SWP_NOZORDER | SWP_NOOWNERZORDER);
@@ -3434,13 +3545,15 @@ static LRESULT CALLBACK winxterm_close_dialog_proc(HWND hwnd, UINT message, WPAR
                                 0,
                                 0);
             dialog->child_label = CreateWindowExW(WS_EX_CLIENTEDGE,
-                                                  L"STATIC",
+                                                  L"EDIT",
                                                   dialog->child_text,
-                                                  WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                                      ES_LEFT | ES_MULTILINE | ES_READONLY |
+                                                      ES_AUTOVSCROLL,
                                                   16,
                                                   60,
                                                   400,
-                                                  28,
+                                                  WINXTERM_CLOSE_DIALOG_CHILD_HEIGHT,
                                                   hwnd,
                                                   0,
                                                   0,
@@ -3557,21 +3670,41 @@ static WinxtermCloseDecision winxterm_app_confirm_child_close(WinxtermApp *app,
         return WINXTERM_CLOSE_DECISION_CLOSE;
     }
 
-    if (winxterm_app_close_child_is_shell(child)) {
-        winxterm_log_writef(app->log,
-                            "close: direct child is a shell; defaulting to terminal shutdown");
-        return WINXTERM_CLOSE_DECISION_TERMINATE;
-    }
-
     WinxtermCloseDialog dialog;
     memset(&dialog, 0, sizeof(dialog));
     dialog.decision = WINXTERM_CLOSE_DECISION_TERMINATE;
-    int written = swprintf_s(dialog.child_text,
-                             sizeof(dialog.child_text) / sizeof(dialog.child_text[0]),
-                             L"%ls (pid %lu)",
-                             child->display_name[0] != L'\0' ? child->display_name : L"(unknown)",
-                             (unsigned long)child->process_id);
-    if (written <= 0) {
+    WinxtermManagedJobSnapshot *jobs = 0;
+    size_t job_count = 0u;
+    bool snapshot_ok = app->bridge != 0 &&
+        winxterm_job_manager_snapshot(&app->bridge->job_manager, 0u, &jobs, &job_count);
+    size_t offset = 0u;
+    for (size_t i = 0u; snapshot_ok && i < job_count; ++i) {
+        if (jobs[i].state == WINXTERM_JOB_EXITED || jobs[i].state == WINXTERM_JOB_FAILED) continue;
+        if (child->is_shell && jobs[i].owner_id == 0u) continue;
+        int written = swprintf_s(dialog.child_text + offset,
+                                 sizeof(dialog.child_text) / sizeof(dialog.child_text[0]) - offset,
+                                 offset == 0u ? L"%llu - %ls (pid %lu, %ls)" :
+                                                L"\r\n%llu - %ls (pid %lu, %ls)",
+                                 (unsigned long long)jobs[i].id,
+                                 jobs[i].display_name[0] != L'\0' ? jobs[i].display_name : L"(unknown)",
+                                 (unsigned long)jobs[i].process_id,
+                                 jobs[i].foreground ? L"foreground" : L"background");
+        if (written <= 0) { offset = 0u; break; }
+        offset += (size_t)written;
+    }
+    winxterm_job_manager_snapshot_dispose(jobs);
+    if (child->is_shell && offset == 0u) {
+        return WINXTERM_CLOSE_DECISION_TERMINATE;
+    }
+    if (offset == 0u) {
+        int written = swprintf_s(dialog.child_text,
+                                 sizeof(dialog.child_text) / sizeof(dialog.child_text[0]),
+                                 L"%ls (pid %lu)",
+                                 child->display_name[0] != L'\0' ? child->display_name : L"(unknown)",
+                                 (unsigned long)child->process_id);
+        if (written > 0) offset = (size_t)written;
+    }
+    if (offset == 0u) {
         winxterm_log_writef(app->log, "close dialog content formatting failed; defaulting to terminate");
         return WINXTERM_CLOSE_DECISION_TERMINATE;
     }
@@ -3687,7 +3820,7 @@ static bool winxterm_app_request_close(WinxtermApp *app, const char *reason)
 
     app->closing = true;
     if (decision == WINXTERM_CLOSE_DECISION_HEADLESS) {
-        winxterm_log_writef(app->log, "%s: keeping direct child running headless", reason);
+        winxterm_log_writef(app->log, "%s: keeping managed jobs running headless", reason);
         winxterm_bridge_request_headless(app->bridge);
     } else if (decision == WINXTERM_CLOSE_DECISION_TERMINATE) {
         winxterm_log_writef(app->log, "%s: terminating direct child", reason);
@@ -4668,6 +4801,127 @@ static void winxterm_app_paint(WinxtermApp *app)
     }
 }
 
+static LRESULT CALLBACK winxterm_job_view_proc(HWND hwnd, UINT message,
+                                               WPARAM wparam, LPARAM lparam)
+{
+    HWND edit = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (message) {
+    case WM_CREATE: {
+        CREATESTRUCTW *create = (CREATESTRUCTW *)lparam;
+        const wchar_t *text = create != 0 ? (const wchar_t *)create->lpCreateParams : L"";
+        edit = CreateWindowExW(WS_EX_CLIENTEDGE,
+                               L"EDIT",
+                               text != 0 ? text : L"",
+                               WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+                                   ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
+                                   ES_AUTOHSCROLL | ES_READONLY,
+                               0, 0, 0, 0,
+                               hwnd, 0, create != 0 ? create->hInstance : 0, 0);
+        if (edit == 0) return -1;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)edit);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        return 0;
+    }
+    case WM_SIZE:
+        if (edit != 0) {
+            MoveWindow(edit, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
+        }
+        return 0;
+    case WM_SETFOCUS:
+        if (edit != 0) SetFocus(edit);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static bool winxterm_app_register_job_view_class(HINSTANCE instance)
+{
+    static const wchar_t class_name[] = L"WinxtermJobView";
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = winxterm_job_view_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(0, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = class_name;
+    ATOM atom = RegisterClassExW(&wc);
+    return atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+static void winxterm_app_open_job_view(WinxtermApp *app)
+{
+    uint64_t job_id = 0u;
+    uint8_t *bytes = 0;
+    size_t byte_count = 0u;
+    if (!winxterm_bridge_take_job_view(app->bridge, &job_id, &bytes, &byte_count)) return;
+    uint8_t *plain = (uint8_t *)malloc(byte_count + 1u);
+    size_t out = 0u;
+    bool escape = false, osc = false, osc_esc = false;
+    if (plain != 0) {
+        for (size_t i = 0u; i < byte_count; ++i) {
+            uint8_t ch = bytes[i];
+            if (osc) {
+                if (ch == 0x07u || (osc_esc && ch == '\\')) osc = false;
+                osc_esc = ch == 0x1bu;
+                continue;
+            }
+            if (escape) {
+                if (ch == ']') { osc = true; escape = false; continue; }
+                if (ch >= 0x40u && ch <= 0x7eu) escape = false;
+                continue;
+            }
+            if (ch == 0x1bu) { escape = true; continue; }
+            if (ch == '\r') {
+                if (i + 1u < byte_count && bytes[i + 1u] == '\n') continue;
+                ch = '\n';
+            }
+            if (ch < 0x20u && ch != '\n' && ch != '\t') continue;
+            plain[out++] = ch;
+        }
+        plain[out] = '\0';
+    }
+    free(bytes);
+    int wide_count = plain != 0 ? MultiByteToWideChar(CP_UTF8, 0, (const char *)plain,
+                                                       (int)out, 0, 0) : 0;
+    wchar_t *wide = (wchar_t *)calloc((size_t)(wide_count > 0 ? wide_count : 1) + 1u,
+                                      sizeof(*wide));
+    if (wide != 0 && wide_count > 0) {
+        (void)MultiByteToWideChar(CP_UTF8, 0, (const char *)plain, (int)out,
+                                  wide, wide_count);
+    }
+    free(plain);
+    if (wide == 0) return;
+    wchar_t title[96];
+    (void)_snwprintf_s(title, sizeof(title) / sizeof(title[0]), _TRUNCATE,
+                       L"Job %llu View", (unsigned long long)job_id);
+    if (!winxterm_app_register_job_view_class(app->instance)) {
+        free(wide);
+        winxterm_log_writef(app->log, "job view class registration failed, error=%lu",
+                            (unsigned long)GetLastError());
+        return;
+    }
+    RECT owner = {0, 0, 800, 600};
+    (void)GetWindowRect(app->hwnd, &owner);
+    int width = owner.right - owner.left;
+    int height = owner.bottom - owner.top;
+    if (width <= 0) width = 800;
+    if (height <= 0) height = 600;
+    HWND view = CreateWindowExW(WS_EX_TOOLWINDOW,
+                                L"WinxtermJobView", title,
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                owner.left, owner.top, width, height,
+                                app->hwnd, 0, app->instance, wide);
+    free(wide);
+    if (view != 0) {
+        bool maximize = app->fullscreen || IsZoomed(app->hwnd) != 0;
+        ShowWindow(view, maximize ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        UpdateWindow(view);
+    }
+}
+
 static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
     WinxtermApp *app = (WinxtermApp *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -4684,6 +4938,10 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
     }
 
     switch (message) {
+    case WINXTERM_WM_JOB_VIEW:
+        winxterm_app_open_job_view(app);
+        return 0;
+
     case WINXTERM_WM_SCALE_UPDATE: {
         unsigned int scale = WINXTERM_DEFAULT_DISPLAY_SCALE;
         while (winxterm_bridge_take_pending_display_scale(app->bridge, &scale)) {
@@ -4877,6 +5135,10 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
 
     case WINXTERM_WM_RENDER_UPDATE:
         winxterm_app_handle_render_update(app, hwnd);
+        return 0;
+
+    case WINXTERM_WM_JOB_UI:
+        winxterm_app_show_context_menu(app, (LPARAM)-1);
         return 0;
 
     case WINXTERM_WM_MACRO_UPDATE:

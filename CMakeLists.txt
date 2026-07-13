@@ -11,6 +11,7 @@ add_library(sqlite3 STATIC
 add_executable(winxterm WIN32
     resources/winxterm.rc
     src/dstcmd/api/unicode.c
+    src/dstcmd/winxterm_dstcmd_job_client.c
     src/main.c
     src/winxterm_app.c
     src/winxterm_bridge.c
@@ -19,8 +20,16 @@ add_executable(winxterm WIN32
     src/winxterm_glyph_fallback.cpp
     src/winxterm_host.c
     src/winxterm_input.c
+    src/winxterm_job_channel.c
+    src/winxterm_job_coordinator.c
+    src/winxterm_job_dispatch.c
+    src/winxterm_job_journal.c
+    src/winxterm_job_plan.c
+    src/winxterm_job_protocol.c
+    src/winxterm_job_manager.c
     src/winxterm_log.c
     src/winxterm_macro.c
+    src/winxterm_managed_runtime.c
     src/winxterm_modes.c
     src/winxterm_mouse.c
     src/winxterm_options.c
@@ -29,6 +38,8 @@ add_executable(winxterm WIN32
     src/winxterm_screen.c
     src/winxterm_smoke.c
     src/winxterm_text.c
+    src/winxterm_terminal_session.c
+    src/winxterm_transfer_format.c
     src/winxterm_threads.c
     src/winxterm_ux.c
     src/winxterm_window_placement.c
@@ -48,6 +59,7 @@ add_executable(dstshell
     src/dstcmd/commands/export.c
     src/dstcmd/commands/help.c
     src/dstcmd/commands/highlight.c
+    src/dstcmd/commands/job.c
     src/dstcmd/commands/ls.c
     src/dstcmd/commands/mv.c
     src/dstcmd/commands/playmacro.c
@@ -60,8 +72,14 @@ add_executable(dstshell
     src/dstcmd/winxterm_dstcmd_dircache.c
     src/dstcmd/winxterm_dstcmd_exec.c
     src/dstcmd/winxterm_dstcmd_host.c
+    src/dstcmd/winxterm_dstcmd_job_client.c
     src/dstcmd/winxterm_dstcmd_jobs.c
     src/dstcmd/winxterm_dstcmd_parse.c
+    src/dstcmd/winxterm_dstcmd_selector.c
+    src/winxterm_job_channel.c
+    src/winxterm_job_plan.c
+    src/winxterm_job_protocol.c
+    src/winxterm_transfer_format.c
 )
 
 if(WINXTERM_BUILD_DSTSHELL_MODE_MUTATOR)

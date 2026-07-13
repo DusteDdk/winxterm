@@ -212,7 +212,7 @@ configure_and_build() {
         -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TRY_COMPILE_CONFIGURATION=Release \
-        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL \
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
         -DWINXTERM_BUILD_DSTSHELL_MODE_MUTATOR=OFF \
         -DCMAKE_C_COMPILER="$TOOLCHAIN_BIN/clang-cl" \
         -DCMAKE_CXX_COMPILER="$TOOLCHAIN_BIN/clang-cl" \

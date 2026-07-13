@@ -1,10 +1,13 @@
 #include "dstcmd/winxterm_dstcmd_exec.h"
+#include "winxterm_transfer_format.h"
 
 #include "dstcmd/api/unicode.h"
 #include "dstcmd/api/path.h"
 #include "dstcmd/dispatch.h"
+#include "winxterm_job_manager.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -12,6 +15,98 @@
 #define WINXTERM_DSTCMD_CLIENT_TITLE_MAX_COLUMNS 240u
 #define WINXTERM_DSTCMD_CLIENT_TITLE_ELLIPSIS L"...."
 #define WINXTERM_DSTCMD_CLIENT_TITLE_ELLIPSIS_COLUMNS 4u
+
+static int winxterm_dstcmd_exec_run_managed_pipeline(WinxtermDstcmdShell *shell,
+                                                     const WinxtermDstcmdExecStage *stages,
+                                                     size_t stage_count,
+                                                     bool background,
+                                                     bool connectable_stdin,
+                                                     uint64_t *job_id_out);
+
+static bool winxterm_dstcmd_is_job_view_attachment(const WinxtermDstcmdExecStage *stage)
+{
+    return stage != 0 && stage->argv != 0 && stage->argv->count == 3 &&
+        stage->argv->items != 0 && _wcsicmp(stage->argv->items[0], L"job") == 0 &&
+        _wcsicmp(stage->argv->items[1], L"view") == 0 &&
+        stage->stdout_endpoint.kind == WINXTERM_DSTCMD_STREAM_REDIRECT;
+}
+
+static int winxterm_dstcmd_run_job_view_attachment(WinxtermDstcmdShell *shell,
+                                                   const WinxtermDstcmdExecStage *stage)
+{
+    wchar_t *end = 0;
+    errno = 0;
+    unsigned long long parsed = wcstoull(stage->argv->items[2], &end, 10);
+    if (errno != 0 || end == stage->argv->items[2] || *end != L'\0' || parsed == 0u) return 2;
+    WinxtermDstcmdScratchMark mark = winxterm_dstcmd_scratch_mark(&shell->scratch);
+    WinxtermDstcmdWin32Path path;
+    uint32_t request_status = ERROR_INVALID_DATA;
+    bool attached = winxterm_dstcmd_path_prepare_win32_scratch(
+                        &shell->scratch, stage->stdout_endpoint.path, &path) &&
+        winxterm_dstcmd_job_client_attach(&shell->job_client, (uint64_t)parsed,
+                                          path.syscall, stage->stdout_endpoint.append,
+                                          stage->stdout_endpoint.tee_to_terminal,
+                                          &request_status) &&
+        request_status == ERROR_SUCCESS;
+    winxterm_dstcmd_scratch_rewind(&shell->scratch, mark);
+    if (!attached) {
+        (void)winxterm_dstcmd_shell_write_widef(shell, L"job: attach failed (%lu)\r\n",
+                                                (unsigned long)request_status);
+        return 1;
+    }
+    HANDLE input = shell->stream_input_handle != 0 ? shell->stream_input_handle :
+                   shell->input_handle;
+    HANDLE event = winxterm_dstcmd_job_client_event_handle(&shell->job_client);
+    for (;;) {
+        WinxtermDstcmdJobEvent job_event;
+        while (winxterm_dstcmd_job_client_poll_event(&shell->job_client, &job_event)) {
+            if (job_event.kind == WINXTERM_JOB_EVENT_EXITED &&
+                job_event.job_id == (uint64_t)parsed) return 0;
+            if (job_event.kind == WINXTERM_JOB_EVENT_RESYNC_REQUIRED) {
+                WinxtermDstcmdJobInfo *jobs = 0;
+                size_t job_count = 0u;
+                bool live = false;
+                if (winxterm_dstcmd_job_client_list(&shell->job_client, &jobs, &job_count)) {
+                    for (size_t i = 0u; i < job_count; ++i) {
+                        if (jobs[i].id == (uint64_t)parsed &&
+                            jobs[i].state != WINXTERM_JOB_EXITED &&
+                            jobs[i].state != WINXTERM_JOB_FAILED) live = true;
+                    }
+                }
+                free(jobs);
+                if (!live) return 0;
+            }
+        }
+        HANDLE waits[3];
+        DWORD wait_count = 0u;
+        if (event != 0) waits[wait_count++] = event;
+        if (input != 0 && input != INVALID_HANDLE_VALUE) waits[wait_count++] = input;
+        if (shell->shutdown_event != 0) waits[wait_count++] = shell->shutdown_event;
+        if (wait_count == 0u) return 1;
+        DWORD wait = WaitForMultipleObjects(wait_count, waits, FALSE, 100u);
+        if (wait == WAIT_TIMEOUT) continue;
+        if (wait >= WAIT_OBJECT_0 + wait_count) return 1;
+        HANDLE signaled = waits[wait - WAIT_OBJECT_0];
+        if (signaled == shell->shutdown_event) return 1;
+        if (signaled == input) {
+            uint8_t bytes[64];
+            size_t count = winxterm_dstcmd_shell_read_input(shell, bytes, sizeof(bytes), false);
+            bool cancel = false;
+            for (size_t i = 0u; i < count; ++i) {
+                if (bytes[i] == 0x03u) cancel = true;
+                else if (shell->pending_input_count < WINXTERM_DSTCMD_PENDING_INPUT_CAPACITY) {
+                    shell->pending_input[shell->pending_input_count++] = bytes[i];
+                }
+            }
+            if (cancel) {
+                (void)winxterm_dstcmd_job_client_simple(
+                    &shell->job_client, WINXTERM_JOB_MESSAGE_DETACH,
+                    (uint64_t)parsed, 0u, &request_status);
+                return request_status == ERROR_SUCCESS ? 0 : 1;
+            }
+        }
+    }
+}
 
 static bool winxterm_dstcmd_is_slash(wchar_t ch)
 {
@@ -1229,6 +1324,12 @@ static int winxterm_dstcmd_run_builtin_stage(WinxtermDstcmdShell *shell,
 static int winxterm_dstcmd_run_standalone_external(WinxtermDstcmdShell *shell,
                                                   const WinxtermDstcmdExecStage *stage)
 {
+    if (winxterm_dstcmd_job_client_available(&shell->job_client) &&
+        (winxterm_dstcmd_job_client_capabilities(&shell->job_client) &
+         WINXTERM_JOB_CAPABILITY_SPAWN) != 0u) {
+        uint64_t job_id = 0u;
+        return winxterm_dstcmd_exec_run_managed_foreground(shell, stage->argv, &job_id);
+    }
     int status = 1;
     bool child_mode_entered = false;
     bool title_changed = false;
@@ -1500,84 +1601,6 @@ static bool winxterm_dstcmd_pump_terminal_input(WinxtermDstcmdShell *shell,
     return true;
 }
 
-static void winxterm_dstcmd_format_byte_quantity(uint64_t bytes, wchar_t *out, size_t out_count)
-{
-    if (out == 0 || out_count == 0u) {
-        return;
-    }
-    if (bytes == 1u) {
-        (void)wcscpy_s(out, out_count, L"1 byte");
-        return;
-    }
-    if (bytes < 1024u) {
-        (void)_snwprintf_s(out,
-                           out_count,
-                           _TRUNCATE,
-                           L"%llu bytes",
-                           (unsigned long long)bytes);
-        return;
-    }
-    static const wchar_t *units[] = { L"KiB", L"MiB", L"GiB", L"TiB" };
-    double value = (double)bytes / 1024.0;
-    size_t unit_index = 0u;
-    while (value >= 1024.0 && unit_index + 1u < sizeof(units) / sizeof(units[0])) {
-        value /= 1024.0;
-        ++unit_index;
-    }
-    (void)_snwprintf_s(out, out_count, _TRUNCATE, L"%.2f %ls", value, units[unit_index]);
-}
-
-static void winxterm_dstcmd_format_duration(uint64_t elapsed_ns, wchar_t *out, size_t out_count)
-{
-    if (out == 0 || out_count == 0u) {
-        return;
-    }
-    if (elapsed_ns < 1000000000ull) {
-        uint64_t milliseconds = (elapsed_ns + 500000ull) / 1000000ull;
-        if (milliseconds == 0u && elapsed_ns != 0u) {
-            milliseconds = 1u;
-        }
-        (void)_snwprintf_s(out,
-                           out_count,
-                           _TRUNCATE,
-                           L"%llu ms",
-                           (unsigned long long)milliseconds);
-        return;
-    }
-    double seconds = (double)elapsed_ns / 1000000000.0;
-    (void)_snwprintf_s(out,
-                       out_count,
-                       _TRUNCATE,
-                       seconds < 10.0 ? L"%.2f s" : L"%.1f s",
-                       seconds);
-}
-
-static void winxterm_dstcmd_format_speed(uint64_t bytes,
-                                         uint64_t elapsed_ns,
-                                         wchar_t *out,
-                                         size_t out_count)
-{
-    if (out == 0 || out_count == 0u) {
-        return;
-    }
-    if (elapsed_ns == 0u) {
-        elapsed_ns = 1u;
-    }
-    double bytes_per_second = ((double)bytes * 1000000000.0) / (double)elapsed_ns;
-    if (bytes_per_second < 1024.0) {
-        (void)_snwprintf_s(out, out_count, _TRUNCATE, L"%.0f bytes/s", bytes_per_second);
-        return;
-    }
-    static const wchar_t *units[] = { L"KiB/s", L"MiB/s", L"GiB/s", L"TiB/s" };
-    double value = bytes_per_second / 1024.0;
-    size_t unit_index = 0u;
-    while (value >= 1024.0 && unit_index + 1u < sizeof(units) / sizeof(units[0])) {
-        value /= 1024.0;
-        ++unit_index;
-    }
-    (void)_snwprintf_s(out, out_count, _TRUNCATE, L"%.2f %ls", value, units[unit_index]);
-}
-
 static bool winxterm_dstcmd_write_redirect_summary(WinxtermDstcmdShell *shell,
                                                    const WinxtermDstcmdRedirectSink *sink)
 {
@@ -1589,9 +1612,12 @@ static bool winxterm_dstcmd_write_redirect_summary(WinxtermDstcmdShell *shell,
     wchar_t bytes[64];
     wchar_t duration[64];
     wchar_t speed[64];
-    winxterm_dstcmd_format_byte_quantity(sink->bytes_written, bytes, sizeof(bytes) / sizeof(bytes[0]));
-    winxterm_dstcmd_format_duration(elapsed_ns, duration, sizeof(duration) / sizeof(duration[0]));
-    winxterm_dstcmd_format_speed(sink->bytes_written, elapsed_ns, speed, sizeof(speed) / sizeof(speed[0]));
+    winxterm_transfer_format_bytes(sink->bytes_written, bytes,
+                                   sizeof(bytes) / sizeof(bytes[0]));
+    winxterm_transfer_format_duration(elapsed_ns, duration,
+                                      sizeof(duration) / sizeof(duration[0]));
+    winxterm_transfer_format_speed(sink->bytes_written, elapsed_ns, speed,
+                                   sizeof(speed) / sizeof(speed[0]));
     return winxterm_dstcmd_shell_write_widef(shell,
                                             L"%ls written in %ls at %ls\r\n",
                                             bytes,
@@ -1914,16 +1940,45 @@ int winxterm_dstcmd_exec_run(WinxtermDstcmdShell *shell,
         if (stages[0].argv == 0 || stages[0].argv->count <= 0 ||
             stages[0].argv->items == 0 || stages[0].argv->items[0] == 0) {
             status = 0;
+        } else if (winxterm_dstcmd_is_job_view_attachment(&stages[0])) {
+            status = winxterm_dstcmd_run_job_view_attachment(shell, &stages[0]);
         } else if (winxterm_dstcmd_exec_uses_interactive_client(stages, stage_count)) {
             status = winxterm_dstcmd_run_standalone_external(shell, stages);
         } else if (winxterm_dstcmd_stage_can_run_direct_builtin(stages)) {
             status = winxterm_dstcmd_run_builtin_stage(shell, stages);
         } else {
-            status = winxterm_dstcmd_run_stdio_job(shell, stages, stage_count);
+            bool managed_file = !winxterm_dstcmd_is_builtin(stages[0].argv->items[0]) &&
+                stages[0].stdout_endpoint.kind == WINXTERM_DSTCMD_STREAM_REDIRECT &&
+                winxterm_dstcmd_job_client_available(&shell->job_client) &&
+                (winxterm_dstcmd_job_client_capabilities(&shell->job_client) &
+                 (WINXTERM_JOB_CAPABILITY_PIPELINES |
+                  WINXTERM_JOB_CAPABILITY_FILE_ENDPOINTS)) ==
+                    (WINXTERM_JOB_CAPABILITY_PIPELINES |
+                     WINXTERM_JOB_CAPABILITY_FILE_ENDPOINTS);
+            status = managed_file ?
+                winxterm_dstcmd_exec_run_managed_pipeline(shell, stages, stage_count,
+                                                          false, false, 0) :
+                winxterm_dstcmd_run_stdio_job(shell, stages, stage_count);
             winxterm_dstcmd_shell_enter_line_editor_mode(shell);
         }
     } else {
-        status = winxterm_dstcmd_run_stdio_job(shell, stages, stage_count);
+        bool managed_pipeline = winxterm_dstcmd_job_client_available(&shell->job_client) &&
+            (winxterm_dstcmd_job_client_capabilities(&shell->job_client) &
+             WINXTERM_JOB_CAPABILITY_PIPELINES) != 0u;
+        for (size_t i = 0u; managed_pipeline && i < stage_count; ++i) {
+            managed_pipeline = stages[i].argv != 0 && stages[i].argv->count > 0 &&
+                stages[i].argv->items != 0 && stages[i].argv->items[0] != 0 &&
+                stages[i].stdin_endpoint.kind != WINXTERM_DSTCMD_STREAM_REDIRECT &&
+                (stages[i].stdout_endpoint.kind != WINXTERM_DSTCMD_STREAM_REDIRECT ||
+                 (i + 1u == stage_count &&
+                  (winxterm_dstcmd_job_client_capabilities(&shell->job_client) &
+                   WINXTERM_JOB_CAPABILITY_FILE_ENDPOINTS) != 0u)) &&
+                stages[i].stderr_endpoint.kind == WINXTERM_DSTCMD_STREAM_TERMINAL;
+        }
+        status = managed_pipeline ?
+            winxterm_dstcmd_exec_run_managed_pipeline(shell, stages, stage_count,
+                                                      false, false, 0) :
+            winxterm_dstcmd_run_stdio_job(shell, stages, stage_count);
         winxterm_dstcmd_shell_enter_line_editor_mode(shell);
     }
     WinxtermCommandDiagnostics *diagnostics =
@@ -1934,4 +1989,257 @@ int winxterm_dstcmd_exec_run(WinxtermDstcmdShell *shell,
                               end_ns >= start_ns ? end_ns - start_ns : 0u);
     }
     return status;
+}
+
+static char *winxterm_dstcmd_exec_wide_to_utf8(const wchar_t *text)
+{
+    if (text == 0) return 0;
+    int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, 0, 0, 0, 0);
+    if (count <= 0) return 0;
+    char *utf8 = (char *)malloc((size_t)count);
+    if (utf8 == 0 || WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1,
+                                         utf8, count, 0, 0) != count) {
+        free(utf8);
+        return 0;
+    }
+    return utf8;
+}
+
+static int winxterm_dstcmd_exec_run_managed(WinxtermDstcmdShell *shell,
+                                           const WinxtermDstcmdArgv *argv,
+                                           bool background, bool connectable_stdin,
+                                           uint64_t *job_id)
+{
+    if (job_id != 0) *job_id = 0u;
+    if (shell == 0 || argv == 0 || argv->count <= 0 || argv->items == 0 ||
+        job_id == 0 || !winxterm_dstcmd_job_client_available(&shell->job_client)) return 1;
+    WinxtermDstcmdPreparedExec prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    int status = winxterm_dstcmd_prepare_external(shell, argv, false, &prepared);
+    if (status != 0) return status;
+
+    WinxtermJobExecutionPlan plan;
+    WinxtermJobPlanStage stage;
+    memset(&plan, 0, sizeof(plan));
+    memset(&stage, 0, sizeof(stage));
+    plan.flags = (background ? WINXTERM_JOB_PLAN_FLAG_BACKGROUND : 0u) |
+                 (connectable_stdin ? WINXTERM_JOB_PLAN_FLAG_CONNECTABLE_STDIN : 0u);
+    plan.cwd = winxterm_dstcmd_exec_wide_to_utf8(prepared.native_cwd);
+    plan.stages = &stage;
+    plan.stage_count = 1u;
+    stage.stdin_endpoint = connectable_stdin ? WINXTERM_JOB_PLAN_ENDPOINT_CONNECTABLE :
+                                               WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    stage.stdout_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    stage.stderr_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+    stage.argument_count = (size_t)prepared.argc;
+    stage.arguments = (char **)calloc(stage.argument_count, sizeof(*stage.arguments));
+    if (plan.cwd == 0 || stage.arguments == 0) { status = 1; goto cleanup_managed; }
+    for (size_t i = 0u; i < stage.argument_count; ++i) {
+        stage.arguments[i] = winxterm_dstcmd_exec_wide_to_utf8(prepared.argv[i]);
+        if (stage.arguments[i] == 0) { status = 1; goto cleanup_managed; }
+    }
+
+    LPWCH environment = GetEnvironmentStringsW();
+    if (environment == 0) { status = 1; goto cleanup_managed; }
+    for (const wchar_t *entry = environment; *entry != L'\0'; entry += wcslen(entry) + 1u) {
+        if (entry[0] == L'=') continue;
+        if (plan.environment_count == WINXTERM_JOB_PLAN_MAX_ENVIRONMENT) {
+            status = 1;
+            break;
+        }
+        void *grown = realloc(plan.environment,
+                              (plan.environment_count + 1u) * sizeof(*plan.environment));
+        if (grown == 0) { status = 1; break; }
+        plan.environment = (char **)grown;
+        plan.environment[plan.environment_count] = winxterm_dstcmd_exec_wide_to_utf8(entry);
+        if (plan.environment[plan.environment_count] == 0) { status = 1; break; }
+        ++plan.environment_count;
+    }
+    FreeEnvironmentStringsW(environment);
+    if (status != 0) goto cleanup_managed;
+    uint32_t host_status = ERROR_INVALID_DATA;
+    uint32_t exit_code = 1u;
+    bool has_exit_code = false;
+    if (!winxterm_dstcmd_job_client_spawn(&shell->job_client, &plan, job_id,
+                                          &exit_code, &has_exit_code, &host_status)) {
+        status = 1;
+    } else {
+        status = host_status == ERROR_SUCCESS ?
+            (!background && has_exit_code ? (int)exit_code : 0) : (int)host_status;
+    }
+
+cleanup_managed:
+    for (size_t i = 0u; i < stage.argument_count; ++i) free(stage.arguments[i]);
+    free(stage.arguments);
+    for (size_t i = 0u; i < plan.environment_count; ++i) free(plan.environment[i]);
+    free(plan.environment);
+    free(plan.cwd);
+    winxterm_dstcmd_prepared_exec_dispose(&prepared);
+    return status;
+}
+
+int winxterm_dstcmd_exec_run_managed_background(WinxtermDstcmdShell *shell,
+                                                const WinxtermDstcmdArgv *argv,
+                                                bool connectable_stdin,
+                                                uint64_t *job_id)
+{
+    return winxterm_dstcmd_exec_run_managed(shell, argv, true, connectable_stdin, job_id);
+}
+
+int winxterm_dstcmd_exec_run_managed_foreground(WinxtermDstcmdShell *shell,
+                                                const WinxtermDstcmdArgv *argv,
+                                                uint64_t *job_id)
+{
+    return winxterm_dstcmd_exec_run_managed(shell, argv, false, false, job_id);
+}
+
+static WinxtermJobPlanEndpoint winxterm_dstcmd_job_plan_endpoint(
+    WinxtermDstcmdStreamEndpointKind endpoint)
+{
+    if (endpoint == WINXTERM_DSTCMD_STREAM_PIPE) return WINXTERM_JOB_PLAN_ENDPOINT_PIPE;
+    if (endpoint == WINXTERM_DSTCMD_STREAM_REDIRECT) return WINXTERM_JOB_PLAN_ENDPOINT_FILE;
+    return WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+}
+
+static int winxterm_dstcmd_exec_run_managed_pipeline(WinxtermDstcmdShell *shell,
+                                                     const WinxtermDstcmdExecStage *stages,
+                                                     size_t stage_count,
+                                                     bool background,
+                                                     bool connectable_stdin,
+                                                     uint64_t *job_id_out)
+{
+    int status = 1;
+    WinxtermJobExecutionPlan plan;
+    memset(&plan, 0, sizeof(plan));
+    WinxtermDstcmdPreparedExec *prepared =
+        (WinxtermDstcmdPreparedExec *)calloc(stage_count, sizeof(*prepared));
+    plan.stages = (WinxtermJobPlanStage *)calloc(stage_count, sizeof(*plan.stages));
+    plan.stage_count = stage_count;
+    if (background) plan.flags |= WINXTERM_JOB_PLAN_FLAG_BACKGROUND;
+    if (connectable_stdin) plan.flags |= WINXTERM_JOB_PLAN_FLAG_CONNECTABLE_STDIN;
+    if (prepared == 0 || plan.stages == 0) goto cleanup;
+    wchar_t helper_path[WINXTERM_DSTCMD_PATH_CAPACITY];
+    DWORD helper_length = GetModuleFileNameW(0, helper_path, WINXTERM_DSTCMD_PATH_CAPACITY);
+    if (helper_length == 0u || helper_length >= WINXTERM_DSTCMD_PATH_CAPACITY) goto cleanup;
+    for (size_t i = 0u; i < stage_count; ++i) {
+        WinxtermJobPlanStage *target = &plan.stages[i];
+        target->stdin_endpoint = winxterm_dstcmd_job_plan_endpoint(stages[i].stdin_endpoint.kind);
+        target->stdout_endpoint = winxterm_dstcmd_job_plan_endpoint(stages[i].stdout_endpoint.kind);
+        target->stderr_endpoint = WINXTERM_JOB_PLAN_ENDPOINT_TERMINAL;
+        if (stages[i].stdout_endpoint.kind == WINXTERM_DSTCMD_STREAM_REDIRECT) {
+            WinxtermDstcmdScratchMark redirect_mark =
+                winxterm_dstcmd_scratch_mark(&shell->scratch);
+            WinxtermDstcmdWin32Path redirect_path;
+            if (!winxterm_dstcmd_path_prepare_win32_scratch(
+                    &shell->scratch, stages[i].stdout_endpoint.path, &redirect_path)) {
+                winxterm_dstcmd_scratch_rewind(&shell->scratch, redirect_mark);
+                status = 1;
+                goto cleanup;
+            }
+            target->path = winxterm_dstcmd_exec_wide_to_utf8(redirect_path.syscall);
+            winxterm_dstcmd_scratch_rewind(&shell->scratch, redirect_mark);
+            if (target->path == 0) { status = 1; goto cleanup; }
+            if (stages[i].stdout_endpoint.append) target->flags |= WINXTERM_JOB_STAGE_FLAG_APPEND;
+            if (stages[i].stdout_endpoint.tee_to_terminal) target->flags |= WINXTERM_JOB_STAGE_FLAG_TEE;
+        }
+        bool builtin = winxterm_dstcmd_is_builtin(stages[i].argv->items[0]);
+        if (!builtin) {
+            status = winxterm_dstcmd_prepare_external(shell, stages[i].argv, true, &prepared[i]);
+            if (status != 0) goto cleanup;
+        } else target->flags |= WINXTERM_JOB_STAGE_FLAG_ISOLATED_BUILTIN;
+        target->argument_count = builtin ? (size_t)stages[i].argv->count + 2u :
+                                           (size_t)prepared[i].argc;
+        target->arguments = (char **)calloc(target->argument_count,
+                                            sizeof(*target->arguments));
+        if (target->arguments == 0) { status = 1; goto cleanup; }
+        if (builtin) {
+            target->arguments[0] = winxterm_dstcmd_exec_wide_to_utf8(helper_path);
+            target->arguments[1] = winxterm_dstcmd_exec_wide_to_utf8(L"--stage");
+            for (int argument = 0; argument < stages[i].argv->count; ++argument) {
+                target->arguments[(size_t)argument + 2u] =
+                    winxterm_dstcmd_exec_wide_to_utf8(stages[i].argv->items[argument]);
+            }
+        } else {
+            for (size_t argument = 0u; argument < target->argument_count; ++argument) {
+                target->arguments[argument] =
+                    winxterm_dstcmd_exec_wide_to_utf8(prepared[i].argv[argument]);
+            }
+        }
+        for (size_t argument = 0u; argument < target->argument_count; ++argument) {
+            if (target->arguments[argument] == 0) { status = 1; goto cleanup; }
+        }
+    }
+    const wchar_t *pipeline_cwd = winxterm_dstcmd_shell_cwd(shell);
+    for (size_t i = 0u; i < stage_count; ++i) {
+        if (prepared[i].native_cwd[0] != L'\0') {
+            pipeline_cwd = prepared[i].native_cwd;
+            break;
+        }
+    }
+    plan.cwd = winxterm_dstcmd_exec_wide_to_utf8(pipeline_cwd);
+    if (plan.cwd == 0) goto cleanup;
+    LPWCH environment = GetEnvironmentStringsW();
+    if (environment == 0) goto cleanup;
+    status = 0;
+    for (const wchar_t *entry = environment; *entry != L'\0'; entry += wcslen(entry) + 1u) {
+        if (entry[0] == L'=') continue;
+        if (plan.environment_count == WINXTERM_JOB_PLAN_MAX_ENVIRONMENT) {
+            status = 1;
+            break;
+        }
+        void *grown = realloc(plan.environment,
+                              (plan.environment_count + 1u) * sizeof(*plan.environment));
+        if (grown == 0) { status = 1; break; }
+        plan.environment = (char **)grown;
+        plan.environment[plan.environment_count] = winxterm_dstcmd_exec_wide_to_utf8(entry);
+        if (plan.environment[plan.environment_count] == 0) { status = 1; break; }
+        ++plan.environment_count;
+    }
+    FreeEnvironmentStringsW(environment);
+    if (status != 0) goto cleanup;
+    uint64_t job_id = 0u;
+    uint32_t exit_code = 1u, host_status = ERROR_INVALID_DATA;
+    bool has_exit_code = false;
+    if (!winxterm_dstcmd_job_client_spawn(&shell->job_client, &plan, &job_id,
+                                          &exit_code, &has_exit_code, &host_status)) {
+        status = 1;
+    } else if (host_status != ERROR_SUCCESS) {
+        status = (int)host_status;
+    } else {
+        if (job_id_out != 0) *job_id_out = job_id;
+        status = background ? 0 : has_exit_code ? (int)exit_code : 0;
+    }
+
+cleanup:
+    if (plan.stages != 0) {
+        for (size_t i = 0u; i < stage_count; ++i) {
+            for (size_t argument = 0u; argument < plan.stages[i].argument_count; ++argument) {
+                free(plan.stages[i].arguments[argument]);
+            }
+            free(plan.stages[i].arguments);
+            free(plan.stages[i].path);
+        }
+    }
+    free(plan.stages);
+    for (size_t i = 0u; i < plan.environment_count; ++i) free(plan.environment[i]);
+    free(plan.environment);
+    free(plan.cwd);
+    if (prepared != 0) {
+        for (size_t i = 0u; i < stage_count; ++i) {
+            winxterm_dstcmd_prepared_exec_dispose(&prepared[i]);
+        }
+    }
+    free(prepared);
+    return status;
+}
+
+int winxterm_dstcmd_exec_run_managed_stages_background(
+    WinxtermDstcmdShell *shell, const WinxtermDstcmdExecStage *stages,
+    size_t stage_count, bool connectable_stdin, uint64_t *job_id)
+{
+    if (job_id != 0) *job_id = 0u;
+    if (shell == 0 || stages == 0 || stage_count == 0u || job_id == 0 ||
+        !winxterm_dstcmd_job_client_available(&shell->job_client)) return 1;
+    return winxterm_dstcmd_exec_run_managed_pipeline(
+        shell, stages, stage_count, true, connectable_stdin, job_id);
 }

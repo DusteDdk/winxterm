@@ -5,6 +5,7 @@
 #include "dstcmd/api/unicode.h"
 #include "dstcmd/dispatch.h"
 #include "dstcmd/winxterm_dstcmd_exec.h"
+#include "dstcmd/winxterm_dstcmd_selector.h"
 #include "dstcmd/winxterm_dstcmd_parse.h"
 
 #include "sqlite3.h"
@@ -2687,20 +2688,6 @@ static bool winxterm_dstcmd_history_search_collect_saved(WinxtermDstcmdShell *sh
     return complete;
 }
 
-static int winxterm_dstcmd_history_search_fold_char(char ch)
-{
-    return tolower((unsigned char)ch);
-}
-
-static bool winxterm_dstcmd_history_search_char_equal(char left, char right, bool smart_case)
-{
-    if (smart_case) {
-        return left == right;
-    }
-    return winxterm_dstcmd_history_search_fold_char(left) ==
-           winxterm_dstcmd_history_search_fold_char(right);
-}
-
 static bool winxterm_dstcmd_history_search_query_has_upper(const char *query)
 {
     if (query == 0) {
@@ -2718,24 +2705,7 @@ static const char *winxterm_dstcmd_history_search_strstr_ci(const char *text,
                                                             const char *needle,
                                                             bool smart_case)
 {
-    if (text == 0 || needle == 0) {
-        return 0;
-    }
-    size_t needle_length = strlen(needle);
-    if (needle_length == 0u) {
-        return text;
-    }
-    for (const char *p = text; *p != '\0'; ++p) {
-        size_t i = 0u;
-        while (i < needle_length && p[i] != '\0' &&
-               winxterm_dstcmd_history_search_char_equal(p[i], needle[i], smart_case)) {
-            ++i;
-        }
-        if (i == needle_length) {
-            return p;
-        }
-    }
-    return 0;
+    return winxterm_dstcmd_selector_contains_utf8(text, needle, smart_case);
 }
 
 static bool winxterm_dstcmd_history_search_is_word_start(const char *text, const char *p)
@@ -2753,32 +2723,7 @@ static bool winxterm_dstcmd_history_search_fuzzy_match(const char *text,
                                                        bool smart_case,
                                                        int *gap_penalty)
 {
-    if (gap_penalty != 0) {
-        *gap_penalty = 0;
-    }
-    if (text == 0 || term == 0) {
-        return false;
-    }
-    const char *cursor = text;
-    int gaps = 0;
-    for (const char *t = term; *t != '\0'; ++t) {
-        const char *matched = 0;
-        while (*cursor != '\0') {
-            if (winxterm_dstcmd_history_search_char_equal(*cursor, *t, smart_case)) {
-                matched = cursor++;
-                break;
-            }
-            ++gaps;
-            ++cursor;
-        }
-        if (matched == 0) {
-            return false;
-        }
-    }
-    if (gap_penalty != 0) {
-        *gap_penalty = gaps;
-    }
-    return true;
+    return winxterm_dstcmd_selector_fuzzy_utf8(text, term, smart_case, gap_penalty);
 }
 
 static size_t winxterm_dstcmd_history_search_split_terms(char *query, char **terms, size_t term_capacity)
@@ -3821,6 +3766,7 @@ bool winxterm_dstcmd_shell_init(WinxtermDstcmdShell *shell)
     shell->input_handle = GetStdHandle(STD_INPUT_HANDLE);
     shell->output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
     shell->error_handle = GetStdHandle(STD_ERROR_HANDLE);
+    winxterm_dstcmd_job_client_init(&shell->job_client);
     winxterm_dstcmd_shell_configure_console_modes(shell);
     InitializeCriticalSection(&shell->output_lock);
     shell->output_lock_initialized = true;
@@ -3861,6 +3807,7 @@ void winxterm_dstcmd_shell_dispose(WinxtermDstcmdShell *shell)
         LeaveCriticalSection(&shell->output_lock);
     }
     winxterm_dstcmd_job_pool_dispose(&shell->jobs);
+    winxterm_dstcmd_job_client_dispose(&shell->job_client);
     winxterm_dstcmd_shell_dispose_dir_cache(shell);
     winxterm_dstcmd_shell_history_dispose_db(shell);
     winxterm_dstcmd_history_search_free_candidates(shell);
@@ -4577,10 +4524,10 @@ static bool winxterm_dstcmd_shell_capture_finish(WinxtermDstcmdShell *shell,
     return true;
 }
 
-static bool winxterm_dstcmd_shell_expand_alias(WinxtermDstcmdShell *shell,
-                                               WinxtermDstcmdArgv *argv,
-                                               wchar_t *error,
-                                               size_t error_count)
+bool winxterm_dstcmd_shell_expand_alias(WinxtermDstcmdShell *shell,
+                                        WinxtermDstcmdArgv *argv,
+                                        wchar_t *error,
+                                        size_t error_count)
 {
     if (shell == 0 || argv == 0 || argv->count <= 0 || argv->items == 0 || argv->items[0] == 0) {
         return true;
@@ -4601,12 +4548,15 @@ static bool winxterm_dstcmd_shell_expand_alias(WinxtermDstcmdShell *shell,
     return true;
 }
 
-static int winxterm_dstcmd_shell_run_pipeline(WinxtermDstcmdShell *shell,
-                                              const WinxtermDstcmdCommandList *list,
-                                              size_t start,
-                                              size_t end,
-                                              wchar_t *error,
-                                              size_t error_count)
+static int winxterm_dstcmd_shell_run_pipeline_mode(WinxtermDstcmdShell *shell,
+                                                   const WinxtermDstcmdCommandList *list,
+                                                   size_t start,
+                                                   size_t end,
+                                                   wchar_t *error,
+                                                   size_t error_count,
+                                                   bool background,
+                                                   bool connectable_stdin,
+                                                   uint64_t *job_id)
 {
     if (shell == 0 || list == 0 || start > end || end >= list->count) {
         return 0;
@@ -4640,6 +4590,7 @@ static int winxterm_dstcmd_shell_run_pipeline(WinxtermDstcmdShell *shell,
             status = 2;
             goto cleanup;
         }
+        stages[i].stdout_endpoint = redirect_endpoint;
         if (redirect_endpoint.kind == WINXTERM_DSTCMD_STREAM_REDIRECT && i + 1u != stage_count) {
             (void)winxterm_dstcmd_shell_write_wide(
                 shell,
@@ -4684,24 +4635,38 @@ static int winxterm_dstcmd_shell_run_pipeline(WinxtermDstcmdShell *shell,
         stages[i].argv = argvs + i;
         stages[i].stdin_endpoint.kind = i == 0u ?
             WINXTERM_DSTCMD_STREAM_TERMINAL : WINXTERM_DSTCMD_STREAM_PIPE;
-        stages[i].stdout_endpoint.kind = i + 1u == stage_count ?
-            WINXTERM_DSTCMD_STREAM_TERMINAL : WINXTERM_DSTCMD_STREAM_PIPE;
-        if (redirect_endpoint.kind == WINXTERM_DSTCMD_STREAM_REDIRECT) {
-            stages[i].stdout_endpoint = redirect_endpoint;
+        if (redirect_endpoint.kind != WINXTERM_DSTCMD_STREAM_REDIRECT) {
+            stages[i].stdout_endpoint.kind = i + 1u == stage_count ?
+                WINXTERM_DSTCMD_STREAM_TERMINAL : WINXTERM_DSTCMD_STREAM_PIPE;
         }
         stages[i].stderr_endpoint.kind = WINXTERM_DSTCMD_STREAM_TERMINAL;
         stages[i].isolate_shell_state = stage_count != 1u;
     }
 
-    status = winxterm_dstcmd_exec_run(shell, stages, stage_count);
+    status = background ? winxterm_dstcmd_exec_run_managed_stages_background(
+                              shell, stages, stage_count, connectable_stdin, job_id) :
+                          winxterm_dstcmd_exec_run(shell, stages, stage_count);
 
 cleanup:
     for (size_t i = 0u; i < stage_count; ++i) {
+        winxterm_dstcmd_stream_endpoint_dispose(&stages[i].stdout_endpoint);
         winxterm_dstcmd_argv_dispose(argvs + i);
     }
     free(argvs);
     free(stages);
     return status;
+}
+
+static int winxterm_dstcmd_shell_run_pipeline(WinxtermDstcmdShell *shell,
+                                              const WinxtermDstcmdCommandList *list,
+                                              size_t start,
+                                              size_t end,
+                                              wchar_t *error,
+                                              size_t error_count)
+{
+    return winxterm_dstcmd_shell_run_pipeline_mode(shell, list, start, end,
+                                                   error, error_count,
+                                                   false, false, 0);
 }
 
 static int winxterm_dstcmd_shell_run_command_list(WinxtermDstcmdShell *shell,
@@ -4786,6 +4751,40 @@ int winxterm_dstcmd_shell_submit_line(WinxtermDstcmdShell *shell, const wchar_t 
     winxterm_dstcmd_command_list_dispose(&commands);
     winxterm_dstcmd_scratch_reset(&shell->scratch);
     return shell->last_status;
+}
+
+int winxterm_dstcmd_shell_run_background_line(WinxtermDstcmdShell *shell,
+                                              const wchar_t *line,
+                                              bool connectable_stdin,
+                                              uint64_t *job_id)
+{
+    if (job_id != 0) *job_id = 0u;
+    if (shell == 0 || line == 0 || job_id == 0) return 1;
+    winxterm_dstcmd_scratch_reset(&shell->scratch);
+    WinxtermDstcmdCommandList commands;
+    wchar_t error[128];
+    if (!winxterm_dstcmd_parse_control_line(line, &commands, error, 128u)) {
+        (void)winxterm_dstcmd_shell_write_widef(shell, L"job: %ls\r\n", error);
+        winxterm_dstcmd_scratch_reset(&shell->scratch);
+        return 2;
+    }
+    bool one_pipeline = commands.count != 0u;
+    for (size_t i = 0u; one_pipeline && i + 1u < commands.count; ++i) {
+        one_pipeline = commands.segments[i].op_after == WINXTERM_DSTCMD_CONTROL_PIPE;
+    }
+    if (!one_pipeline) {
+        (void)winxterm_dstcmd_shell_write_wide(
+            shell, L"job: run/open accepts one command or pipeline\r\n");
+        winxterm_dstcmd_command_list_dispose(&commands);
+        winxterm_dstcmd_scratch_reset(&shell->scratch);
+        return 2;
+    }
+    int status = winxterm_dstcmd_shell_run_pipeline_mode(
+        shell, &commands, 0u, commands.count - 1u, error, 128u,
+        true, connectable_stdin, job_id);
+    winxterm_dstcmd_command_list_dispose(&commands);
+    winxterm_dstcmd_scratch_reset(&shell->scratch);
+    return status;
 }
 
 static void winxterm_dstcmd_shell_backspace(WinxtermDstcmdShell *shell)

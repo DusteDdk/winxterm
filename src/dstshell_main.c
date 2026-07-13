@@ -1,5 +1,7 @@
 #include "dstcmd/winxterm_dstcmd.h"
+#include "dstcmd/dispatch.h"
 
+#include <stdlib.h>
 #include <wchar.h>
 #include <windows.h>
 
@@ -47,6 +49,22 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc > 1 && argv != 0 && argv[1] != 0 && wcscmp(argv[1], L"--smoke") == 0) {
         exit_code = winxterm_dstcmd_smoke_run();
+        dstshell_restore_console_encoding(original_input_code_page, original_output_code_page);
+        return exit_code;
+    }
+    if (argc > 2 && argv != 0 && argv[1] != 0 && wcscmp(argv[1], L"--stage") == 0) {
+        WinxtermDstcmdShell *shell = (WinxtermDstcmdShell *)calloc(1u, sizeof(*shell));
+        if (shell == 0 || !winxterm_dstcmd_shell_init(shell)) {
+            free(shell);
+            dstshell_restore_console_encoding(original_input_code_page, original_output_code_page);
+            return 1;
+        }
+        WinxtermDstcmdArgv stage_argv;
+        stage_argv.count = argc - 2;
+        stage_argv.items = argv + 2;
+        exit_code = winxterm_dstcmd_dispatch_builtin(shell, &stage_argv);
+        winxterm_dstcmd_shell_dispose(shell);
+        free(shell);
         dstshell_restore_console_encoding(original_input_code_page, original_output_code_page);
         return exit_code;
     }

@@ -3,6 +3,8 @@
 
 #include "winxterm_diagnostics.h"
 #include "winxterm_log.h"
+#include "winxterm_job_manager.h"
+#include "winxterm_job_coordinator.h"
 #include "winxterm_screen.h"
 #include "winxterm_text.h"
 
@@ -14,6 +16,8 @@
 #define WINXTERM_WM_RENDER_UPDATE (WM_APP + 1u)
 #define WINXTERM_WM_SCALE_UPDATE (WM_APP + 2u)
 #define WINXTERM_WM_MACRO_UPDATE (WM_APP + 3u)
+#define WINXTERM_WM_JOB_VIEW (WM_APP + 4u)
+#define WINXTERM_WM_JOB_UI (WM_APP + 5u)
 #define WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY 16384u
 #define WINXTERM_BRIDGE_INPUT_MAX_CAPACITY (16u * 1024u * 1024u)
 #define WINXTERM_BRIDGE_OUTPUT_INITIAL_CAPACITY 65536u
@@ -22,6 +26,7 @@
 #define WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES 65536u
 #define WINXTERM_BRIDGE_TITLE_CAPACITY 256u
 #define WINXTERM_BRIDGE_CHILD_NAME_CAPACITY 512u
+#define WINXTERM_BRIDGE_JOB_ACTION_QUEUE_LIMIT 1024u
 
 typedef enum WinxtermFrameCause {
     WINXTERM_FRAME_CAUSE_NONE = 0u,
@@ -42,8 +47,18 @@ typedef enum WinxtermHostState {
     WINXTERM_HOST_STATE_FAILED
 } WinxtermHostState;
 
+typedef enum WinxtermBridgeJobAction {
+    WINXTERM_BRIDGE_JOB_ACTION_NONE = 0,
+    WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND,
+    WINXTERM_BRIDGE_JOB_ACTION_VIEW,
+    WINXTERM_BRIDGE_JOB_ACTION_BACKGROUND,
+    WINXTERM_BRIDGE_JOB_ACTION_CLOSE,
+    WINXTERM_BRIDGE_JOB_ACTION_FORCE_EXIT
+} WinxtermBridgeJobAction;
+
 typedef struct WinxtermHostChildInfo {
     bool running;
+    bool is_shell;
     WinxtermHostState state;
     DWORD process_id;
     wchar_t display_name[WINXTERM_BRIDGE_CHILD_NAME_CAPACITY];
@@ -83,6 +98,7 @@ typedef struct WinxtermBridgeDiagnostics {
 
 typedef struct WinxtermBridge {
     WinxtermLog *log;
+    WinxtermJobManager job_manager;
     WinxtermScreen screen;
     CRITICAL_SECTION screen_lock;
     CRITICAL_SECTION input_lock;
@@ -104,6 +120,7 @@ typedef struct WinxtermBridge {
     size_t input_head;
     size_t input_tail;
     size_t input_count;
+    uint64_t input_session_id;
     size_t output_capacity;
     size_t output_count;
     size_t output_high_water;
@@ -127,6 +144,7 @@ typedef struct WinxtermBridge {
     unsigned int pending_frame_causes;
     bool output_paused;
     bool macro_update_pending;
+    WinxtermJobCoordinator job_coordinator;
     wchar_t *pending_macro_path;
     unsigned int resize_request_count;
     unsigned int resize_coalesced_count;
@@ -149,6 +167,7 @@ typedef struct WinxtermBridge {
     uint32_t fps_window_frames;
     double last_fps;
     bool host_child_running;
+    bool host_child_is_shell;
     bool host_headless;
     bool host_terminate_requested;
     WinxtermHostState host_state;
@@ -179,15 +198,34 @@ bool winxterm_bridge_request_macro(WinxtermBridge *bridge, const wchar_t *path);
 wchar_t *winxterm_bridge_take_macro_request(WinxtermBridge *bridge);
 bool winxterm_bridge_queue_input(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
 bool winxterm_bridge_queue_reply(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
+bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
+                                          uint64_t session_id,
+                                          const uint8_t *pending_bytes,
+                                          size_t pending_count,
+                                          uint8_t **previous_bytes,
+                                          size_t *previous_count);
 bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
+bool winxterm_bridge_request_job_action(WinxtermBridge *bridge,
+                                       WinxtermBridgeJobAction action, uint64_t job_id);
+bool winxterm_bridge_take_job_action(WinxtermBridge *bridge,
+                                    WinxtermBridgeJobAction *action, uint64_t *job_id);
+bool winxterm_bridge_publish_job_view(WinxtermBridge *bridge, uint64_t job_id,
+                                      uint8_t *bytes, size_t byte_count);
+bool winxterm_bridge_take_job_view(WinxtermBridge *bridge, uint64_t *job_id,
+                                   uint8_t **bytes, size_t *byte_count);
+bool winxterm_bridge_request_job_ui(WinxtermBridge *bridge);
 bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
                                    size_t max_bytes,
                                    bool *content_changed,
                                    bool *more_pending,
                                    bool *presentation_changed);
 size_t winxterm_bridge_read_input(WinxtermBridge *bridge, uint8_t *buffer, size_t buffer_capacity);
+size_t winxterm_bridge_read_session_input(WinxtermBridge *bridge, uint64_t session_id,
+                                          uint8_t *buffer, size_t buffer_capacity);
 void winxterm_bridge_clear_input(WinxtermBridge *bridge);
 void winxterm_bridge_set_title_utf8(WinxtermBridge *bridge, const char *title, size_t title_length);
+void winxterm_bridge_set_active_session(WinxtermBridge *bridge, uint64_t session_id);
+uint64_t winxterm_bridge_active_session(WinxtermBridge *bridge);
 bool winxterm_bridge_note_bell(WinxtermBridge *bridge);
 bool winxterm_bridge_take_bell(WinxtermBridge *bridge);
 void winxterm_bridge_set_bell_enabled(WinxtermBridge *bridge, bool enabled);
@@ -216,7 +254,8 @@ void winxterm_bridge_mark_painted(WinxtermBridge *bridge);
 void winxterm_bridge_mark_painted_locked(WinxtermBridge *bridge);
 void winxterm_bridge_note_frame(WinxtermBridge *bridge);
 void winxterm_bridge_set_host_starting(WinxtermBridge *bridge);
-void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id, const wchar_t *display_name);
+void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id,
+                                    const wchar_t *display_name, bool is_shell);
 void winxterm_bridge_set_host_state(WinxtermBridge *bridge, WinxtermHostState state);
 void winxterm_bridge_clear_host_child(WinxtermBridge *bridge, WinxtermHostState final_state);
 bool winxterm_bridge_copy_child_info(WinxtermBridge *bridge, WinxtermHostChildInfo *info);
