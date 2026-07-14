@@ -1,6 +1,7 @@
 #include "dstcmd/commands/ls.h"
 
 #include "dstcmd/api/path.h"
+#include "dstcmd/api/unicode.h"
 #include "dstcmd/winxterm_dstcmd_parse.h"
 
 #include <stdlib.h>
@@ -206,7 +207,49 @@ static void winxterm_dstcmd_format_file_size(ULONGLONG size,
 
 static bool winxterm_dstcmd_ls_uses_wide_format(const WinxtermDstcmdLsOptions *options)
 {
-    return options != 0 && !options->long_format && !options->sort_time;
+    return options != 0 && !options->long_format;
+}
+
+static size_t winxterm_dstcmd_ls_terminal_columns(const WinxtermDstcmdShell *shell)
+{
+    HANDLE output = shell != 0 && shell->output_handle != 0 &&
+        shell->output_handle != INVALID_HANDLE_VALUE ?
+        shell->output_handle : GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (output != 0 && output != INVALID_HANDLE_VALUE &&
+        GetConsoleScreenBufferInfo(output, &info)) {
+        int columns = (int)(info.srWindow.Right - info.srWindow.Left + 1);
+        if (columns > 0) {
+            return (size_t)columns;
+        }
+        if (info.dwSize.X > 0) {
+            return (size_t)info.dwSize.X;
+        }
+    }
+    return 80u;
+}
+
+static size_t winxterm_dstcmd_ls_name_columns(const wchar_t *name)
+{
+    if (name == 0) {
+        return 0u;
+    }
+    size_t length = wcslen(name);
+    size_t offset = 0u;
+    size_t columns = 0u;
+    while (offset < length) {
+        uint32_t codepoint = 0u;
+        size_t before = offset;
+        (void)winxterm_dstcmd_wide_decode_next(name, length, &offset, &codepoint);
+        if (offset <= before) {
+            offset = before + 1u;
+        }
+        int width = winxterm_dstcmd_codepoint_width(codepoint);
+        if (width > 0) {
+            columns += (size_t)width;
+        }
+    }
+    return columns;
 }
 
 static bool winxterm_dstcmd_ls_append_wide_entries(WinxtermDstcmdOutputBuilder *builder,
@@ -218,18 +261,65 @@ static bool winxterm_dstcmd_ls_append_wide_entries(WinxtermDstcmdOutputBuilder *
         return true;
     }
 
-    (void)shell;
-
+    if (count > ((size_t)-1) / sizeof(size_t)) {
+        return false;
+    }
+    size_t *name_columns = (size_t *)calloc(count, sizeof(*name_columns));
+    if (name_columns == 0) {
+        return false;
+    }
+    size_t widest_name = 0u;
     for (size_t i = 0u; i < count; ++i) {
-        const wchar_t *name = entries[i].name != 0 ? entries[i].name : L"";
-        if (!winxterm_dstcmd_output_builder_append_wide(builder, name)) {
-            return false;
-        }
-        if (!winxterm_dstcmd_output_builder_append_wide(builder, L"\r\n")) {
-            return false;
+        name_columns[i] = winxterm_dstcmd_ls_name_columns(entries[i].name);
+        if (name_columns[i] > widest_name) {
+            widest_name = name_columns[i];
         }
     }
-    return true;
+
+    size_t terminal_columns = winxterm_dstcmd_ls_terminal_columns(shell);
+    if (widest_name > ((size_t)-1) - 2u) {
+        free(name_columns);
+        return false;
+    }
+    size_t column_width = widest_name + 2u;
+    size_t column_count = terminal_columns + 2u >= column_width ?
+        (terminal_columns + 2u) / column_width : 1u;
+    if (column_count == 0u) {
+        column_count = 1u;
+    } else if (column_count > count) {
+        column_count = count;
+    }
+    size_t row_count = (count + column_count - 1u) / column_count;
+
+    bool appended = true;
+    for (size_t row = 0u; appended && row < row_count; ++row) {
+        for (size_t column = 0u; column < column_count; ++column) {
+            size_t index = row + column * row_count;
+            if (index >= count) {
+                break;
+            }
+            const wchar_t *name = entries[index].name != 0 ? entries[index].name : L"";
+            if (!winxterm_dstcmd_output_builder_append_wide(builder, name)) {
+                appended = false;
+                break;
+            }
+            size_t next_index = row + (column + 1u) * row_count;
+            if (next_index < count) {
+                size_t padding = widest_name - name_columns[index] + 2u;
+                while (padding-- != 0u) {
+                    if (!winxterm_dstcmd_output_builder_append_wide(builder, L" ")) {
+                        appended = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (appended && !winxterm_dstcmd_output_builder_append_wide(builder, L"\r\n")) {
+            appended = false;
+        }
+    }
+    free(name_columns);
+    return appended;
 }
 
 static bool winxterm_dstcmd_ls_append_entry(WinxtermDstcmdOutputBuilder *builder,

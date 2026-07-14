@@ -3,6 +3,7 @@
 set -e
 DIST_DIR="${DIST_DIR:-$(id -un)-dist-linux-msvc}"
 export DIST_DIR
+export WINXTERM_HOST_TRANSPORT=stdio
 ./build-windows-binaries-on-linux.sh
 rm -Rf ~/.wine/drive_c/$DIST_DIR
 cp -a "$DIST_DIR" ~/.wine/drive_c/$DIST_DIR

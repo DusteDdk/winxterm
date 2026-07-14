@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <commdlg.h>
 #include <wincodec.h>
 #include <windowsx.h>
 
@@ -126,6 +127,7 @@ enum {
     WINXTERM_MENU_RENDER_SPANS,
     WINXTERM_MENU_RENDER_ROW_MASKS,
     WINXTERM_MENU_RENDER_PRECOLORED,
+    WINXTERM_MENU_DUMP_SCREEN,
     WINXTERM_MENU_DIAGNOSTICS,
     WINXTERM_MENU_RENDER_THREADS_BASE = 1100,
     WINXTERM_MENU_RENDER_THREADS_LAST =
@@ -137,6 +139,7 @@ static LRESULT CALLBACK winxterm_close_dialog_proc(HWND hwnd, UINT message, WPAR
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes);
 static void winxterm_app_handle_macro_update(WinxtermApp *app);
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam);
+static void winxterm_app_dump_screen_to_file(WinxtermApp *app);
 static SIZE winxterm_app_min_window_size(WinxtermApp *app);
 static void winxterm_app_snap_window_to_cells(WinxtermApp *app);
 static void winxterm_app_update_scrollbar(WinxtermApp *app);
@@ -3314,6 +3317,7 @@ static void winxterm_app_show_context_menu(WinxtermApp *app, LPARAM lparam)
     AppendMenuW(menu, MF_SEPARATOR, 0, 0);
     AppendMenuW(menu, MF_STRING, WINXTERM_MENU_CLEAR_SCROLLBACK, L"Clear scrollback");
     AppendMenuW(menu, MF_STRING, WINXTERM_MENU_RESET_TERMINAL, L"Reset terminal");
+    AppendMenuW(menu, MF_STRING, WINXTERM_MENU_DUMP_SCREEN, L"Dump screen to file");
 
     typedef struct WinxtermMenuJobCommand {
         UINT id;
@@ -3484,6 +3488,9 @@ static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
         break;
     case WINXTERM_MENU_RESET_TERMINAL:
         winxterm_app_reset_terminal(app);
+        break;
+    case WINXTERM_MENU_DUMP_SCREEN:
+        winxterm_app_dump_screen_to_file(app);
         break;
     case WINXTERM_MENU_SCALE_1:
         winxterm_bridge_request_display_scale(app->bridge, 1u);
@@ -4660,6 +4667,49 @@ static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *pa
 static bool winxterm_app_macro_write_celldump(void *context, const wchar_t *path)
 {
     return winxterm_app_macro_write_grid_dump(context, path, true);
+}
+
+static void winxterm_app_dump_screen_to_file(WinxtermApp *app)
+{
+    if (app == 0 || app->hwnd == 0) {
+        return;
+    }
+
+    wchar_t path[32768] = L"";
+    wchar_t cwd[32768];
+    DWORD cwd_length = GetCurrentDirectoryW((DWORD)ARRAYSIZE(cwd), cwd);
+    const wchar_t *initial_directory =
+        cwd_length != 0u && cwd_length < (DWORD)ARRAYSIZE(cwd) ? cwd : 0;
+
+    OPENFILENAMEW dialog;
+    memset(&dialog, 0, sizeof(dialog));
+    dialog.lStructSize = (DWORD)sizeof(dialog);
+    dialog.hwndOwner = app->hwnd;
+    dialog.lpstrFilter = L"winxterm cell dump (.txt)\0*.txt\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = (DWORD)ARRAYSIZE(path);
+    dialog.lpstrInitialDir = initial_directory;
+    dialog.lpstrTitle = L"Dump screen to file";
+    dialog.lpstrDefExt = L"txt";
+    dialog.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    if (!GetSaveFileNameW(&dialog)) {
+        DWORD error = CommDlgExtendedError();
+        if (error != 0u) {
+            winxterm_log_writef(app->log,
+                                "save cell dump dialog failed, error=%lu",
+                                (unsigned long)error);
+        }
+        return;
+    }
+
+    if (!winxterm_app_macro_write_celldump(app, path)) {
+        winxterm_log_writef(app->log, "cell dump write failed path=%ls", path);
+        MessageBoxW(app->hwnd,
+                    L"Could not write the screen dump to the selected file.",
+                    L"Winxterm cell dump",
+                    MB_OK | MB_ICONERROR);
+    }
 }
 
 static bool winxterm_app_macro_write_histdump(void *context, const wchar_t *path)

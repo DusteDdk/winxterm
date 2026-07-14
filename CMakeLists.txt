@@ -125,10 +125,17 @@ set_property(TARGET dstshell PROPERTY C_STANDARD 17)
 set_property(TARGET dstshell PROPERTY C_STANDARD_REQUIRED ON)
 set_property(TARGET dstshell PROPERTY C_EXTENSIONS OFF)
 
+set_property(TARGET sqlite3 winxterm dstshell
+    PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+)
+
 if(WINXTERM_BUILD_DSTSHELL_MODE_MUTATOR)
     set_property(TARGET dstshell_mode_mutator PROPERTY C_STANDARD 17)
     set_property(TARGET dstshell_mode_mutator PROPERTY C_STANDARD_REQUIRED ON)
     set_property(TARGET dstshell_mode_mutator PROPERTY C_EXTENSIONS OFF)
+    set_property(TARGET dstshell_mode_mutator
+        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+    )
 endif()
 
 set_property(TARGET pcf_to_header PROPERTY C_STANDARD 17)
@@ -172,6 +179,7 @@ endif()
 
 target_link_libraries(winxterm PRIVATE
     sqlite3
+    comdlg32
     d2d1
     d3d11
     dwrite
@@ -192,7 +200,6 @@ if(MSVC)
     target_compile_options(sqlite3 PRIVATE
         /utf-8
         $<$<CONFIG:Release>:/O2>
-        $<$<CONFIG:Release>:/GL>
     )
 
     target_compile_definitions(sqlite3 PRIVATE
@@ -209,12 +216,8 @@ if(MSVC)
         $<$<CONFIG:Release>:/O2>
         $<$<CONFIG:Release>:/Oi>
         $<$<CONFIG:Release>:/Ot>
-        $<$<CONFIG:Release>:/GL>
-        $<$<CONFIG:Release>:/favor:INTEL64>
-    )
-
-    target_link_options(winxterm PRIVATE
-        $<$<CONFIG:Release>:/LTCG>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:C,MSVC>>:/favor:INTEL64>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/favor:INTEL64>
     )
 
     target_compile_options(dstshell PRIVATE
@@ -224,12 +227,7 @@ if(MSVC)
         $<$<CONFIG:Release>:/O2>
         $<$<CONFIG:Release>:/Oi>
         $<$<CONFIG:Release>:/Ot>
-        $<$<CONFIG:Release>:/GL>
-        $<$<CONFIG:Release>:/favor:INTEL64>
-    )
-
-    target_link_options(dstshell PRIVATE
-        $<$<CONFIG:Release>:/LTCG>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:C,MSVC>>:/favor:INTEL64>
     )
 
     if(WINXTERM_BUILD_DSTSHELL_MODE_MUTATOR)
@@ -240,12 +238,7 @@ if(MSVC)
             $<$<CONFIG:Release>:/O2>
             $<$<CONFIG:Release>:/Oi>
             $<$<CONFIG:Release>:/Ot>
-            $<$<CONFIG:Release>:/GL>
-            $<$<CONFIG:Release>:/favor:INTEL64>
-        )
-
-        target_link_options(dstshell_mode_mutator PRIVATE
-            $<$<CONFIG:Release>:/LTCG>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:C,MSVC>>:/favor:INTEL64>
         )
     endif()
 
