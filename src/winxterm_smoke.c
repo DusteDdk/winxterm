@@ -25,6 +25,7 @@
 #include "winxterm_transfer_format.h"
 #include "dstcmd/winxterm_dstcmd_job_client.h"
 #include "winxterm_settings.h"
+#include "winxterm_surface.h"
 #include "winxterm_ux.h"
 #include "winxterm_window_placement.h"
 
@@ -34,7 +35,6 @@
 #include <string.h>
 #include <wchar.h>
 
-#define WINXTERM_SMOKE_PATH_CAPACITY 32768u
 
 typedef struct WinxtermSmokeState {
     int failures;
@@ -54,6 +54,33 @@ typedef struct WinxtermJobStressContext {
     uint64_t job_id;
     volatile LONG failures;
 } WinxtermJobStressContext;
+
+typedef struct WinxtermOutputCommitStressContext {
+    WinxtermBridge *bridge;
+    HANDLE start_event;
+    volatile LONG failures;
+} WinxtermOutputCommitStressContext;
+
+static DWORD WINAPI winxterm_smoke_output_commit_thread(void *context)
+{
+    WinxtermOutputCommitStressContext *stress =
+        (WinxtermOutputCommitStressContext *)context;
+    if (WaitForSingleObject(stress->start_event, 5000u) != WAIT_OBJECT_0) {
+        InterlockedIncrement(&stress->failures);
+        return 1u;
+    }
+    bool more = false;
+    do {
+        bool changed = false;
+        bool presentation = false;
+        if (!winxterm_bridge_commit_output(stress->bridge, 1u, &changed,
+                                           &more, &presentation)) {
+            InterlockedIncrement(&stress->failures);
+            return 1u;
+        }
+    } while (more);
+    return 0u;
+}
 
 static DWORD WINAPI winxterm_smoke_job_snapshot_thread(void *context)
 {
@@ -788,33 +815,6 @@ static bool winxterm_smoke_screen_contains_text(const WinxtermScreen *screen, co
     return false;
 }
 
-static bool winxterm_smoke_screen_row_contains_text(const WinxtermScreen *screen, int row, const char *text)
-{
-    if (screen == 0 || text == 0 || text[0] == '\0' || row < 0 || row >= screen->rows) {
-        return false;
-    }
-    size_t length = strlen(text);
-    if (length == 0u || length > (size_t)screen->columns) {
-        return false;
-    }
-    for (int column = 0; column + (int)length <= screen->columns; ++column) {
-        bool matched = true;
-        for (size_t i = 0u; i < length; ++i) {
-            const WinxtermScreenCell *cell = winxterm_screen_cell_at((WinxtermScreen *)screen,
-                                                                     row,
-                                                                     column + (int)i);
-            if (cell == 0 || cell->codepoint != (uint32_t)(unsigned char)text[i]) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool winxterm_smoke_row_view_contains_text(const WinxtermScreenRowView *row, const char *text)
 {
     if (row == 0 || row->cells == 0 || text == 0 || text[0] == '\0') {
@@ -885,13 +885,11 @@ static void winxterm_smoke_test_render_constants(WinxtermSmokeState *state)
 
 static void winxterm_smoke_test_font_contract(WinxtermSmokeState *state)
 {
-    winxterm_smoke_expect(state, winxterm_font_6x13.width == 6, "font width contract must be 6");
-    winxterm_smoke_expect(state, winxterm_font_6x13.height == 13, "font height contract must be 13");
+    winxterm_smoke_expect(state, WINXTERM_FONT_6X13_WIDTH == 6u, "font width contract must be 6");
+    winxterm_smoke_expect(state, WINXTERM_FONT_6X13_HEIGHT == 13u, "font height contract must be 13");
     winxterm_smoke_expect(state, WINXTERM_FONT_6X13_SOURCE_GLYPH_COUNT == 256u, "source font glyph slots must be 256");
-    winxterm_smoke_expect(state, winxterm_font_6x13.glyph_count == 257, "font glyph count must include fallback");
-    winxterm_smoke_expect(state,
-                          WINXTERM_FONT_6X13_GLYPH_DATA_AVAILABLE == 1,
-                          "Phase 2 must embed generated glyph data");
+    winxterm_smoke_expect(state, WINXTERM_FONT_6X13_TOTAL_GLYPH_COUNT == 257u,
+                          "font glyph count must include fallback");
     winxterm_smoke_expect(state,
                           winxterm_font_6x13_rows[WINXTERM_FONT_6X13_FALLBACK_GLYPH_INDEX][0].foreground_mask == 0x3fu,
                           "fallback glyph top row must be a full rectangle edge");
@@ -1115,15 +1113,8 @@ static void winxterm_smoke_test_options(WinxtermSmokeState *state)
                           options.unpainted_line_limit == WINXTERM_DEFAULT_UNPAINTED_LINE_LIMIT,
                           "option parser should set default unpainted line limit");
     winxterm_smoke_expect(state,
-                          options.render_backend == WINXTERM_DEFAULT_RENDER_BACKEND,
-                          "option parser should set profiled default renderer");
-    winxterm_smoke_expect(state,
                           options.display_scale == WINXTERM_DEFAULT_DISPLAY_SCALE,
                           "option parser should set default display scale");
-    winxterm_smoke_expect(state,
-                          options.render_thread_count >= 1u &&
-                              options.render_thread_count <= WINXTERM_MAX_RENDER_THREADS,
-                          "option parser should default render threads to available hardware capacity");
 
     const wchar_t *demo_argv[] = {L"winxterm.exe", L"--demo"};
     winxterm_smoke_expect(state,
@@ -1153,33 +1144,23 @@ static void winxterm_smoke_test_options(WinxtermSmokeState *state)
                               options.client_argc == 0,
                           "option parser should accept macro help topic");
 
-    const wchar_t *render_argv[] = {L"winxterm.exe",
-                                    L"--rendermethod",
-                                    L"row-masks",
-                                    L"--unpaintedlines",
-                                    L"42"};
+    const wchar_t *render_argv[] = {L"winxterm.exe", L"--unpaintedlines", L"42"};
     winxterm_smoke_expect(state,
-                          winxterm_options_parse(5, render_argv, &options) == 0,
-                          "option parser should accept renderer and backlog options");
-    winxterm_smoke_expect(state,
-                          options.render_backend_set &&
-                              options.render_backend == WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                          "option parser should select row-mask renderer");
+                          winxterm_options_parse(3, render_argv, &options) == 0,
+                          "option parser should accept backlog option");
     winxterm_smoke_expect(state,
                           options.unpainted_line_limit == 42u,
                           "option parser should set custom unpainted line limit");
 
     const wchar_t *thread_argv[] = {L"winxterm.exe", L"--ncputhreads", L"2"};
     winxterm_smoke_expect(state,
-                          winxterm_options_parse(3, thread_argv, &options) == 0 &&
-                              options.render_thread_count == 2u,
-                          "option parser should accept render thread count");
+                          winxterm_options_parse(3, thread_argv, &options) != 0,
+                          "removed render thread option should be rejected");
 
     const wchar_t *all_render_argv[] = {L"winxterm.exe", L"--rendermethod", L"all"};
     winxterm_smoke_expect(state,
-                          winxterm_options_parse(3, all_render_argv, &options) == 0,
-                          "option parser should accept all renderer mode");
-    winxterm_smoke_expect(state, options.render_backend_all, "option parser should set all renderer mode");
+                          winxterm_options_parse(3, all_render_argv, &options) != 0,
+                          "removed renderer option should be rejected");
 
     const wchar_t *scale_argv[] = {L"winxterm.exe", L"-x", L"2"};
     winxterm_smoke_expect(state,
@@ -1399,8 +1380,10 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                           "committed queued output should mutate screen");
     winxterm_bridge_copy_diagnostics(&bridge, &diagnostics);
     winxterm_smoke_expect(state,
-                          diagnostics.output_queue_high_water >= sizeof(queued_output) - 1u,
-                          "output queue diagnostics should record high water");
+                          diagnostics.output_queue_high_water >= sizeof(queued_output) - 1u &&
+                              diagnostics.output_queue_copy_latency.p50_ns != 0u &&
+                              diagnostics.parser_apply_latency.p50_ns != 0u,
+                          "output queue diagnostics should record high water and latency distributions");
 
     WinxtermBridge fast_bridge;
     memset(&fast_bridge, 0, sizeof(fast_bridge));
@@ -1449,6 +1432,95 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                               "fast committed output should preserve scrolled rows in scrollback before any render");
     }
     winxterm_bridge_dispose(&fast_bridge);
+
+    WinxtermBridge wrap_bridge;
+    memset(&wrap_bridge, 0, sizeof(wrap_bridge));
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_init(&wrap_bridge, 0, 40, 2),
+                          "output ring wrap bridge should initialize");
+    if (wrap_bridge.output_buffer != 0) {
+        static const uint8_t wrap_first[] = "abcdefghijklmnopqrstuvwx";
+        static const uint8_t wrap_second[] = "YZ0123456789ABCD";
+        static const uint8_t wrap_expected[] =
+            "abcdefghijklmnopqrstuvwxYZ0123456789ABCD";
+        wrap_bridge.output_capacity = 32u;
+        bool wrap_changed = false;
+        bool wrap_more = false;
+        bool wrap_presentation = false;
+        bool wrap_ok =
+            winxterm_bridge_enqueue_output(&wrap_bridge, wrap_first,
+                                           sizeof(wrap_first) - 1u) &&
+            winxterm_bridge_commit_output(&wrap_bridge, 20u, &wrap_changed,
+                                          &wrap_more, &wrap_presentation) &&
+            wrap_more && wrap_bridge.output_head == 20u &&
+            winxterm_bridge_enqueue_output(&wrap_bridge, wrap_second,
+                                           sizeof(wrap_second) - 1u) &&
+            winxterm_bridge_commit_output(&wrap_bridge, 0u, &wrap_changed,
+                                          &wrap_more, &wrap_presentation) &&
+            !wrap_more && wrap_bridge.output_count == 0u &&
+            wrap_bridge.output_head == 0u;
+        for (int column = 0; wrap_ok && column < 40; ++column) {
+            const WinxtermScreenCell *cell =
+                winxterm_screen_cell_at(&wrap_bridge.screen, 0, column);
+            wrap_ok = cell != 0 &&
+                cell->codepoint == (uint32_t)wrap_expected[column];
+        }
+        winxterm_smoke_expect(state, wrap_ok,
+                              "output ring should preserve exact FIFO order across split wrap");
+    }
+    winxterm_bridge_dispose(&wrap_bridge);
+
+    WinxtermBridge concurrent_bridge;
+    memset(&concurrent_bridge, 0, sizeof(concurrent_bridge));
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_init(&concurrent_bridge, 0, 200, 2),
+                          "concurrent commit bridge should initialize");
+    if (concurrent_bridge.output_buffer != 0) {
+        uint8_t ordered_output[200];
+        for (size_t i = 0u; i < sizeof(ordered_output); ++i) {
+            ordered_output[i] = (uint8_t)('A' + (i % 26u));
+        }
+        WinxtermOutputCommitStressContext stress;
+        memset(&stress, 0, sizeof(stress));
+        stress.bridge = &concurrent_bridge;
+        stress.start_event = CreateEventW(0, TRUE, FALSE, 0);
+        HANDLE commit_threads[2] = {0, 0};
+        bool concurrent_ok = stress.start_event != 0 &&
+            winxterm_bridge_enqueue_output(&concurrent_bridge, ordered_output,
+                                           sizeof(ordered_output));
+        if (concurrent_ok) {
+            commit_threads[0] = CreateThread(0, 0, winxterm_smoke_output_commit_thread,
+                                             &stress, 0, 0);
+            commit_threads[1] = CreateThread(0, 0, winxterm_smoke_output_commit_thread,
+                                             &stress, 0, 0);
+            concurrent_ok = commit_threads[0] != 0 && commit_threads[1] != 0;
+        }
+        if (concurrent_ok) {
+            SetEvent(stress.start_event);
+            concurrent_ok = WaitForMultipleObjects(2, commit_threads, TRUE, 10000u) ==
+                                WAIT_OBJECT_0 &&
+                            stress.failures == 0 && concurrent_bridge.output_count == 0u;
+        } else if (stress.start_event != 0) {
+            SetEvent(stress.start_event);
+        }
+        for (size_t i = 0u; concurrent_ok && i < sizeof(ordered_output); ++i) {
+            const WinxtermScreenCell *cell =
+                winxterm_screen_cell_at(&concurrent_bridge.screen, 0, (int)i);
+            concurrent_ok = cell != 0 && cell->codepoint == ordered_output[i];
+        }
+        if (commit_threads[0] != 0) {
+            (void)WaitForSingleObject(commit_threads[0], INFINITE);
+            CloseHandle(commit_threads[0]);
+        }
+        if (commit_threads[1] != 0) {
+            (void)WaitForSingleObject(commit_threads[1], INFINITE);
+            CloseHandle(commit_threads[1]);
+        }
+        if (stress.start_event != 0) CloseHandle(stress.start_event);
+        winxterm_smoke_expect(state, concurrent_ok,
+                              "commit lock should preserve parser order across consumers");
+    }
+    winxterm_bridge_dispose(&concurrent_bridge);
 
     static const uint8_t queue_byte[] = "Q";
     winxterm_smoke_expect(state,
@@ -1884,88 +1956,6 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
     winxterm_bridge_dispose(&bridge);
 }
 
-static bool winxterm_smoke_join_path(const wchar_t *directory,
-                                     const wchar_t *name,
-                                     wchar_t *out,
-                                     size_t out_count)
-{
-    if (directory == 0 || name == 0 || out == 0 || out_count == 0u) {
-        return false;
-    }
-    int written = _snwprintf_s(out, out_count, _TRUNCATE, L"%ls\\%ls", directory, name);
-    return written >= 0;
-}
-
-static bool winxterm_smoke_write_file(const wchar_t *path, const char *text)
-{
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    DWORD written = 0;
-    DWORD byte_count = text != 0 ? (DWORD)strlen(text) : 0u;
-    BOOL ok = WriteFile(file, text, byte_count, &written, 0);
-    CloseHandle(file);
-    return ok != 0 && written == byte_count;
-}
-
-static bool winxterm_smoke_path_exists(const wchar_t *path)
-{
-    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-}
-
-static void winxterm_smoke_remove_tree(const wchar_t *path)
-{
-    DWORD attributes = GetFileAttributesW(path);
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        return;
-    }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0u) {
-        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-        DeleteFileW(path);
-        return;
-    }
-    wchar_t pattern[WINXTERM_SMOKE_PATH_CAPACITY];
-    if (!winxterm_smoke_join_path(path, L"*", pattern, WINXTERM_SMOKE_PATH_CAPACITY)) {
-        return;
-    }
-    WIN32_FIND_DATAW data;
-    HANDLE find = FindFirstFileW(pattern, &data);
-    if (find != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
-                continue;
-            }
-            wchar_t child[WINXTERM_SMOKE_PATH_CAPACITY];
-            if (winxterm_smoke_join_path(path, data.cFileName, child, WINXTERM_SMOKE_PATH_CAPACITY)) {
-                winxterm_smoke_remove_tree(child);
-            }
-        } while (FindNextFileW(find, &data));
-        FindClose(find);
-    }
-    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-    RemoveDirectoryW(path);
-}
-
-static bool winxterm_smoke_make_temp_dir(wchar_t *path, size_t path_count)
-{
-    wchar_t temp_path[WINXTERM_SMOKE_PATH_CAPACITY];
-    DWORD temp_length = GetTempPathW(WINXTERM_SMOKE_PATH_CAPACITY, temp_path);
-    if (temp_length == 0u || temp_length >= WINXTERM_SMOKE_PATH_CAPACITY) {
-        return false;
-    }
-    wchar_t temp_file[WINXTERM_SMOKE_PATH_CAPACITY];
-    if (GetTempFileNameW(temp_path, L"wxt", 0, temp_file) == 0u) {
-        return false;
-    }
-    DeleteFileW(temp_file);
-    if (!CreateDirectoryW(temp_file, 0)) {
-        return false;
-    }
-    wcsncpy_s(path, path_count, temp_file, _TRUNCATE);
-    return true;
-}
-
 static void winxterm_smoke_test_screen_and_text(WinxtermSmokeState *state)
 {
     WinxtermScreen screen;
@@ -2129,7 +2119,7 @@ static void winxterm_smoke_test_screen_and_text(WinxtermSmokeState *state)
     winxterm_utf8_decoder_init(&decoder);
     static const char progress_rewrite[] =
         "before\r\n"
-        "[1/3] first\r\x1b[2K[2/3] second\r\x1b[2K[3/3] done";
+        "[1]\r\x1b[2K[2]\r\x1b[2K[3]";
     winxterm_smoke_expect(state,
                           winxterm_text_feed_bytes(&screen,
                                                    &decoder,
@@ -3144,25 +3134,14 @@ static void winxterm_smoke_test_daily_ux_helpers(WinxtermSmokeState *state)
                                        "dddd");
         winxterm_smoke_expect(state, seeded, "partial viewport history should seed");
 
-        WinxtermScreenRenderSnapshot snapshot;
+        WinxtermScreenRenderState snapshot;
         winxterm_smoke_expect(state,
-                              winxterm_screen_render_snapshot_init(&snapshot,
-                                                                   &screen,
-                                                                   screen.columns * WINXTERM_CELL_WIDTH_PIXELS,
-                                                                   2 * WINXTERM_CELL_HEIGHT_PIXELS,
-                                                                   WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                                                                   false,
-                                                                   0),
-                              "partial viewport snapshot should initialize");
-        if (snapshot.cells != 0) {
-            winxterm_smoke_expect(state,
-                                  snapshot.rows == 2 &&
-                                      snapshot.first_row == 4u &&
-                                      snapshot.cells[0].codepoint == (uint32_t)'c' &&
-                                      snapshot.cells[(size_t)snapshot.columns].codepoint == (uint32_t)'d',
-                                  "partial bottom snapshot should render bottom live rows");
-        }
-        winxterm_screen_render_snapshot_dispose(&snapshot);
+                              winxterm_screen_render_state_init(
+                                  &snapshot, &screen,
+                                  screen.columns * WINXTERM_CELL_WIDTH_PIXELS,
+                                  2 * WINXTERM_CELL_HEIGHT_PIXELS, false, 0) &&
+                                  snapshot.rows == 2 && snapshot.first_row == 4u,
+                              "partial bottom render state should select bottom live rows");
 
         winxterm_ux_init(&ux);
         winxterm_ux_note_screen_changed_for_rows(&ux, &screen, 2);
@@ -3331,332 +3310,150 @@ static void winxterm_smoke_test_daily_ux_helpers(WinxtermSmokeState *state)
                           "bell helper should stop after two seconds");
 }
 
-static bool winxterm_smoke_cell_has_non_background_pixels(const uint32_t *pixels,
-                                                          int bitmap_width,
-                                                          int cell_x,
-                                                          int cell_y,
-                                                          uint8_t width_cells,
-                                                          uint32_t background_rgb)
-{
-    if (pixels == 0 || bitmap_width <= 0 || width_cells == 0u) {
-        return false;
-    }
-    int origin_x = cell_x * WINXTERM_CELL_WIDTH_PIXELS;
-    int origin_y = cell_y * WINXTERM_CELL_HEIGHT_PIXELS;
-    int width_pixels = (int)width_cells * WINXTERM_CELL_WIDTH_PIXELS;
-    uint32_t background = winxterm_render_bgra_from_rgb(background_rgb);
-    for (int row = 0; row < WINXTERM_CELL_HEIGHT_PIXELS; ++row) {
-        const uint32_t *src = pixels + (size_t)(origin_y + row) * (size_t)bitmap_width + (size_t)origin_x;
-        for (int col = 0; col < width_pixels; ++col) {
-            if (src[col] != background) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static bool winxterm_smoke_fallback_bitmap_has_alpha(const WinxtermGlyphFallbackBitmap *bitmap)
-{
-    if (bitmap == 0 || bitmap->width_pixels <= 0 || bitmap->height_pixels <= 0) {
-        return false;
-    }
-    for (int row = 0; row < bitmap->height_pixels; ++row) {
-        const uint8_t *alpha = bitmap->alpha + (size_t)row * WINXTERM_FALLBACK_MAX_WIDTH_PIXELS;
-        for (int col = 0; col < bitmap->width_pixels; ++col) {
-            if (alpha[col] != 0u) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 static void winxterm_smoke_test_renderers(WinxtermSmokeState *state)
 {
-    const int width = WINXTERM_INITIAL_PIXEL_WIDTH;
-    const int height = WINXTERM_INITIAL_PIXEL_HEIGHT;
+    const int columns = 12;
+    const int rows = 4;
+    const int width = columns * WINXTERM_CELL_WIDTH_PIXELS;
+    const int height = rows * WINXTERM_CELL_HEIGHT_PIXELS;
     size_t pixel_count = (size_t)width * (size_t)height;
-    uint32_t *spans = (uint32_t *)malloc(pixel_count * sizeof(*spans));
-    uint32_t *row_masks = (uint32_t *)malloc(pixel_count * sizeof(*row_masks));
-    uint32_t *precolored = (uint32_t *)malloc(pixel_count * sizeof(*precolored));
+    uint32_t *incremental = (uint32_t *)malloc(pixel_count * sizeof(*incremental));
+    uint32_t *reference = (uint32_t *)malloc(pixel_count * sizeof(*reference));
+    WinxtermScreen screen;
     WinxtermRenderContext context;
+    memset(&screen, 0, sizeof(screen));
     winxterm_render_context_init(&context);
     (void)winxterm_render_context_load_fallback_fonts(&context, GetModuleHandleW(0), 0);
 
-    winxterm_smoke_expect(state,
-                          spans != 0 && row_masks != 0 && precolored != 0,
-                          "renderer smoke buffers should allocate");
-    winxterm_smoke_expect(state,
-                          winxterm_glyph_fallback_select_font(0x1f600u) ==
-                              WINXTERM_GLYPH_FALLBACK_FONT_EMOJI &&
-                              winxterm_glyph_fallback_select_font(0x2211u) ==
-                                  WINXTERM_GLYPH_FALLBACK_FONT_MATH &&
-                              winxterm_glyph_fallback_select_font(0x20acu) ==
-                                  WINXTERM_GLYPH_FALLBACK_FONT_GENERAL,
-                          "fallback font policy should classify emoji, math and general glyphs");
-    winxterm_smoke_expect(state,
-                          winxterm_render_context_fallback_ready(&context),
-                          "renderer should load startup TTF fallback fonts");
-    const WinxtermGlyphFallbackBitmap *emoji_bitmap =
-        winxterm_glyph_fallback_get_glyph(context.glyph_fallback, 0x1f600u, 0, 0u, 2u);
-    winxterm_smoke_expect(state,
-                          emoji_bitmap != 0 &&
-                              emoji_bitmap->width_pixels == WINXTERM_CELL_WIDTH_PIXELS &&
-                              emoji_bitmap->height_pixels == WINXTERM_CELL_HEIGHT_PIXELS &&
-                              emoji_bitmap->color_pixels &&
-                              winxterm_smoke_fallback_bitmap_has_alpha(emoji_bitmap),
-                          "emoji fallback should rasterize as a visible one-cell color bitmap");
-    if (spans != 0 && row_masks != 0 && precolored != 0) {
-        winxterm_render_clear(spans, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-        winxterm_render_clear(row_masks, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-        winxterm_render_clear(precolored, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-        winxterm_render_draw_glyph(&context,
-                                   spans,
-                                   width,
-                                   height,
-                                   0,
-                                   0,
-                                   (uint32_t)'A',
-                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                   WINXTERM_RENDER_BACKEND_SPANS);
-        winxterm_render_draw_glyph(&context,
-                                   row_masks,
-                                   width,
-                                   height,
-                                   0,
-                                   0,
-                                   (uint32_t)'A',
-                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                   WINXTERM_RENDER_BACKEND_ROW_MASKS);
-        winxterm_render_draw_glyph(&context,
-                                   precolored,
-                                   width,
-                                   height,
-                                   0,
-                                   0,
-                                   (uint32_t)'A',
-                                   WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                   WINXTERM_RENDER_BACKEND_PRECLORED_CACHE);
-        winxterm_smoke_expect(state,
-                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0,
-                              "span and row-mask renderers should match");
-        winxterm_smoke_expect(state,
-                              memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
-                              "span and precolored renderers should match");
-        winxterm_smoke_expect(state,
-                              context.precolored_count == 1u,
-                              "precolored renderer should cache first glyph/color pair");
-
-        WinxtermScreen screen;
-        WinxtermUtf8Decoder decoder;
-        winxterm_smoke_expect(state,
-                              winxterm_screen_init(&screen, WINXTERM_TERMINAL_COLUMNS, WINXTERM_TERMINAL_ROWS),
-                              "decorated renderer screen should initialize");
-        winxterm_utf8_decoder_init(&decoder);
-        static const char decorated[] = "\x1b[4;7;9;53mA\x1b[48;5;1m B";
-        winxterm_smoke_expect(state,
-                              winxterm_text_feed_bytes(&screen,
-                                                       &decoder,
-                                                       (const uint8_t *)decorated,
-                                                       sizeof(decorated) - 1u),
-                              "decorated renderer fixture should feed");
-        winxterm_screen_render(&screen,
-                               &context,
-                               spans,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_SPANS,
-                               false);
-        winxterm_screen_render(&screen,
-                               &context,
-                               row_masks,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                               false);
-        winxterm_screen_render(&screen,
-                               &context,
-                               precolored,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_PRECLORED_CACHE,
-                               false);
-        winxterm_smoke_expect(state,
-                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0,
-                              "decorated span and row-mask screen renderers should match");
-        winxterm_smoke_expect(state,
-                              memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
-                              "decorated span and precolored screen renderers should match");
-        WinxtermScreenRenderSnapshot snapshot;
-        winxterm_smoke_expect(state,
-                              winxterm_screen_render_snapshot_init(&snapshot,
-                                                                   &screen,
-                                                                   width,
-                                                                   height,
-                                                                   WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                                                                   false,
-                                                                   0),
-                              "decorated renderer snapshot should initialize");
-        if (snapshot.cells != 0) {
-            winxterm_render_clear(precolored, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-            winxterm_screen_render_snapshot_range(&snapshot,
-                                                  &context,
-                                                  precolored,
-                                                  0,
-                                                  snapshot.rows / 2);
-            winxterm_screen_render_snapshot_range(&snapshot,
-                                                  &context,
-                                                  precolored,
-                                                  snapshot.rows / 2,
-                                                  snapshot.rows - snapshot.rows / 2);
-            winxterm_smoke_expect(state,
-                                  memcmp(row_masks, precolored, pixel_count * sizeof(*row_masks)) == 0,
-                                  "snapshot row-range renderer should match full screen renderer");
+    bool ready = incremental != 0 && reference != 0 &&
+        winxterm_screen_init(&screen, columns, rows);
+    winxterm_smoke_expect(state, ready, "incremental renderer test should initialize");
+    if (ready) {
+        static const char initial[] = "alpha\nbeta\ngamma";
+        for (size_t i = 0u; i < sizeof(initial) - 1u; ++i) {
+            (void)winxterm_screen_append_codepoint(&screen, (uint8_t)initial[i]);
         }
-        winxterm_screen_render_snapshot_dispose(&snapshot);
+        WinxtermScreenRenderState render_state;
         winxterm_smoke_expect(state,
-                              winxterm_screen_render_snapshot_init_rows(&snapshot,
-                                                                        &screen,
-                                                                        WINXTERM_CELL_WIDTH_PIXELS,
-                                                                        WINXTERM_CELL_HEIGHT_PIXELS * 4,
-                                                                        WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                                                                        false,
-                                                                        0,
-                                                                        2,
-                                                                        1),
-                              "row-offset renderer snapshot should initialize");
-        if (snapshot.cells != 0) {
-            const uint32_t marker_rgb = 0x00010203u;
-            uint32_t marker = winxterm_render_bgra_from_rgb(marker_rgb);
-            size_t small_pixel_count = (size_t)WINXTERM_CELL_WIDTH_PIXELS *
-                                       (size_t)WINXTERM_CELL_HEIGHT_PIXELS * 4u;
-            for (size_t i = 0u; i < small_pixel_count; ++i) {
-                precolored[i] = marker;
+                              winxterm_screen_render_state_init(&render_state, &screen,
+                                                               width, height, true, 0),
+                              "direct render state should initialize");
+        winxterm_screen_render_state_rows(&render_state, &screen, &context,
+                                          incremental, 0, rows);
+        winxterm_render_damage_clear(&screen.damage);
+
+        int old_cursor_row = screen.cursor_row;
+        screen.cursor_row = 1;
+        screen.cursor_col = 2;
+        winxterm_render_damage_mark_row(&screen.damage, old_cursor_row);
+        winxterm_render_damage_mark_row(&screen.damage, screen.cursor_row);
+        (void)winxterm_screen_append_codepoint(&screen, (uint32_t)'Z');
+        (void)winxterm_screen_render_state_init(&render_state, &screen,
+                                                width, height, true, 0);
+        memcpy(reference, incremental, pixel_count * sizeof(*reference));
+        for (int row = 0; row < rows;) {
+            while (row < rows && !winxterm_render_damage_row(&screen.damage, row)) ++row;
+            int first = row;
+            while (row < rows && winxterm_render_damage_row(&screen.damage, row)) ++row;
+            if (first < row) {
+                winxterm_screen_render_state_rows(&render_state, &screen, &context,
+                                                  incremental, first, row - first);
             }
-            winxterm_screen_render_snapshot(&snapshot, &context, precolored);
-            winxterm_smoke_expect(state,
-                                  precolored[(size_t)WINXTERM_CELL_WIDTH_PIXELS *
-                                             (size_t)WINXTERM_CELL_HEIGHT_PIXELS] == marker,
-                                  "row-offset snapshot render should not clear rows above the rendered band");
         }
-        winxterm_screen_render_snapshot_dispose(&snapshot);
-        winxterm_screen_dispose(&screen);
+        winxterm_screen_render_state_rows(&render_state, &screen, &context,
+                                          reference, 0, rows);
+        winxterm_smoke_expect(state,
+                              memcmp(incremental, reference,
+                                     pixel_count * sizeof(*incremental)) == 0,
+                              "incremental rows should match a forced full redraw");
 
-        WinxtermScreen fallback_screen;
-        WinxtermUtf8Decoder fallback_decoder;
-        winxterm_smoke_expect(state,
-                              winxterm_screen_init(&fallback_screen,
-                                                   WINXTERM_TERMINAL_COLUMNS,
-                                                   WINXTERM_TERMINAL_ROWS),
-                              "fallback renderer screen should initialize");
-        winxterm_utf8_decoder_init(&fallback_decoder);
-        static const char fallback_text[] = "\xe2\x82\xac\xe2\x88\x91\xf0\x9f\x98\x80";
-        winxterm_smoke_expect(state,
-                              winxterm_text_feed_bytes(&fallback_screen,
-                                                       &fallback_decoder,
-                                                       (const uint8_t *)fallback_text,
-                                                       sizeof(fallback_text) - 1u),
-                              "fallback renderer fixture should feed");
-        winxterm_smoke_expect(state,
-                              winxterm_screen_cell_at(&fallback_screen, 0, 0)->glyph_index ==
-                                  WINXTERM_DYNAMIC_GLYPH_INDEX &&
-                                  winxterm_screen_cell_at(&fallback_screen, 0, 1)->glyph_index ==
-                                      WINXTERM_DYNAMIC_GLYPH_INDEX &&
-                                  winxterm_screen_cell_at(&fallback_screen, 0, 2)->glyph_index ==
-                                      WINXTERM_DYNAMIC_GLYPH_INDEX &&
-                                  winxterm_screen_cell_at(&fallback_screen, 0, 2)->width == 1u &&
-                                  !winxterm_screen_cell_at(&fallback_screen, 0, 3)->continuation,
-                              "non-bitmap Unicode should retain dynamic glyph keys and one-cell layout");
-        size_t fallback_cached_before = winxterm_render_context_fallback_cached_count(&context);
-        winxterm_screen_render(&fallback_screen,
-                               &context,
-                               spans,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_SPANS,
-                               false);
-        winxterm_smoke_expect(state,
-                              winxterm_smoke_cell_has_non_background_pixels(spans,
-                                                                            width,
-                                                                            2,
-                                                                            0,
-                                                                            1u,
-                                                                            WINXTERM_DEFAULT_BACKGROUND_RGB),
-                              "emoji fallback should draw visible pixels in its screen cell");
-        winxterm_screen_render(&fallback_screen,
-                               &context,
-                               row_masks,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                               false);
-        winxterm_screen_render(&fallback_screen,
-                               &context,
-                               precolored,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_PRECLORED_CACHE,
-                               false);
-        winxterm_smoke_expect(state,
-                              memcmp(spans, row_masks, pixel_count * sizeof(*spans)) == 0 &&
-                                  memcmp(spans, precolored, pixel_count * sizeof(*spans)) == 0,
-                              "fallback glyph rendering should be backend-equivalent");
-        winxterm_smoke_expect(state,
-                              winxterm_render_context_fallback_cached_count(&context) > fallback_cached_before,
-                              "fallback renderer should cache first TTF glyph rasterization");
-        size_t fallback_cached_after = winxterm_render_context_fallback_cached_count(&context);
-        winxterm_screen_render(&fallback_screen,
-                               &context,
-                               spans,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_SPANS,
-                               false);
-        winxterm_smoke_expect(state,
-                              winxterm_render_context_fallback_cached_count(&context) == fallback_cached_after,
-                              "fallback renderer should reuse cached glyph bitmaps");
-        winxterm_screen_dispose(&fallback_screen);
+        uint32_t random = 0x5eed1234u;
+        bool randomized_match = true;
+        winxterm_render_damage_clear(&screen.damage);
+        for (int step = 0; step < 128 && randomized_match; ++step) {
+            int previous_cursor_row = screen.cursor_row;
+            random = random * 1664525u + 1013904223u;
+            screen.cursor_row = (int)(random % (uint32_t)rows);
+            random = random * 1664525u + 1013904223u;
+            screen.cursor_col = (int)(random % (uint32_t)(columns - 1));
+            screen.pending_wrap = false;
+            winxterm_render_damage_mark_row(&screen.damage, previous_cursor_row);
+            winxterm_render_damage_mark_row(&screen.damage, screen.cursor_row);
+            if ((step % 3) == 0) {
+                winxterm_screen_set_foreground_index(&screen, step % 16);
+            }
+            (void)winxterm_screen_append_codepoint(
+                &screen, (uint32_t)('!' + (step % 90)));
+            (void)winxterm_screen_render_state_init(&render_state, &screen,
+                                                    width, height, true, 0);
+            for (int row = 0; row < rows;) {
+                while (row < rows &&
+                       !winxterm_render_damage_row(&screen.damage, row)) ++row;
+                int first = row;
+                while (row < rows &&
+                       winxterm_render_damage_row(&screen.damage, row)) ++row;
+                if (first < row) {
+                    winxterm_screen_render_state_rows(&render_state, &screen, &context,
+                                                      incremental, first, row - first);
+                }
+            }
+            winxterm_screen_render_state_rows(&render_state, &screen, &context,
+                                              reference, 0, rows);
+            randomized_match = memcmp(incremental, reference,
+                                      pixel_count * sizeof(*incremental)) == 0;
+            winxterm_render_damage_clear(&screen.damage);
+        }
+        winxterm_smoke_expect(state, randomized_match,
+                              "randomized incremental updates should match forced full redraws");
 
-        WinxtermScreen variation_screen;
-        WinxtermUtf8Decoder variation_decoder;
+        winxterm_render_damage_mark_row(&screen.damage, 0);
+        winxterm_render_damage_mark_row(&screen.damage, 3);
         winxterm_smoke_expect(state,
-                              winxterm_screen_init(&variation_screen,
-                                                   WINXTERM_TERMINAL_COLUMNS,
-                                                   WINXTERM_TERMINAL_ROWS),
-                              "variation selector screen should initialize");
-        winxterm_utf8_decoder_init(&variation_decoder);
-        static const char variation_text[] = "\xe2\x98\xba\xef\xb8\x8f";
+                              winxterm_render_damage_row(&screen.damage, 0) &&
+                                  !winxterm_render_damage_row(&screen.damage, 1) &&
+                                  winxterm_render_damage_row(&screen.damage, 3),
+                              "row damage should preserve disjoint updates");
+        winxterm_render_damage_record_scroll(&screen.damage, 1);
         winxterm_smoke_expect(state,
-                              winxterm_text_feed_bytes(&variation_screen,
-                                                       &variation_decoder,
-                                                       (const uint8_t *)variation_text,
-                                                       sizeof(variation_text) - 1u),
-                              "emoji variation selector fixture should feed");
-        winxterm_smoke_expect(state,
-                              winxterm_screen_cell_at(&variation_screen, 0, 0)->codepoint == 0x263au &&
-                                  winxterm_screen_cell_at(&variation_screen, 0, 0)->combining_count == 1u &&
-                                  winxterm_screen_cell_at(&variation_screen, 0, 0)->combining_codepoints[0] ==
-                                      0xfe0fu &&
-                                  winxterm_screen_cell_at(&variation_screen, 0, 1)->codepoint == (uint32_t)' ',
-                              "emoji variation selectors should attach to the base cell");
-        winxterm_screen_render(&variation_screen,
-                               &context,
-                               spans,
-                               width,
-                               height,
-                               WINXTERM_RENDER_BACKEND_ROW_MASKS,
-                               false);
-        winxterm_screen_dispose(&variation_screen);
+                              screen.damage.scroll_valid &&
+                                  screen.damage.scroll_rows == 1 &&
+                                  winxterm_render_damage_row(&screen.damage, rows - 1),
+                              "scroll damage should mark the exposed row");
     }
 
+    winxterm_screen_dispose(&screen);
     winxterm_render_context_dispose(&context);
-    free(spans);
-    free(row_masks);
-    free(precolored);
+    free(incremental);
+    free(reference);
+}
+
+static void winxterm_smoke_test_surface(WinxtermSmokeState *state)
+{
+    WinxtermSurface surface;
+    memset(&surface, 0, sizeof(surface));
+    bool initialized = winxterm_surface_init(&surface, 0, 12, 13);
+    winxterm_smoke_expect(state,
+                          initialized && surface.memory_dc != 0 && surface.dib != 0 &&
+                              surface.pixels != 0 && surface.width == 12 &&
+                              surface.height == 13 && surface.stride_pixels == 12,
+                          "persistent DIB surface should initialize");
+    if (initialized) {
+        uint32_t *old_pixels = surface.pixels;
+        winxterm_smoke_expect(state,
+                              !winxterm_surface_resize(&surface, 0, 0, 26) &&
+                                  surface.pixels == old_pixels && surface.width == 12 &&
+                                  surface.height == 13,
+                              "invalid surface replacement should preserve the live DIB");
+        winxterm_smoke_expect(state,
+                              winxterm_surface_resize(&surface, 0, 18, 26) &&
+                                  surface.pixels != 0 && surface.width == 18 &&
+                                  surface.height == 26 && surface.stride_pixels == 18,
+                              "valid surface replacement should commit transactionally");
+    }
+    winxterm_surface_dispose(&surface);
+    winxterm_smoke_expect(state,
+                          surface.memory_dc == 0 && surface.dib == 0 && surface.pixels == 0,
+                          "surface disposal should release every GDI resource");
 }
 
 int winxterm_smoke_run(void)
@@ -3684,6 +3481,7 @@ int winxterm_smoke_run(void)
     winxterm_smoke_test_macro_capture_commands(&state);
     winxterm_smoke_test_daily_ux_helpers(&state);
     winxterm_smoke_test_renderers(&state);
+    winxterm_smoke_test_surface(&state);
 
     return state.failures == 0 ? 0 : 1;
 }

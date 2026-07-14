@@ -32,7 +32,6 @@ typedef struct WinxtermUtf8Decoder {
     uint8_t string_kind;
     bool string_overflow;
     uint8_t remaining;
-    uint8_t expected;
     uint8_t escape_state;
     char csi_private;
     bool csi_has_param;

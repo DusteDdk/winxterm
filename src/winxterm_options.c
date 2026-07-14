@@ -7,56 +7,6 @@
 #include <wchar.h>
 #include <windows.h>
 
-unsigned int winxterm_options_default_render_thread_count(void)
-{
-    DWORD count = 0;
-#if defined(ALL_PROCESSOR_GROUPS)
-    count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-#endif
-    if (count == 0u) {
-        SYSTEM_INFO info;
-        memset(&info, 0, sizeof(info));
-        GetSystemInfo(&info);
-        count = info.dwNumberOfProcessors;
-    }
-    if (count == 0u) {
-        count = 1u;
-    }
-    return count > WINXTERM_MAX_RENDER_THREADS ? WINXTERM_MAX_RENDER_THREADS : (unsigned int)count;
-}
-
-static bool winxterm_options_parse_render_backend(const wchar_t *value,
-                                                  WinxtermRenderBackend *backend,
-                                                  bool *all)
-{
-    if (value == 0 || backend == 0 || all == 0) {
-        return false;
-    }
-
-    *all = false;
-    if (wcscmp(value, L"spans") == 0 || wcscmp(value, L"span") == 0) {
-        *backend = WINXTERM_RENDER_BACKEND_SPANS;
-        return true;
-    }
-    if (wcscmp(value, L"row-masks") == 0 || wcscmp(value, L"rowmask") == 0 ||
-        wcscmp(value, L"row-masks-avx2") == 0) {
-        *backend = WINXTERM_RENDER_BACKEND_ROW_MASKS;
-        return true;
-    }
-    if (wcscmp(value, L"precolored-cache") == 0 || wcscmp(value, L"precolored") == 0 ||
-        wcscmp(value, L"cache") == 0) {
-        *backend = WINXTERM_RENDER_BACKEND_PRECLORED_CACHE;
-        return true;
-    }
-    if (wcscmp(value, L"all") == 0) {
-        *backend = WINXTERM_RENDER_BACKEND_SPANS;
-        *all = true;
-        return true;
-    }
-
-    return false;
-}
-
 static bool winxterm_options_parse_unsigned(const wchar_t *value, unsigned int *out)
 {
     if (value == 0 || value[0] == L'\0' || out == 0) {
@@ -89,10 +39,8 @@ int winxterm_options_parse(int argc, const wchar_t * const *argv, WinxtermOption
     }
 
     memset(options, 0, sizeof(*options));
-    options->render_backend = WINXTERM_DEFAULT_RENDER_BACKEND;
     options->unpainted_line_limit = WINXTERM_DEFAULT_UNPAINTED_LINE_LIMIT;
     options->display_scale = WINXTERM_DEFAULT_DISPLAY_SCALE;
-    options->render_thread_count = winxterm_options_default_render_thread_count();
 
     for (int i = 1; i < argc; ++i) {
         if (argv == 0 || argv[i] == 0) {
@@ -115,25 +63,9 @@ int winxterm_options_parse(int argc, const wchar_t * const *argv, WinxtermOption
             }
             options->macro_path = argv[i + 1];
             ++i;
-        } else if (wcscmp(argv[i], L"--rendermethod") == 0) {
-            if (i + 1 >= argc || argv[i + 1] == 0 ||
-                !winxterm_options_parse_render_backend(argv[i + 1],
-                                                       &options->render_backend,
-                                                       &options->render_backend_all)) {
-                return -1;
-            }
-            options->render_backend_set = true;
-            ++i;
         } else if (wcscmp(argv[i], L"--unpaintedlines") == 0) {
             if (i + 1 >= argc || argv[i + 1] == 0 ||
                 !winxterm_options_parse_unsigned(argv[i + 1], &options->unpainted_line_limit)) {
-                return -1;
-            }
-            ++i;
-        } else if (wcscmp(argv[i], L"--ncputhreads") == 0) {
-            if (i + 1 >= argc || argv[i + 1] == 0 ||
-                !winxterm_options_parse_unsigned(argv[i + 1], &options->render_thread_count) ||
-                options->render_thread_count > WINXTERM_MAX_RENDER_THREADS) {
                 return -1;
             }
             ++i;

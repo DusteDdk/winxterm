@@ -358,6 +358,40 @@ uint64_t winxterm_bridge_timestamp_ns(void)
     return seconds * 1000000000ull + (remainder * 1000000000ull) / ticks_per_second;
 }
 
+static uint64_t winxterm_timing_histogram_percentile(
+    const WinxtermTimingHistogram *histogram,
+    unsigned int percentile)
+{
+    if (histogram == 0 || percentile == 0u || percentile > 100u) return 0u;
+    uint64_t total = 0u;
+    for (size_t i = 0u; i < WINXTERM_TIMING_HISTOGRAM_BUCKETS; ++i) {
+        total += (uint64_t)InterlockedCompareExchange64(
+            (volatile LONG64 *)&histogram->buckets[i], 0, 0);
+    }
+    if (total == 0u) return 0u;
+    uint64_t target = total / 100u * percentile +
+        ((total % 100u) * percentile + 99u) / 100u;
+    uint64_t cumulative = 0u;
+    for (size_t i = 0u; i < WINXTERM_TIMING_HISTOGRAM_BUCKETS; ++i) {
+        cumulative += (uint64_t)InterlockedCompareExchange64(
+            (volatile LONG64 *)&histogram->buckets[i], 0, 0);
+        if (cumulative >= target) {
+            return i + 1u >= 64u ? UINT64_MAX : 1ull << i;
+        }
+    }
+    return UINT64_MAX;
+}
+
+static WinxtermTimingPercentiles winxterm_timing_histogram_percentiles(
+    const WinxtermTimingHistogram *histogram)
+{
+    WinxtermTimingPercentiles result;
+    result.p50_ns = winxterm_timing_histogram_percentile(histogram, 50u);
+    result.p95_ns = winxterm_timing_histogram_percentile(histogram, 95u);
+    result.p99_ns = winxterm_timing_histogram_percentile(histogram, 99u);
+    return result;
+}
+
 void winxterm_bridge_note_output_batch(WinxtermBridge *bridge, size_t byte_count)
 {
     if (bridge == 0 || byte_count == 0u) {
@@ -383,7 +417,6 @@ bool winxterm_bridge_init(WinxtermBridge *bridge, WinxtermLog *log, int columns,
         return false;
     }
     bridge->log = log;
-    bridge->backend = WINXTERM_DEFAULT_RENDER_BACKEND;
     bridge->unpainted_line_limit = WINXTERM_DEFAULT_UNPAINTED_LINE_LIMIT;
     bridge->fps_window_start_tick = GetTickCount();
     bridge->host_state = WINXTERM_HOST_STATE_NOT_STARTED;
@@ -391,15 +424,14 @@ bool winxterm_bridge_init(WinxtermBridge *bridge, WinxtermLog *log, int columns,
     bridge->input_buffer = (uint8_t *)malloc(bridge->input_capacity);
     if (bridge->input_buffer == 0) {
         bridge->input_capacity = 0u;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
-    bridge->output_capacity = WINXTERM_BRIDGE_OUTPUT_INITIAL_CAPACITY;
+    bridge->output_capacity = WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY;
     bridge->output_buffer = (uint8_t *)malloc(bridge->output_capacity);
     if (bridge->output_buffer == 0) {
         bridge->output_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
     bridge->transcript_capacity = WINXTERM_BRIDGE_TRANSCRIPT_CAPACITY;
@@ -414,108 +446,36 @@ bool winxterm_bridge_init(WinxtermBridge *bridge, WinxtermLog *log, int columns,
     bridge->input_lock_initialized = true;
     bridge->hwnd_ready_event = CreateEventW(0, TRUE, FALSE, 0);
     if (bridge->hwnd_ready_event == 0) {
-        free(bridge->output_buffer);
-        bridge->output_buffer = 0;
-        bridge->output_capacity = 0u;
-        free(bridge->transcript_buffer);
-        bridge->transcript_buffer = 0;
-        bridge->transcript_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
-        DeleteCriticalSection(&bridge->input_lock);
-        bridge->input_lock_initialized = false;
-        DeleteCriticalSection(&bridge->screen_lock);
-        bridge->screen_lock_initialized = false;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
     bridge->unpainted_below_limit_event = CreateEventW(0, TRUE, TRUE, 0);
     if (bridge->unpainted_below_limit_event == 0) {
-        free(bridge->output_buffer);
-        bridge->output_buffer = 0;
-        bridge->output_capacity = 0u;
-        free(bridge->transcript_buffer);
-        bridge->transcript_buffer = 0;
-        bridge->transcript_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
-        CloseHandle(bridge->hwnd_ready_event);
-        bridge->hwnd_ready_event = 0;
-        DeleteCriticalSection(&bridge->input_lock);
-        bridge->input_lock_initialized = false;
-        DeleteCriticalSection(&bridge->screen_lock);
-        bridge->screen_lock_initialized = false;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
     bridge->output_room_event = CreateEventW(0, TRUE, TRUE, 0);
     if (bridge->output_room_event == 0) {
-        free(bridge->output_buffer);
-        bridge->output_buffer = 0;
-        bridge->output_capacity = 0u;
-        free(bridge->transcript_buffer);
-        bridge->transcript_buffer = 0;
-        bridge->transcript_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
-        CloseHandle(bridge->hwnd_ready_event);
-        bridge->hwnd_ready_event = 0;
-        CloseHandle(bridge->unpainted_below_limit_event);
-        bridge->unpainted_below_limit_event = 0;
-        DeleteCriticalSection(&bridge->input_lock);
-        bridge->input_lock_initialized = false;
-        DeleteCriticalSection(&bridge->screen_lock);
-        bridge->screen_lock_initialized = false;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
     bridge->input_ready_event = CreateEventW(0, TRUE, FALSE, 0);
     if (bridge->input_ready_event == 0) {
-        free(bridge->output_buffer);
-        bridge->output_buffer = 0;
-        bridge->output_capacity = 0u;
-        free(bridge->transcript_buffer);
-        bridge->transcript_buffer = 0;
-        bridge->transcript_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
-        CloseHandle(bridge->hwnd_ready_event);
-        bridge->hwnd_ready_event = 0;
-        CloseHandle(bridge->unpainted_below_limit_event);
-        bridge->unpainted_below_limit_event = 0;
-        CloseHandle(bridge->output_room_event);
-        bridge->output_room_event = 0;
-        DeleteCriticalSection(&bridge->input_lock);
-        bridge->input_lock_initialized = false;
-        DeleteCriticalSection(&bridge->screen_lock);
-        bridge->screen_lock_initialized = false;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
     if (!winxterm_screen_init(&bridge->screen, columns, rows)) {
-        free(bridge->output_buffer);
-        bridge->output_buffer = 0;
-        bridge->output_capacity = 0u;
-        free(bridge->transcript_buffer);
-        bridge->transcript_buffer = 0;
-        bridge->transcript_capacity = 0u;
-        free(bridge->input_buffer);
-        bridge->input_buffer = 0;
-        bridge->input_capacity = 0u;
-        CloseHandle(bridge->hwnd_ready_event);
-        bridge->hwnd_ready_event = 0;
-        CloseHandle(bridge->unpainted_below_limit_event);
-        bridge->unpainted_below_limit_event = 0;
-        CloseHandle(bridge->output_room_event);
-        bridge->output_room_event = 0;
-        CloseHandle(bridge->input_ready_event);
-        bridge->input_ready_event = 0;
-        DeleteCriticalSection(&bridge->input_lock);
-        bridge->input_lock_initialized = false;
-        DeleteCriticalSection(&bridge->screen_lock);
-        bridge->screen_lock_initialized = false;
+        winxterm_bridge_dispose(bridge);
         return false;
     }
+    bridge->output_commit_scratch =
+        (uint8_t *)malloc(WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES);
+    if (bridge->output_commit_scratch == 0) {
+        winxterm_bridge_dispose(bridge);
+        return false;
+    }
+    InitializeCriticalSection(&bridge->commit_lock);
+    bridge->commit_lock_initialized = true;
     winxterm_job_coordinator_init(&bridge->job_coordinator,
                                   WINXTERM_BRIDGE_JOB_ACTION_QUEUE_LIMIT);
     return true;
@@ -537,7 +497,10 @@ void winxterm_bridge_dispose(WinxtermBridge *bridge)
     bridge->input_tail = 0u;
     free(bridge->output_buffer);
     bridge->output_buffer = 0;
+    free(bridge->output_commit_scratch);
+    bridge->output_commit_scratch = 0;
     bridge->output_capacity = 0u;
+    bridge->output_head = 0u;
     bridge->output_count = 0u;
     bridge->output_high_water = 0u;
     free(bridge->transcript_buffer);
@@ -571,6 +534,10 @@ void winxterm_bridge_dispose(WinxtermBridge *bridge)
     if (bridge->input_lock_initialized) {
         DeleteCriticalSection(&bridge->input_lock);
         bridge->input_lock_initialized = false;
+    }
+    if (bridge->commit_lock_initialized) {
+        DeleteCriticalSection(&bridge->commit_lock);
+        bridge->commit_lock_initialized = false;
     }
     if (bridge->screen_lock_initialized) {
         DeleteCriticalSection(&bridge->screen_lock);
@@ -1063,38 +1030,6 @@ bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
     return ok;
 }
 
-static bool winxterm_bridge_grow_output_locked(WinxtermBridge *bridge, size_t required_capacity)
-{
-    if (bridge == 0 || required_capacity > WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY) {
-        return false;
-    }
-    size_t new_capacity = bridge->output_capacity != 0u ?
-        bridge->output_capacity : WINXTERM_BRIDGE_OUTPUT_INITIAL_CAPACITY;
-    while (new_capacity < required_capacity) {
-        size_t doubled = new_capacity * 2u;
-        if (doubled <= new_capacity || doubled > WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY) {
-            new_capacity = WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY;
-        } else {
-            new_capacity = doubled;
-        }
-    }
-    if (new_capacity < required_capacity) {
-        return false;
-    }
-    uint8_t *new_buffer = (uint8_t *)malloc(new_capacity);
-    if (new_buffer == 0) {
-        return false;
-    }
-    if (bridge->output_buffer != 0 && bridge->output_count != 0u) {
-        memcpy(new_buffer, bridge->output_buffer, bridge->output_count);
-    }
-    free(bridge->output_buffer);
-    bridge->output_buffer = new_buffer;
-    bridge->output_capacity = new_capacity;
-    ++bridge->output_grow_count;
-    return true;
-}
-
 static void winxterm_bridge_update_output_room_event_locked(WinxtermBridge *bridge)
 {
     if (bridge == 0 || bridge->output_room_event == 0) {
@@ -1102,7 +1037,7 @@ static void winxterm_bridge_update_output_room_event_locked(WinxtermBridge *brid
     }
     if (bridge->host_headless ||
         bridge->host_terminate_requested ||
-        bridge->output_count < WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY) {
+        bridge->output_count < bridge->output_capacity) {
         SetEvent(bridge->output_room_event);
     } else {
         ResetEvent(bridge->output_room_event);
@@ -1151,18 +1086,25 @@ bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge,
         return false;
     }
 
+    uint64_t queue_start_ns = winxterm_bridge_timestamp_ns();
     bool ok = true;
     EnterCriticalSection(&bridge->input_lock);
     winxterm_bridge_record_transcript_locked(bridge, bytes, byte_count);
     if (bridge->host_headless || bridge->host_terminate_requested ||
-        byte_count > WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY ||
-        WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY - bridge->output_count < byte_count) {
+        bridge->output_capacity == 0u || byte_count > bridge->output_capacity ||
+        bridge->output_capacity - bridge->output_count < byte_count) {
         ok = false;
-    } else if (bridge->output_capacity - bridge->output_count < byte_count) {
-        ok = winxterm_bridge_grow_output_locked(bridge, bridge->output_count + byte_count);
     }
     if (ok) {
-        memcpy(bridge->output_buffer + bridge->output_count, bytes, byte_count);
+        size_t tail = (bridge->output_head + bridge->output_count) % bridge->output_capacity;
+        size_t first = bridge->output_capacity - tail;
+        if (first > byte_count) {
+            first = byte_count;
+        }
+        memcpy(bridge->output_buffer + tail, bytes, first);
+        if (first < byte_count) {
+            memcpy(bridge->output_buffer, bytes + first, byte_count - first);
+        }
         bridge->output_count += byte_count;
         if (bridge->output_count > bridge->output_high_water) {
             bridge->output_high_water = bridge->output_count;
@@ -1172,6 +1114,13 @@ bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge,
     }
     winxterm_bridge_update_output_room_event_locked(bridge);
     LeaveCriticalSection(&bridge->input_lock);
+    uint64_t queue_end_ns = winxterm_bridge_timestamp_ns();
+    if (queue_end_ns >= queue_start_ns) {
+        uint64_t duration_ns = queue_end_ns - queue_start_ns;
+        winxterm_diag_add_u64(&bridge->output_queue_copy_ns, duration_ns);
+        winxterm_timing_histogram_note(&bridge->output_queue_copy_histogram,
+                                       duration_ns);
+    }
     if (ok) {
         winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_CONTENT);
     }
@@ -1270,7 +1219,13 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
         return false;
     }
 
-    uint8_t *bytes = 0;
+    if (!bridge->commit_lock_initialized || bridge->output_commit_scratch == 0) {
+        return false;
+    }
+
+    EnterCriticalSection(&bridge->commit_lock);
+    uint64_t queue_start_ns = winxterm_bridge_timestamp_ns();
+    uint8_t *bytes = bridge->output_commit_scratch;
     size_t byte_count = 0u;
     EnterCriticalSection(&bridge->input_lock);
     if (!bridge->output_paused && bridge->output_count != 0u) {
@@ -1278,34 +1233,53 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
         if (max_bytes != 0u && byte_count > max_bytes) {
             byte_count = max_bytes;
         }
-        bytes = (uint8_t *)malloc(byte_count);
-        if (bytes != 0) {
-            memcpy(bytes, bridge->output_buffer, byte_count);
-            bridge->output_count -= byte_count;
-            if (bridge->output_count != 0u) {
-                memmove(bridge->output_buffer,
-                        bridge->output_buffer + byte_count,
-                        bridge->output_count);
-            }
-            winxterm_bridge_update_output_room_event_locked(bridge);
-        } else {
-            byte_count = 0u;
+        if (byte_count > WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES) {
+            byte_count = WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES;
         }
+        size_t first = bridge->output_capacity - bridge->output_head;
+        if (first > byte_count) {
+            first = byte_count;
+        }
+        memcpy(bytes, bridge->output_buffer + bridge->output_head, first);
+        if (first < byte_count) {
+            memcpy(bytes + first, bridge->output_buffer, byte_count - first);
+        }
+        bridge->output_head = (bridge->output_head + byte_count) % bridge->output_capacity;
+        bridge->output_count -= byte_count;
+        if (bridge->output_count == 0u) {
+            bridge->output_head = 0u;
+        }
+        winxterm_bridge_update_output_room_event_locked(bridge);
     }
-    bool still_pending = !bridge->output_paused && bridge->output_count != 0u;
     LeaveCriticalSection(&bridge->input_lock);
+    uint64_t queue_end_ns = winxterm_bridge_timestamp_ns();
+    if (queue_end_ns >= queue_start_ns) {
+        uint64_t duration_ns = queue_end_ns - queue_start_ns;
+        winxterm_diag_add_u64(&bridge->output_queue_copy_ns, duration_ns);
+        winxterm_timing_histogram_note(&bridge->output_queue_copy_histogram,
+                                       duration_ns);
+    }
 
-    if (bytes == 0 || byte_count == 0u) {
+    if (byte_count == 0u) {
         if (more_pending != 0) {
-            *more_pending = still_pending;
+            *more_pending = false;
         }
-        return bytes != 0 || byte_count == 0u;
+        LeaveCriticalSection(&bridge->commit_lock);
+        return true;
     }
 
     WinxtermBridgeOutputCommit commit;
     memset(&commit, 0, sizeof(commit));
     commit.bridge = bridge;
+    uint64_t lock_start_ns = winxterm_bridge_timestamp_ns();
     EnterCriticalSection(&bridge->screen_lock);
+    uint64_t parse_start_ns = winxterm_bridge_timestamp_ns();
+    if (parse_start_ns >= lock_start_ns) {
+        uint64_t duration_ns = parse_start_ns - lock_start_ns;
+        winxterm_diag_add_u64(&bridge->screen_lock_wait_ns, duration_ns);
+        winxterm_timing_histogram_note(&bridge->screen_lock_wait_histogram,
+                                       duration_ns);
+    }
     uint64_t visual_lines_before = winxterm_screen_visual_line_advances(&bridge->screen);
     bool ok = winxterm_text_feed_bytes_to_sink(&bridge->output_decoder,
                                                bytes,
@@ -1317,7 +1291,17 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
     if (visual_delta > UINT_MAX) visual_delta = UINT_MAX;
     winxterm_bridge_add_unpainted_lines_locked(bridge, (unsigned int)visual_delta);
     LeaveCriticalSection(&bridge->screen_lock);
-    free(bytes);
+    uint64_t parse_end_ns = winxterm_bridge_timestamp_ns();
+    if (parse_end_ns >= parse_start_ns) {
+        uint64_t duration_ns = parse_end_ns - parse_start_ns;
+        winxterm_diag_add_u64(&bridge->parser_apply_ns, duration_ns);
+        winxterm_timing_histogram_note(&bridge->parser_apply_histogram,
+                                       duration_ns);
+    }
+
+    EnterCriticalSection(&bridge->input_lock);
+    bool still_pending = !bridge->output_paused && bridge->output_count != 0u;
+    LeaveCriticalSection(&bridge->input_lock);
 
     if (content_changed != 0) {
         *content_changed = commit.content_changed;
@@ -1328,6 +1312,7 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
     if (more_pending != 0) {
         *more_pending = still_pending;
     }
+    LeaveCriticalSection(&bridge->commit_lock);
     return ok;
 }
 
@@ -1477,20 +1462,6 @@ bool winxterm_bridge_copy_mode_state(WinxtermBridge *bridge, WinxtermModeState *
     return true;
 }
 
-void winxterm_bridge_set_backend(WinxtermBridge *bridge, WinxtermRenderBackend backend)
-{
-    if (bridge == 0 || backend < 0 || backend >= WINXTERM_RENDER_BACKEND_COUNT) {
-        return;
-    }
-
-    bridge->backend = backend;
-}
-
-WinxtermRenderBackend winxterm_bridge_backend(WinxtermBridge *bridge)
-{
-    return bridge != 0 ? bridge->backend : WINXTERM_RENDER_BACKEND_SPANS;
-}
-
 void winxterm_bridge_set_unpainted_line_limit(WinxtermBridge *bridge, unsigned int line_limit)
 {
     if (bridge == 0 || line_limit == 0u) {
@@ -1593,7 +1564,7 @@ bool winxterm_bridge_wait_for_output_room(WinxtermBridge *bridge,
                                           HANDLE shutdown_event)
 {
     if (bridge == 0 || bridge->output_room_event == 0 || byte_count == 0u ||
-        byte_count > WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY) {
+        bridge->output_capacity == 0u || byte_count > bridge->output_capacity) {
         return false;
     }
 
@@ -1603,8 +1574,8 @@ bool winxterm_bridge_wait_for_output_room(WinxtermBridge *bridge,
         EnterCriticalSection(&bridge->input_lock);
         stopped = bridge->host_headless || bridge->host_terminate_requested;
         available = !stopped &&
-                    bridge->output_count <= WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY &&
-                    WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY - bridge->output_count >= byte_count;
+                    bridge->output_count <= bridge->output_capacity &&
+                    bridge->output_capacity - bridge->output_count >= byte_count;
         if (available) {
             SetEvent(bridge->output_room_event);
         } else if (!stopped) {
@@ -1689,7 +1660,7 @@ void winxterm_bridge_note_frame(WinxtermBridge *bridge)
         return;
     }
 
-    ++bridge->rendered_frames;
+    winxterm_diag_inc_u64(&bridge->rendered_frames);
     ++bridge->fps_window_frames;
     DWORD now = GetTickCount();
     DWORD elapsed = now - bridge->fps_window_start_tick;
@@ -1809,6 +1780,7 @@ void winxterm_bridge_request_headless(WinxtermBridge *bridge)
     bridge->input_head = 0u;
     bridge->input_tail = 0u;
     bridge->input_count = 0u;
+    bridge->output_head = 0u;
     bridge->output_count = 0u;
     bridge->pending_frame_causes = WINXTERM_FRAME_CAUSE_NONE;
     HWND hwnd = bridge->hwnd;
@@ -1843,6 +1815,7 @@ void winxterm_bridge_request_terminate(WinxtermBridge *bridge)
     bridge->input_head = 0u;
     bridge->input_tail = 0u;
     bridge->input_count = 0u;
+    bridge->output_head = 0u;
     bridge->output_count = 0u;
     bridge->pending_frame_causes = WINXTERM_FRAME_CAUSE_NONE;
     winxterm_bridge_update_output_room_event_locked(bridge);
@@ -1972,8 +1945,34 @@ void winxterm_bridge_copy_diagnostics(WinxtermBridge *bridge, WinxtermBridgeDiag
     diagnostics->output_queue_capacity = bridge->output_capacity;
     diagnostics->output_queue_count = bridge->output_count;
     diagnostics->output_queue_high_water = bridge->output_high_water;
-    diagnostics->output_queue_grow_count = bridge->output_grow_count;
     diagnostics->output_queue_enqueue_failures = bridge->output_enqueue_failures;
+    diagnostics->output_queue_copy_ns = winxterm_diag_load_u64(&bridge->output_queue_copy_ns);
+    diagnostics->parser_apply_ns = winxterm_diag_load_u64(&bridge->parser_apply_ns);
+    diagnostics->screen_lock_wait_ns = winxterm_diag_load_u64(&bridge->screen_lock_wait_ns);
+    diagnostics->render_raster_ns = winxterm_diag_load_u64(&bridge->render_raster_ns);
+    diagnostics->render_scroll_ns = winxterm_diag_load_u64(&bridge->render_scroll_ns);
+    diagnostics->render_present_ns = winxterm_diag_load_u64(&bridge->render_present_ns);
+    diagnostics->render_invalidate_to_paint_ns =
+        winxterm_diag_load_u64(&bridge->render_invalidate_to_paint_ns);
+    diagnostics->dirty_rows_rendered = winxterm_diag_load_u64(&bridge->dirty_rows_rendered);
+    diagnostics->invalidated_pixels = winxterm_diag_load_u64(&bridge->invalidated_pixels);
+    diagnostics->rendered_frames = winxterm_diag_load_u64(&bridge->rendered_frames);
+    diagnostics->full_repaints = winxterm_diag_load_u64(&bridge->full_repaints);
+    diagnostics->scroll_blits = winxterm_diag_load_u64(&bridge->scroll_blits);
+    diagnostics->output_queue_copy_latency =
+        winxterm_timing_histogram_percentiles(&bridge->output_queue_copy_histogram);
+    diagnostics->parser_apply_latency =
+        winxterm_timing_histogram_percentiles(&bridge->parser_apply_histogram);
+    diagnostics->screen_lock_wait_latency =
+        winxterm_timing_histogram_percentiles(&bridge->screen_lock_wait_histogram);
+    diagnostics->render_raster_latency =
+        winxterm_timing_histogram_percentiles(&bridge->render_raster_histogram);
+    diagnostics->render_scroll_latency =
+        winxterm_timing_histogram_percentiles(&bridge->render_scroll_histogram);
+    diagnostics->invalidate_to_paint_latency =
+        winxterm_timing_histogram_percentiles(&bridge->invalidate_to_paint_histogram);
+    diagnostics->render_present_latency =
+        winxterm_timing_histogram_percentiles(&bridge->render_present_histogram);
     diagnostics->headless_output_bytes = bridge->headless_output_bytes;
     diagnostics->headless_output_lines = bridge->headless_output_lines;
     LeaveCriticalSection(&bridge->input_lock);

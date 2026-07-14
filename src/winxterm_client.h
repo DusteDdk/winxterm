@@ -29,6 +29,6 @@ DWORD winxterm_client_run_process_in_directory(WinxtermBridge *bridge,
                                                int argc,
                                                const wchar_t *current_directory,
                                                HANDLE shutdown_event);
-int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_backend, bool selected_only);
+int winxterm_glyphbench_run(WinxtermLog *log);
 
 #endif

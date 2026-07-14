@@ -19,7 +19,6 @@ from the public tree.
   `src/dstcmd/` shell implementation.
 - `resources/` contains checked-in Windows resources, font inputs, generated
   bitmap-font data, and bundled fallback fonts.
-- `generated/` contains compatibility include shims for generated resources.
 - `dependencies/sqlite3/` vendors the SQLite amalgamation used for persisted
   `dstshell` history.
 - `tools/` contains resource conversion helpers.
@@ -27,10 +26,9 @@ from the public tree.
 ## Runtime Status
 
 - `--smoke` runs built-in non-UI self-tests.
-- `--demo` runs the renderer demo producer and shows FPS/backend information in
-  the window title.
-- `--glyphbench` runs headless renderer benchmarks.
-- `--rendermethod <spans|row-masks|precolored-cache|all>` selects the renderer.
+- `--demo` runs the renderer demo producer and shows FPS information in the
+  window title.
+- `--glyphbench` benchmarks the production row-mask/fallback glyph path.
 - `-x <integer>` sets integer display scale from 1 through 100.
 - With no client command, startup looks for `dstshell.exe` beside `winxterm.exe`.
 

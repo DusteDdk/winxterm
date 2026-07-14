@@ -1,6 +1,6 @@
 # Winxterm Architecture
 
-This directory contains the native Windows port bring-up for XTerm for Windows. The current implementation includes Phase 1 bring-up, completed Phase 2 rendering/client scaffolding, and the Phase 3 terminal core: a generated bitmap-font header, multiple selectable text-rendering backends, a terminal-operation parser contract, a grid plus scrollback screen model, extended screen-layout semantics, xterm-style ANSI/CSI/OSC handling, keyboard encoding, demo and glyph benchmark modes, ConPTY hosted process support, and the external default `dstshell.exe` shell.
+This directory contains the native Windows port bring-up for XTerm for Windows. The current implementation includes a generated row-mask bitmap font, a single-surface incremental CPU renderer, a terminal-operation parser contract, a grid plus scrollback screen model, extended screen-layout semantics, xterm-style ANSI/CSI/OSC handling, keyboard encoding, demo and glyph benchmark modes, ConPTY hosted process support, and the external default `dstshell.exe` shell.
 
 The historical upstream `xterm-410` import is not part of the public release tree. Full upstream terminal behavior is not ported yet.
 
@@ -18,9 +18,9 @@ The executable is a GUI subsystem application. Command-line maintenance paths, s
 
 `src/main.c` owns process startup. It parses command-line options, dispatches `--smoke` and `--glyphbench`, initializes the disabled debug-log handle, initializes threaded runtime, and performs shutdown cleanup. It also handles console-vs-dialog help output.
 
-`src/winxterm_app.c` owns the native Win32 window. It registers the window class, creates the main window, tracks resize/minimize/maximize/restore events, applies integer display scaling, propagates terminal cell-size changes through the bridge, toggles fullscreen with Alt+Enter, encodes keyboard messages through `src/winxterm_input.c`, handles close confirmation for a running direct ConPTY child, logs Alt+F4, renders posted screen updates into the backbuffer, swaps buffers, and paints the current front buffer into the client area. When the persisted scrollbar setting is on, it also hosts the native vertical scrollbar, keeps the bar's range/page/thumb synchronized with the scrollback viewport on every frame, and translates `WM_VSCROLL` gestures into viewport scrolling.
+`src/winxterm_app.c` owns the native Win32 window and frame scheduler. It registers the window class, tracks resize/minimize/maximize/restore events, applies integer display scaling, propagates terminal cell-size changes through the bridge, toggles fullscreen with Alt+Enter, encodes keyboard messages, and renders dirty screen rows directly into one persistent DIB on the window thread. `WM_PAINT` only copies that DIB into the client area. When the persisted scrollbar setting is on, the app also hosts the native vertical scrollbar and translates `WM_VSCROLL` gestures into viewport scrolling.
 
-`src/winxterm_render.c` owns Phase 2 bitmap operations and glyph drawing. It supports span rendering, AVX2 row-mask rendering with safe masked stores, an opaque pre-colored glyph cache keyed by glyph plus foreground/background color, and a shared fixed-cell TTF fallback blitter for codepoints outside the built-in bitmap atlas.
+`src/winxterm_render.c` owns reusable damage-bitset operations, pixel clearing and in-place scrolling, AVX2 row-mask glyph drawing, and the fixed-cell cached TTF fallback blitter for codepoints outside the built-in bitmap atlas. There is no runtime renderer selection or color-keyed glyph cache.
 
 `src/winxterm_screen.c` owns the mutable terminal grid and scrollback model. It stores primary and alternate visible grids, row wrap metadata, cursor state, saved cursor state, current attributes, protected-cell metadata, tab stops, vertical and horizontal scroll margins, origin mode, auto-wrap and reverse-wrap behavior, alternate-screen variant semantics, DEC special graphics cell mapping, soft-wrapped scrollback reflow, fallback glyph mapping, and a 10,000-row scrollback cap.
 
@@ -46,19 +46,19 @@ The host creates concurrent multi-stage pipelines from typed plans, including pr
 
 `src/winxterm_input.c` owns keyboard input encoding. It converts printable characters, Alt printable prefixes, cursor/navigation keys, function keys, and modifier variants into terminal byte sequences for the host input queue.
 
-`src/winxterm_bridge.c` owns shared state between the window thread and producer/client thread: the screen lock, selected renderer, unpainted-line backpressure, elastic host input queue, pending resize state and coalescing counters, direct-child host state, headless/terminate requests, terminal title, bell notification state, window update posting, and FPS/diagnostic counters.
+`src/winxterm_bridge.c` owns shared state between the window thread and producer/client thread: the screen lock, fixed circular output queue, reusable commit scratch, serialized parser commits, unpainted-line backpressure, elastic host input queue, pending resize state and coalescing counters, direct-child host state, headless/terminate requests, terminal title, bell notification state, window update posting, and pipeline diagnostics.
 
 `src/winxterm_log.c` owns opt-in debug-log path creation and timestamped log writes. Runtime logs are disabled by default; `set debuglog on` creates `%USERPROFILE%\.winxterm\logs\winxterm-debug-{PID}.txt`.
 
 `src/winxterm_settings.c` owns persisted user settings in `%USERPROFILE%\.winxterm\settings.rc`. The file is line-oriented `key=value` text; unknown keys and invalid values are tolerated and leave defaults in place. The only setting today is `scrollbar=on|off` (default off). Settings are loaded once at window startup and rewritten atomically when a setting changes at runtime.
 
-`src/winxterm_options.c` owns supported command-line options. Unknown options are rejected early. Renderer selection is controlled with `--rendermethod <spans|row-masks|precolored-cache|all>`, producer backpressure is controlled with `--unpaintedlines <count>`, and startup display scale is controlled with `-x <integer>`.
+`src/winxterm_options.c` owns supported command-line options. Unknown options are rejected early. Producer backpressure is controlled with `--unpaintedlines <count>`, and startup display scale is controlled with `-x <integer>`. Renderer and render-thread selection are intentionally not runtime options.
 
-`src/winxterm_smoke.c` owns built-in self-tests. These tests validate non-UI invariants such as option parsing, render dimensions, generated font contracts, UTF-8/parser behavior, CSI/OSC operation handling, grid and alternate-screen behavior, bridge queue/backpressure/resize diagnostics, SGR color attributes, keyboard encoding, renderer equivalence, and opt-in debug-log behavior.
+`src/winxterm_smoke.c` owns built-in self-tests. These tests validate non-UI invariants such as option parsing, render dimensions, generated font contracts, UTF-8/parser behavior, CSI/OSC operation handling, grid and alternate-screen behavior, circular-queue wrap/order, bridge backpressure and resize diagnostics, SGR color attributes, keyboard encoding, and incremental pixels against a forced-full-render oracle.
 
-`src/winxterm_render.h` defines rendering constants and the public render backend contract: 80 columns, 24 rows, 6x13 cells, 480x312 initial logical bitmap size, 32-bit BGRA pixels, and default Phase 2 colors. `src/winxterm_scale.h` defines the bounded integer display scale helpers used by command-line parsing, window sizing, painting, and hit-testing.
+`src/winxterm_render.h` defines rendering constants, reusable row-bitset damage, and the sole row-mask/fallback glyph contract: 80 columns, 24 rows, 6x13 cells, 480x312 initial logical bitmap size, 32-bit BGRA pixels, and default colors. `src/winxterm_surface.h` owns the persistent top-down DIB section. `src/winxterm_scale.h` defines the bounded integer display scale helpers used by command-line parsing, window sizing, painting, and hit-testing.
 
-`resources/winxterm_font_6x13.h` is generated from `resources/6x13-ISO8859-1.pcf`. It contains 256 ISO-8859-1 glyphs plus one internal missing-glyph fallback, stored as row masks and foreground/background spans. `generated/winxterm_font_6x13.h` remains as a compatibility include shim. Non-bitmap codepoints keep their Unicode values in the screen cell and are rasterized on demand from startup-loaded TTF fallback fonts when those resources are available.
+`resources/winxterm_font_6x13.h` is generated from `resources/6x13-ISO8859-1.pcf`. It contains 256 ISO-8859-1 glyphs plus one internal missing-glyph fallback, stored only as the row masks consumed by the production renderer. Non-bitmap codepoints keep their Unicode values in the screen cell and are rasterized on demand from startup-loaded TTF fallback fonts when those resources are available.
 
 ## Data Flow
 
@@ -67,12 +67,10 @@ flowchart LR
     processStart[Process Startup] --> optionParser[Option Parser]
     optionParser -->|"--smoke"| smokeTests[Smoke Tests]
     optionParser -->|"--glyphbench"| glyphBench[Glyph Benchmark]
-    optionParser -->|"--rendermethod"| rendererChoice[Renderer Choice]
     optionParser -->|"--unpaintedlines"| backpressureLimit[Backpressure Limit]
     optionParser -->|"-x"| displayScale[Display Scale]
     optionParser -->|"window launch"| debugLog[Debug Log]
     debugLog --> bridge[Shared Bridge]
-    rendererChoice --> bridge
     backpressureLimit --> bridge
     displayScale --> bridge
     bridge --> screenModel[Grid And Scrollback Model]
@@ -86,21 +84,23 @@ flowchart LR
     terminalOps --> screenModel
     resizeEvent[Window Resize] --> bridge
     bridge --> conptyResize[ResizePseudoConsole]
-    screenModel --> renderBackends[Render Backends]
-    renderBackends --> frontBuffer[Front Buffer]
-    frontBuffer --> gdiPaint[GDI Paint]
+    screenModel --> dirtyRows[Dirty Row Rasterizer]
+    dirtyRows --> dib[Persistent DIB Section]
+    dib --> gdiPaint[Clipped GDI Paint]
     gdiPaint --> clientArea[Terminal Area]
 ```
 
 ## Window And Buffer Model
 
-The application keeps window/message handling separate from terminal state and producer-side output. `WinxtermApp` owns the native `HWND`, a debug-log pointer, two heap-allocated 32-bit pixel buffers, current bitmap dimensions, render cache state, and fullscreen restore state.
+The application keeps window/message handling separate from terminal state and producer-side output. `WinxtermApp` owns the native `HWND`, one persistent top-down 32-bit DIB section, reusable row damage, one fallback-glyph cache, and fullscreen restore state. Pixels are mutated and presented only by the window thread.
 
-Rendering clears or updates the logical back buffer, draws the current visible terminal grid from the screen model, marks accepted producer output as painted, swaps buffers, and asks Win32 to repaint. At display scale 1, painting copies the front buffer to the window with the existing 1:1 `StretchDIBits` path. At larger integer scales, painting stretches the logical bitmap to `bitmap_width * scale` by `bitmap_height * scale`; resize and hit-testing divide physical client pixels by that same scale before calculating terminal rows and columns.
+Terminal operations accumulate exact dirty rows. The window thread renders only contiguous dirty runs directly from locked screen row views, or scrolls existing pixels in place for an eligible full-screen upward scroll. It invalidates the corresponding scaled bands. `WM_PAINT` only copies the persistent DIB with `BitBlt` or clipped `StretchBlt`; expose paints never parse or rasterize terminal state. Surface generations release producer backpressure only after newly rendered pixels are presented.
+
+Pipeline diagnostics record totals plus logarithmic p50/p95/p99 latency distributions for queue copy, parser/apply, screen-lock waits, row rasterization, in-place scroll, invalidation-to-paint, and GDI presentation. Counters also track committed batches, queue high-water, dirty rows, full repaints, scroll blits, frames, and invalidated pixels. The Diagnostics menu writes a snapshot to the opt-in debug log; instrumentation occurs at stage boundaries rather than in the glyph loop.
 
 ## Runtime Options
 
-`--rendermethod` chooses the active renderer. Normal mode and `--demo` use the selected backend, defaulting to the profiled `row-masks` renderer. `--demo` cycles all backends only when `--rendermethod all` is set. `--glyphbench` runs either the selected backend or all backends.
+The production renderer is always the fixed-font row-mask path with cached Unicode fallback. `--glyphbench` measures that path only; the former renderer and worker-count options are rejected.
 
 `--unpaintedlines` sets the accepted-but-unpainted producer line budget. Hosted ConPTY output blocks before parser/screen acceptance when this budget is reached, preserving terminal correctness while allowing the child to block naturally through ConPTY pipes. The demo intentionally bypasses this wait so it can stress the rendering path with output faster than painting.
 
@@ -126,19 +126,20 @@ The visible cursor is rendered as an xterm-style blinking block at the screen cu
 
 `resources/winxterm.rc` embeds `resources/winxterm.ico` into the executable. The icon is generated from the project-owned icon PNG.
 
-The same resource script embeds three fixed startup TTF fallbacks as `RCDATA`: a general Unicode font, an emoji font, and a math-symbol font. `src/winxterm_glyph_fallback.cpp` loads those resources into DirectWrite font faces, rasterizes missing bitmap glyphs into 6x13 or 12x13 fixed-cell alpha tiles, caches them with an LRU cap, and lets every renderer backend blit the same cached pixels.
+The same resource script embeds three fixed startup TTF fallbacks as `RCDATA`: a general Unicode font, an emoji font, and a math-symbol font. `src/winxterm_glyph_fallback.cpp` loads those resources into DirectWrite font faces, rasterizes missing bitmap glyphs into 6x13 or 12x13 fixed-cell alpha tiles, and caches them with an LRU cap for the production renderer.
 
 The bitmap font source lives at `resources/6x13-ISO8859-1.pcf`. `tools/pcf_to_header.c` converts it into `resources/winxterm_font_6x13.h` when run manually.
 
-## Phase 2 Completion Check
-
-The Phase 2 implementation is present in this public tree:
+## Rendering Pipeline Check
 
 - The fixed 6x13 bitmap font is generated into a checked-in C header.
-- BGRA32 front/back buffers, clears, swaps, scroll primitives, and glyph blitting are implemented.
-- Span, AVX2 row-mask, and pre-colored-cache renderers are implemented and selectable.
+- One persistent top-down BGRA32 DIB owns the live pixels; resize replacement is transactional.
+- Exact row damage, in-place upward scroll, dirty-band invalidation, and generation-based paint accounting are implemented.
+- The sole production bitmap path is the AVX2 row-mask renderer plus cached Unicode fallback.
+- Output ahead of the parser uses a fixed 16 MiB circular queue and reusable commit scratch.
+- UI parse/apply work is bounded by byte and time budgets, with a sustained-output frame deadline.
 - Per-cell foreground/background color attributes are supported, including minimal SGR parsing.
-- Demo, benchmark, smoke, renderer selection, and output-only client scaffold paths are implemented.
+- Demo, fixed-path benchmark, smoke, and output-only client scaffold paths are implemented.
 - Screen/history state now tracks visible grid cells plus a fixed 10,000-row scrollback cap.
 
 ## Phase 3 Completion Check
@@ -150,14 +151,13 @@ The Phase 3 implementation is present in this public tree:
 - ANSI/CSI/OSC handling covers the Phase 3 baseline plus screen-layout extensions: cursor movement, erases and selective erases, insert/delete cells, columns, and lines, scroll up/down/left/right, margins, modes, save/restore cursor, protected text, selected DEC rectangles, DEC special graphics cell mapping, SGR reset plus 8/16/256/RGB colors, OSC title, winxterm OSC 9001 host-control requests, bell, and unsupported-sequence skipping.
 - Hosted commands run through ConPTY with bidirectional output/input and resize propagation.
 - Win32 keyboard messages are encoded into terminal input bytes and queued through the bridge.
-- Smoke tests cover parser fixtures, screen-operation invariants, screen-layout edge cases, resize scrollback reflow, renderer equivalence, and keyboard encoding.
+- Smoke tests cover parser fixtures, screen-operation invariants, screen-layout edge cases, resize scrollback reflow, incremental-versus-full pixel equivalence, and keyboard encoding.
 
 ## Remaining Extension Points
 
 Later terminal behavior remains behind explicit APIs:
 
-- Scrollback navigation, selection, clipboard, paste, and mouse behavior belong in Phase 4 UX work.
 - Wide and combining character rendering can expand the existing width metadata in the terminal cell contract.
-- Cursor style rendering, full DEC rectangle attribute coverage, and exact xterm resize viewport behavior remain compatibility extension points beyond the current block-cursor and primary-scrollback reflow implementation.
-- Diagnostics and compatibility stress tests belong in Phase 5 hardening.
+- Cursor style rendering, full DEC rectangle attribute coverage, and exact xterm resize viewport behavior remain extension points beyond the current block-cursor and primary-scrollback reflow implementation.
+- More randomized damage sequences and hardware performance baselines remain useful hardening work.
 - Dynamic runtime font switching remains out of scope. The renderer uses the generated 6x13 bitmap font first and the fixed bundled startup TTF fallbacks only when a cell's codepoint is not covered by the bitmap atlas.

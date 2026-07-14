@@ -21,10 +21,10 @@
 #define WINXTERM_WM_SCROLLBAR_UPDATE (WM_APP + 6u)
 #define WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY 16384u
 #define WINXTERM_BRIDGE_INPUT_MAX_CAPACITY (16u * 1024u * 1024u)
-#define WINXTERM_BRIDGE_OUTPUT_INITIAL_CAPACITY 65536u
 #define WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY (16u * 1024u * 1024u)
 #define WINXTERM_BRIDGE_TRANSCRIPT_CAPACITY (4u * 1024u * 1024u)
-#define WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES 65536u
+#define WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES (256u * 1024u)
+#define WINXTERM_TIMING_HISTOGRAM_BUCKETS 64u
 #define WINXTERM_BRIDGE_TITLE_CAPACITY 256u
 #define WINXTERM_BRIDGE_CHILD_NAME_CAPACITY 512u
 #define WINXTERM_BRIDGE_JOB_ACTION_QUEUE_LIMIT 1024u
@@ -33,7 +33,8 @@ typedef enum WinxtermFrameCause {
     WINXTERM_FRAME_CAUSE_NONE = 0u,
     WINXTERM_FRAME_CAUSE_CONTENT = 0x01u,
     WINXTERM_FRAME_CAUSE_RESIZE = 0x02u,
-    WINXTERM_FRAME_CAUSE_PRESENTATION = 0x04u
+    WINXTERM_FRAME_CAUSE_PRESENTATION = 0x04u,
+    WINXTERM_FRAME_CAUSE_ROW_PRESENTATION = 0x08u
 } WinxtermFrameCause;
 
 typedef enum WinxtermHostState {
@@ -56,6 +57,29 @@ typedef enum WinxtermBridgeJobAction {
     WINXTERM_BRIDGE_JOB_ACTION_CLOSE,
     WINXTERM_BRIDGE_JOB_ACTION_FORCE_EXIT
 } WinxtermBridgeJobAction;
+
+typedef struct WinxtermTimingHistogram {
+    uint64_t buckets[WINXTERM_TIMING_HISTOGRAM_BUCKETS];
+} WinxtermTimingHistogram;
+
+typedef struct WinxtermTimingPercentiles {
+    uint64_t p50_ns;
+    uint64_t p95_ns;
+    uint64_t p99_ns;
+} WinxtermTimingPercentiles;
+
+static inline void winxterm_timing_histogram_note(WinxtermTimingHistogram *histogram,
+                                                   uint64_t duration_ns)
+{
+    if (histogram == 0) return;
+    unsigned int bucket = 0u;
+    uint64_t remaining = duration_ns > 0u ? duration_ns - 1u : 0u;
+    while (remaining != 0u && bucket + 1u < WINXTERM_TIMING_HISTOGRAM_BUCKETS) {
+        remaining >>= 1u;
+        ++bucket;
+    }
+    (void)InterlockedIncrement64((volatile LONG64 *)&histogram->buckets[bucket]);
+}
 
 typedef struct WinxtermHostChildInfo {
     bool running;
@@ -88,8 +112,26 @@ typedef struct WinxtermBridgeDiagnostics {
     size_t output_queue_capacity;
     size_t output_queue_count;
     size_t output_queue_high_water;
-    size_t output_queue_grow_count;
     size_t output_queue_enqueue_failures;
+    uint64_t output_queue_copy_ns;
+    uint64_t parser_apply_ns;
+    uint64_t screen_lock_wait_ns;
+    uint64_t render_raster_ns;
+    uint64_t render_scroll_ns;
+    uint64_t render_present_ns;
+    uint64_t render_invalidate_to_paint_ns;
+    uint64_t dirty_rows_rendered;
+    uint64_t invalidated_pixels;
+    uint64_t rendered_frames;
+    uint64_t full_repaints;
+    uint64_t scroll_blits;
+    WinxtermTimingPercentiles output_queue_copy_latency;
+    WinxtermTimingPercentiles parser_apply_latency;
+    WinxtermTimingPercentiles screen_lock_wait_latency;
+    WinxtermTimingPercentiles render_raster_latency;
+    WinxtermTimingPercentiles render_scroll_latency;
+    WinxtermTimingPercentiles invalidate_to_paint_latency;
+    WinxtermTimingPercentiles render_present_latency;
     unsigned int backpressure_wait_count;
     DWORD backpressure_total_wait_ms;
     DWORD backpressure_longest_wait_ms;
@@ -109,29 +151,30 @@ typedef struct WinxtermBridge {
     WinxtermScreen screen;
     CRITICAL_SECTION screen_lock;
     CRITICAL_SECTION input_lock;
+    CRITICAL_SECTION commit_lock;
     bool screen_lock_initialized;
     bool input_lock_initialized;
+    bool commit_lock_initialized;
     HANDLE hwnd_ready_event;
     HANDLE unpainted_below_limit_event;
     HANDLE output_room_event;
     HANDLE input_ready_event;
     HWND hwnd;
-    WinxtermRenderBackend backend;
-    bool cycle_render_backends;
     bool show_render_stats_in_title;
     unsigned int unpainted_line_limit;
     unsigned int unpainted_lines;
     uint8_t *input_buffer;
     uint8_t *output_buffer;
+    uint8_t *output_commit_scratch;
     size_t input_capacity;
     size_t input_head;
     size_t input_tail;
     size_t input_count;
     uint64_t input_session_id;
     size_t output_capacity;
+    size_t output_head;
     size_t output_count;
     size_t output_high_water;
-    size_t output_grow_count;
     size_t output_enqueue_failures;
     uint8_t *transcript_buffer;
     size_t transcript_capacity;
@@ -170,10 +213,28 @@ typedef struct WinxtermBridge {
     unsigned long long output_batch_count;
     unsigned long long output_batch_bytes;
     unsigned long long output_batch_max_bytes;
+    uint64_t output_queue_copy_ns;
+    uint64_t parser_apply_ns;
+    uint64_t screen_lock_wait_ns;
+    uint64_t render_raster_ns;
+    uint64_t render_scroll_ns;
+    uint64_t render_present_ns;
+    uint64_t render_invalidate_to_paint_ns;
+    uint64_t dirty_rows_rendered;
+    uint64_t invalidated_pixels;
+    WinxtermTimingHistogram output_queue_copy_histogram;
+    WinxtermTimingHistogram parser_apply_histogram;
+    WinxtermTimingHistogram screen_lock_wait_histogram;
+    WinxtermTimingHistogram render_raster_histogram;
+    WinxtermTimingHistogram render_scroll_histogram;
+    WinxtermTimingHistogram invalidate_to_paint_histogram;
+    WinxtermTimingHistogram render_present_histogram;
     char terminal_title[WINXTERM_BRIDGE_TITLE_CAPACITY];
     bool bell_pending;
     bool bell_enabled;
     uint64_t rendered_frames;
+    uint64_t full_repaints;
+    uint64_t scroll_blits;
     DWORD fps_window_start_tick;
     uint32_t fps_window_frames;
     double last_fps;
@@ -248,8 +309,6 @@ void winxterm_bridge_set_bell_enabled(WinxtermBridge *bridge, bool enabled);
 bool winxterm_bridge_bell_enabled(WinxtermBridge *bridge);
 bool winxterm_bridge_mode_enabled(WinxtermBridge *bridge, WinxtermTerminalMode mode);
 bool winxterm_bridge_copy_mode_state(WinxtermBridge *bridge, WinxtermModeState *modes);
-void winxterm_bridge_set_backend(WinxtermBridge *bridge, WinxtermRenderBackend backend);
-WinxtermRenderBackend winxterm_bridge_backend(WinxtermBridge *bridge);
 void winxterm_bridge_set_unpainted_line_limit(WinxtermBridge *bridge, unsigned int line_limit);
 void winxterm_bridge_set_output_paused(WinxtermBridge *bridge, bool paused);
 bool winxterm_bridge_wait_for_unpainted_budget(WinxtermBridge *bridge, HANDLE shutdown_event);

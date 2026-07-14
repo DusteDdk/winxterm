@@ -16,9 +16,7 @@ static const wchar_t WINXTERM_HELP_TEXT[] =
     L"--demo                    Run the rendering demo producer.\n"
     L"--glyphbench              Run headless glyph renderer benchmarks and exit.\n"
     L"--macro <filename>        Play a macro after the window starts.\n"
-    L"--rendermethod <method>   Choose spans, row-masks, precolored-cache, or all.\n"
     L"--unpaintedlines <count>  Producer backlog limit before paint, default 20000.\n"
-    L"--ncputhreads <count>     Persistent render worker count, default hardware threads.\n"
     L"-x <integer>              Integer display scale, 1 through 100, default 1.\n"
     L"\n"
     L"The first non-option argument is used as the client only when it resolves\n"
@@ -241,10 +239,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, PWSTR com
     winxterm_log_writef(&log, "startup");
 
     if (options.glyphbench) {
-        int glyphbench_result = winxterm_glyphbench_run(&log,
-                                                        options.render_backend,
-                                                        options.render_backend_set &&
-                                                            !options.render_backend_all);
+        int glyphbench_result = winxterm_glyphbench_run(&log);
         winxterm_log_writef(&log, "glyphbench shutdown exit_code=%d", glyphbench_result);
         winxterm_log_dispose(&log);
         LocalFree(argv);

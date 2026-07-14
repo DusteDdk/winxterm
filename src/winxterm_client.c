@@ -140,21 +140,13 @@ DWORD winxterm_client_run_demo(WinxtermBridge *bridge, HANDLE shutdown_event)
     unsigned long long output_bytes = 0u;
     HANDLE demo_timer = winxterm_demo_create_timer();
     while (WaitForSingleObject(shutdown_event, 0) == WAIT_TIMEOUT) {
-        if (bridge->cycle_render_backends) {
-            WinxtermRenderBackend cycled_backend =
-                (WinxtermRenderBackend)((frame / 180u) % WINXTERM_RENDER_BACKEND_COUNT);
-            winxterm_bridge_set_backend(bridge, cycled_backend);
-        }
-        WinxtermRenderBackend backend = winxterm_bridge_backend(bridge);
-
         char buffer[1024];
         int header = snprintf(buffer,
                               sizeof(buffer),
-                              "\xf0\x9f\x98\x80 demo frame=%lu lines=%llu bytes=%llu renderer=%s\n",
+                              "\xf0\x9f\x98\x80 demo frame=%lu lines=%llu bytes=%llu renderer=row-masks\n",
                               (unsigned long)frame,
                               output_lines,
-                              output_bytes,
-                              winxterm_render_backend_name(backend));
+                              output_bytes);
         if (header > 0) {
             size_t offset = (size_t)header < sizeof(buffer) ? (size_t)header : sizeof(buffer) - 1u;
             offset = winxterm_demo_append_colored_line(buffer, sizeof(buffer), offset, emoji_demo_text);
@@ -232,7 +224,7 @@ static double winxterm_glyphbench_process_cpu_seconds(void)
     return (double)cpu_ticks / 10000000.0;
 }
 
-int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_backend, bool selected_only)
+int winxterm_glyphbench_run(WinxtermLog *log)
 {
     enum {
         width = WINXTERM_INITIAL_PIXEL_WIDTH,
@@ -241,30 +233,25 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
         rounds = 10
     };
 
-    uint32_t *front = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*front));
-    uint32_t *back = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*back));
-    if (front == 0 || back == 0) {
-        free(front);
-        free(back);
+    uint32_t *pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*pixels));
+    if (pixels == 0) {
         return 1;
     }
 
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
-    int first_backend = selected_only ? (int)selected_backend : 0;
-    int backend_limit = selected_only ? (int)selected_backend + 1 : WINXTERM_RENDER_BACKEND_COUNT;
     winxterm_log_writef(log,
                         "glyphbench profile rounds=%d iterations_per_round=%d cells=%dx%d",
                         rounds,
                         iterations,
                         WINXTERM_TERMINAL_COLUMNS,
                         WINXTERM_TERMINAL_ROWS);
-    for (int backend = first_backend; backend < backend_limit; ++backend) {
+    {
         WinxtermRenderContext context;
         winxterm_render_context_init(&context);
         (void)winxterm_render_context_load_fallback_fonts(&context, GetModuleHandleW(0), log);
         winxterm_render_draw_cell_glyph(&context,
-                                        back,
+                                        pixels,
                                         width,
                                         height,
                                         0,
@@ -275,10 +262,9 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
                                         0u,
                                         1u,
                                         WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                        WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                        (WinxtermRenderBackend)backend);
+                                        WINXTERM_DEFAULT_BACKGROUND_RGB);
         winxterm_render_draw_cell_glyph(&context,
-                                        back,
+                                        pixels,
                                         width,
                                         height,
                                         1,
@@ -289,10 +275,9 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
                                         0u,
                                         1u,
                                         WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                        WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                        (WinxtermRenderBackend)backend);
+                                        WINXTERM_DEFAULT_BACKGROUND_RGB);
         winxterm_render_draw_cell_glyph(&context,
-                                        back,
+                                        pixels,
                                         width,
                                         height,
                                         2,
@@ -303,14 +288,13 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
                                         0u,
                                         2u,
                                         WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                        WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                        (WinxtermRenderBackend)backend);
+                                        WINXTERM_DEFAULT_BACKGROUND_RGB);
         double total_wall_seconds = 0.0;
         double total_cpu_seconds = 0.0;
         double best_wall_seconds = 0.0;
         double best_cpu_seconds = 0.0;
         for (int round = 0; round < rounds; ++round) {
-            winxterm_render_clear(back, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
+            winxterm_render_clear(pixels, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
             LARGE_INTEGER start;
             LARGE_INTEGER end;
             double cpu_start = winxterm_glyphbench_process_cpu_seconds();
@@ -319,19 +303,16 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
                 for (int row = 0; row < WINXTERM_TERMINAL_ROWS; ++row) {
                     for (int col = 0; col < WINXTERM_TERMINAL_COLUMNS; ++col) {
                         uint32_t glyph = (uint32_t)((row * WINXTERM_TERMINAL_COLUMNS + col + iteration) & 0xff);
-                        winxterm_render_draw_glyph(&context,
-                                                   back,
+                        winxterm_render_draw_glyph(pixels,
                                                    width,
                                                    height,
                                                    col,
                                                    row,
                                                    glyph,
                                                    WINXTERM_DEFAULT_FOREGROUND_RGB,
-                                                   WINXTERM_DEFAULT_BACKGROUND_RGB,
-                                                   (WinxtermRenderBackend)backend);
+                                                   WINXTERM_DEFAULT_BACKGROUND_RGB);
                     }
                 }
-                winxterm_render_swap(&front, &back);
             }
             QueryPerformanceCounter(&end);
             double cpu_end = winxterm_glyphbench_process_cpu_seconds();
@@ -348,20 +329,17 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
                 best_cpu_seconds = cpu_seconds;
             }
             winxterm_log_writef(log,
-                                "glyphbench backend=%s round=%d wall_seconds=%.6f cpu_seconds=%.6f fps=%.2f glyphs_per_second=%.2f cached_glyphs=%zu fallback_cached=%zu fallback_misses=%zu",
-                                winxterm_render_backend_name((WinxtermRenderBackend)backend),
+                                "glyphbench backend=row-masks round=%d wall_seconds=%.6f cpu_seconds=%.6f fps=%.2f glyphs_per_second=%.2f fallback_cached=%zu fallback_misses=%zu",
                                 round + 1,
                                 wall_seconds,
                                 cpu_seconds,
                                 frames_per_second,
                                 wall_seconds > 0.0 ? glyphs / wall_seconds : 0.0,
-                                context.precolored_count,
                                 winxterm_render_context_fallback_cached_count(&context),
                                 winxterm_render_context_fallback_miss_count(&context));
         }
         winxterm_log_writef(log,
-                            "glyphbench summary backend=%s rounds=%d total_wall_seconds=%.6f total_cpu_seconds=%.6f average_wall_seconds=%.6f average_cpu_seconds=%.6f best_wall_seconds=%.6f best_cpu_seconds=%.6f average_fps=%.2f",
-                            winxterm_render_backend_name((WinxtermRenderBackend)backend),
+                            "glyphbench summary backend=row-masks rounds=%d total_wall_seconds=%.6f total_cpu_seconds=%.6f average_wall_seconds=%.6f average_cpu_seconds=%.6f best_wall_seconds=%.6f best_cpu_seconds=%.6f average_fps=%.2f",
                             rounds,
                             total_wall_seconds,
                             total_cpu_seconds,
@@ -373,7 +351,6 @@ int winxterm_glyphbench_run(WinxtermLog *log, WinxtermRenderBackend selected_bac
         winxterm_render_context_dispose(&context);
     }
 
-    free(front);
-    free(back);
+    free(pixels);
     return 0;
 }

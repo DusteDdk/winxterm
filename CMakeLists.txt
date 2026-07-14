@@ -38,6 +38,7 @@ add_executable(winxterm WIN32
     src/winxterm_screen.c
     src/winxterm_settings.c
     src/winxterm_smoke.c
+    src/winxterm_surface.c
     src/winxterm_text.c
     src/winxterm_terminal_session.c
     src/winxterm_transfer_format.c
@@ -99,13 +100,11 @@ target_include_directories(sqlite3 PUBLIC
 )
 
 target_include_directories(winxterm PRIVATE
-    generated
     resources
     src
 )
 
 target_include_directories(dstshell PRIVATE
-    generated
     resources
     src
 )

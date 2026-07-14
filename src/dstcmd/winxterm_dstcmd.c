@@ -3797,14 +3797,9 @@ static bool winxterm_dstcmd_shell_write_verbose_timing(WinxtermDstcmdShell *shel
                                             L"Timing verbose:\r\n"
                                             L"  timestamps ns: command entered=%ls prompt ready=%ls delta=%ls\r\n"
                                             L"  phases ns: parse=%llu lookup=%llu builtin=%llu resolve=%llu exec=%llu process=%llu finish_to_prompt=%llu\r\n"
-                                            L"  output bytes: total=%llu builtin=%llu external=%llu rendered=%llu skipped=%llu\r\n"
-                                            L"  calls: shell_writes=%llu feeds=%llu input_enqueues=%llu refreshes=%llu updates=%llu frames=%llu external_reads=%llu\r\n"
-                                            L"  batches: count=%llu bytes=%llu max_bytes=%llu\r\n"
-                                            L"  render updates: coalesced=%llu messages=%llu\r\n"
-                                            L"  cells: rendered=%llu skipped=%llu empty_skips=%llu continuation_skips=%llu\r\n"
-                                            L"  glyphs: draws=%llu rendered=%llu cache_hits=%llu cache_misses=%llu precolored_hits=%llu precolored_misses=%llu fallback_hits=%llu fallback_misses=%llu\r\n"
-                                            L"  render ns: prepare=%llu snapshot=%llu dispatch_wait=%llu worker_total=%llu worker_max=%llu flip=%llu present=%llu\r\n"
-                                            L"  damage: dirty_rows=%llu full_repaints=%llu scroll_blits=%llu\r\n",
+                                            L"  output bytes: total=%llu builtin=%llu external=%llu\r\n"
+                                            L"  calls: shell_writes=%llu feeds=%llu input_enqueues=%llu refreshes=%llu external_reads=%llu\r\n"
+                                            L"  batches: count=%llu bytes=%llu max_bytes=%llu\r\n",
                                             command_entered_text,
                                             prompt_ready_text,
                                             delta_text,
@@ -3818,42 +3813,14 @@ static bool winxterm_dstcmd_shell_write_verbose_timing(WinxtermDstcmdShell *shel
                                             (unsigned long long)d->total_output_bytes,
                                             (unsigned long long)d->builtin_output_bytes,
                                             (unsigned long long)d->external_output_bytes,
-                                            (unsigned long long)d->rendered_output_bytes,
-                                            (unsigned long long)d->skipped_output_bytes,
                                             (unsigned long long)d->shell_write_calls,
                                             (unsigned long long)d->output_feed_calls,
                                             (unsigned long long)d->input_enqueue_calls,
                                             (unsigned long long)d->terminal_refresh_calls,
-                                            (unsigned long long)d->update_requests,
-                                            (unsigned long long)d->rendered_frames,
                                             (unsigned long long)d->external_read_calls,
                                             (unsigned long long)d->output_batches,
                                             (unsigned long long)d->output_batch_bytes,
-                                            (unsigned long long)d->output_batch_max_bytes,
-                                            (unsigned long long)d->coalesced_update_requests,
-                                            (unsigned long long)d->render_messages_handled,
-                                            (unsigned long long)d->rendered_cells,
-                                            (unsigned long long)d->skipped_cells,
-                                            (unsigned long long)d->empty_cell_skips,
-                                            (unsigned long long)d->continuation_cell_skips,
-                                            (unsigned long long)d->glyph_draw_calls,
-                                            (unsigned long long)d->glyph_rendered_count,
-                                            (unsigned long long)d->glyph_cache_hits,
-                                            (unsigned long long)d->glyph_cache_misses,
-                                            (unsigned long long)d->precolored_cache_hits,
-                                            (unsigned long long)d->precolored_cache_misses,
-                                            (unsigned long long)d->fallback_cache_hits,
-                                            (unsigned long long)d->fallback_cache_misses,
-                                            (unsigned long long)d->render_prepare_ns,
-                                            (unsigned long long)d->render_snapshot_ns,
-                                            (unsigned long long)d->render_dispatch_wait_ns,
-                                            (unsigned long long)d->render_worker_total_ns,
-                                            (unsigned long long)d->render_worker_max_ns,
-                                            (unsigned long long)d->render_flip_ns,
-                                            (unsigned long long)d->render_present_ns,
-                                            (unsigned long long)d->dirty_rows_rendered,
-                                            (unsigned long long)d->full_repaints,
-                                            (unsigned long long)d->scroll_blits);
+                                            (unsigned long long)d->output_batch_max_bytes);
 }
 
 static bool winxterm_dstcmd_shell_prompt_after_submit(WinxtermDstcmdShell *shell)

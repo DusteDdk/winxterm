@@ -2,7 +2,7 @@
 
 `winxterm_256.png` and `winxterm.ico` are project-owned icon assets. `winxterm_256.png` was created for this project, is not derived from xterm, and is distributed under the WTFPL. The `.rc` resource name should stay unchanged when the icon is refreshed.
 
-`6x13-ISO8859-1.pcf` is the checked-in fixed bitmap font source. `winxterm_font_6x13.h` is generated from that PCF file by `../tools/pcf_to_header.c`; `../generated/winxterm_font_6x13.h` is a compatibility include shim.
+`6x13-ISO8859-1.pcf` is the checked-in fixed bitmap font source. `winxterm_font_6x13.h` is generated from that PCF file by `../tools/pcf_to_header.c` and stores only the row masks used by the production renderer.
 
 ## Startup TTF Fallback Fonts
 

@@ -1,7 +1,6 @@
 #ifndef WINXTERM_SCREEN_H
 #define WINXTERM_SCREEN_H
 
-#include "winxterm_diagnostics.h"
 #include "winxterm_render.h"
 #include "winxterm_modes.h"
 #include "winxterm_terminal_ops.h"
@@ -50,7 +49,6 @@ typedef struct WinxtermScreenAttributeState {
 typedef struct WinxtermScreenCell {
     uint32_t codepoint;
     uint32_t glyph_index;
-    uint64_t source_byte_count;
     uint32_t foreground_rgb;
     uint32_t background_rgb;
     uint32_t attribute_flags;
@@ -60,7 +58,6 @@ typedef struct WinxtermScreenCell {
     uint8_t combining_count;
     uint8_t color_flags;
     uint8_t width;
-    bool source_rendered;
     bool continuation;
     bool occupied;
 } WinxtermScreenCell;
@@ -104,19 +101,9 @@ typedef struct WinxtermScreenRenderView {
     WinxtermScreenSelectionRange selection;
 } WinxtermScreenRenderView;
 
-typedef struct WinxtermScreenDamage {
-    bool full_repaint;
-    bool dirty;
-    int dirty_top;
-    int dirty_bottom;
-    int scroll_delta;
-} WinxtermScreenDamage;
-
-typedef struct WinxtermScreenRenderSnapshot {
-    WinxtermScreenCell *cells;
+typedef struct WinxtermScreenRenderState {
     int columns;
     int rows;
-    int row_offset;
     int bitmap_width;
     int bitmap_height;
     bool alternate_active;
@@ -128,9 +115,8 @@ typedef struct WinxtermScreenRenderSnapshot {
     WinxtermScreenPalette palette;
     WinxtermModeState mode_state;
     WinxtermScreenSelectionRange selection;
-    WinxtermRenderBackend backend;
     uint32_t clear_rgb;
-} WinxtermScreenRenderSnapshot;
+} WinxtermScreenRenderState;
 
 typedef struct WinxtermScreenCursorState {
     int row;
@@ -186,9 +172,8 @@ typedef struct WinxtermScreen {
     size_t scrollback_count;
     size_t scrollback_capacity;
     bool *tab_stops;
-    WinxtermScreenDamage damage;
+    WinxtermRenderDamage damage;
     uint64_t visual_line_advances;
-    WinxtermCommandDiagnostics *active_diagnostics;
 } WinxtermScreen;
 
 bool winxterm_screen_init(WinxtermScreen *screen, int columns, int rows);
@@ -237,47 +222,17 @@ bool winxterm_screen_get_alternate_view_row(const WinxtermScreen *screen,
                                             WinxtermScreenRowView *row);
 void winxterm_screen_clear_scrollback(WinxtermScreen *screen);
 void winxterm_screen_mark_full_repaint(WinxtermScreen *screen);
-bool winxterm_screen_take_damage(WinxtermScreen *screen, WinxtermScreenDamage *damage);
+bool winxterm_screen_render_state_init(WinxtermScreenRenderState *state,
+                                      WinxtermScreen *screen,
+                                      int bitmap_width,
+                                      int bitmap_height,
+                                      bool cursor_visible,
+                                      const WinxtermScreenRenderView *view);
+void winxterm_screen_render_state_rows(const WinxtermScreenRenderState *state,
+                                       WinxtermScreen *screen,
+                                       WinxtermRenderContext *render_context,
+                                       uint32_t *pixels,
+                                       int row_start,
+                                       int row_count);
 uint64_t winxterm_screen_visual_line_advances(const WinxtermScreen *screen);
-void winxterm_screen_render(WinxtermScreen *screen,
-                            WinxtermRenderContext *render_context,
-                            uint32_t *pixels,
-                            int bitmap_width,
-                            int bitmap_height,
-                            WinxtermRenderBackend backend,
-                            bool cursor_visible);
-void winxterm_screen_render_view(WinxtermScreen *screen,
-                                 WinxtermRenderContext *render_context,
-                                 uint32_t *pixels,
-                                 int bitmap_width,
-                                 int bitmap_height,
-                                 WinxtermRenderBackend backend,
-                                 bool cursor_visible,
-                                 const WinxtermScreenRenderView *view);
-bool winxterm_screen_render_snapshot_init(WinxtermScreenRenderSnapshot *snapshot,
-                                          WinxtermScreen *screen,
-                                          int bitmap_width,
-                                          int bitmap_height,
-                                          WinxtermRenderBackend backend,
-                                          bool cursor_visible,
-                                          const WinxtermScreenRenderView *view);
-bool winxterm_screen_render_snapshot_init_rows(WinxtermScreenRenderSnapshot *snapshot,
-                                               WinxtermScreen *screen,
-                                               int bitmap_width,
-                                               int bitmap_height,
-                                               WinxtermRenderBackend backend,
-                                               bool cursor_visible,
-                                               const WinxtermScreenRenderView *view,
-                                               int row_offset,
-                                               int row_count);
-void winxterm_screen_render_snapshot_dispose(WinxtermScreenRenderSnapshot *snapshot);
-void winxterm_screen_render_snapshot_range(const WinxtermScreenRenderSnapshot *snapshot,
-                                           WinxtermRenderContext *render_context,
-                                           uint32_t *pixels,
-                                           int row_start,
-                                           int row_count);
-void winxterm_screen_render_snapshot(const WinxtermScreenRenderSnapshot *snapshot,
-                                     WinxtermRenderContext *render_context,
-                                     uint32_t *pixels);
-
 #endif

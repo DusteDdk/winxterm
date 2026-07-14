@@ -180,7 +180,6 @@ typedef enum WinxtermTerminalResetKind {
 
 typedef struct WinxtermTerminalOp {
     WinxtermTerminalOpType type;
-    size_t source_byte_count;
     bool private_mode;
     union {
         uint32_t codepoint;

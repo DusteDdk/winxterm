@@ -722,46 +722,6 @@ static int build_font_rows(const ParsedFont *font, FontRows *rows)
     return 1;
 }
 
-static uint8_t build_spans(uint8_t mask, uint8_t starts[3], uint8_t lengths[3])
-{
-    uint32_t x = 0u;
-    uint8_t count = 0u;
-
-    while (x < FONT_WIDTH) {
-        uint32_t start = 0u;
-        uint32_t length = 0u;
-        const uint8_t bit = (uint8_t)(1u << (FONT_WIDTH - 1u - x));
-        if ((mask & bit) == 0u) {
-            ++x;
-            continue;
-        }
-
-        start = x;
-        while (x < FONT_WIDTH) {
-            const uint8_t run_bit = (uint8_t)(1u << (FONT_WIDTH - 1u - x));
-            if ((mask & run_bit) == 0u) {
-                break;
-            }
-            ++length;
-            ++x;
-        }
-
-        starts[count] = (uint8_t)start;
-        lengths[count] = (uint8_t)length;
-        ++count;
-    }
-
-    {
-        uint8_t actual_count = count;
-        while (count < 3u) {
-            starts[count] = 0u;
-            lengths[count] = 0u;
-            ++count;
-        }
-        return actual_count;
-    }
-}
-
 static const char *basename_for_comment(const char *path)
 {
     const char *last_slash = strrchr(path, '/');
@@ -800,17 +760,8 @@ static int write_header(const char *output_path, const char *input_path, const F
     fprintf(file, "#define WINXTERM_FONT_6X13_TOTAL_GLYPH_COUNT 257u\n");
     fprintf(file, "#define WINXTERM_FONT_6X13_FALLBACK_GLYPH_INDEX 256u\n");
     fprintf(file, "#define WINXTERM_FONT_6X13_ROW_MASK_LEFT_BIT 0x20u\n\n");
-    fprintf(file, "typedef struct WinxtermFont6x13Span {\n");
-    fprintf(file, "    uint8_t x;\n");
-    fprintf(file, "    uint8_t length;\n");
-    fprintf(file, "} WinxtermFont6x13Span;\n\n");
     fprintf(file, "typedef struct WinxtermFont6x13Row {\n");
     fprintf(file, "    uint8_t foreground_mask;\n");
-    fprintf(file, "    uint8_t background_mask;\n");
-    fprintf(file, "    uint8_t foreground_span_count;\n");
-    fprintf(file, "    uint8_t background_span_count;\n");
-    fprintf(file, "    WinxtermFont6x13Span foreground_spans[3];\n");
-    fprintf(file, "    WinxtermFont6x13Span background_spans[3];\n");
     fprintf(file, "} WinxtermFont6x13Row;\n\n");
     fprintf(file, "static const WinxtermFont6x13Row winxterm_font_6x13_rows[WINXTERM_FONT_6X13_TOTAL_GLYPH_COUNT][WINXTERM_FONT_6X13_HEIGHT] = {\n");
 
@@ -824,32 +775,9 @@ static int write_header(const char *output_path, const char *input_path, const F
         fprintf(file, "    {\n");
         for (y = 0u; y < FONT_HEIGHT; ++y) {
             const uint8_t foreground_mask = rows->masks[glyph][y];
-            const uint8_t background_mask = (uint8_t)(0x3fu & (uint8_t)~foreground_mask);
-            uint8_t foreground_starts[3] = { 0u, 0u, 0u };
-            uint8_t foreground_lengths[3] = { 0u, 0u, 0u };
-            uint8_t background_starts[3] = { 0u, 0u, 0u };
-            uint8_t background_lengths[3] = { 0u, 0u, 0u };
-            uint8_t foreground_count = build_spans(foreground_mask, foreground_starts, foreground_lengths);
-            uint8_t background_count = build_spans(background_mask, background_starts, background_lengths);
-
             fprintf(file,
-                    "        { 0x%02xu, 0x%02xu, %uu, %uu, { { %uu, %uu }, { %uu, %uu }, { %uu, %uu } }, { { %uu, %uu }, { %uu, %uu }, { %uu, %uu } } }%s\n",
+                    "        { 0x%02xu }%s\n",
                     foreground_mask,
-                    background_mask,
-                    (unsigned int)foreground_count,
-                    (unsigned int)background_count,
-                    (unsigned int)foreground_starts[0],
-                    (unsigned int)foreground_lengths[0],
-                    (unsigned int)foreground_starts[1],
-                    (unsigned int)foreground_lengths[1],
-                    (unsigned int)foreground_starts[2],
-                    (unsigned int)foreground_lengths[2],
-                    (unsigned int)background_starts[0],
-                    (unsigned int)background_lengths[0],
-                    (unsigned int)background_starts[1],
-                    (unsigned int)background_lengths[1],
-                    (unsigned int)background_starts[2],
-                    (unsigned int)background_lengths[2],
                     y + 1u == FONT_HEIGHT ? "" : ",");
         }
         fprintf(file, "    }%s\n", glyph + 1u == TOTAL_GLYPH_COUNT ? "" : ",");

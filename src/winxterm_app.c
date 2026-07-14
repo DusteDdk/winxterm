@@ -36,6 +36,8 @@ static const UINT_PTR WINXTERM_CLICK_EVENT_TIMER_ID = 5u;
 static const UINT_PTR WINXTERM_COPY_OVERLAY_TIMER_ID = 6u;
 static const UINT WINXTERM_DEFAULT_CURSOR_BLINK_MS = 500u;
 static const UINT WINXTERM_FRAME_THROTTLE_MS = 16u;
+static const uint64_t WINXTERM_PARSE_TURN_BUDGET_NS = 4u * 1000u * 1000u;
+static const size_t WINXTERM_PARSE_SLICE_BYTES = 32u * 1024u;
 static const UINT WINXTERM_COPY_OVERLAY_FRAME_MS = 33u;
 static const DWORD WINXTERM_COPY_OVERLAY_SOLID_MS = 250u;
 static const DWORD WINXTERM_COPY_OVERLAY_FADE_MS = 250u;
@@ -48,11 +50,6 @@ static const uint32_t WINXTERM_HOVER_OUTLINE_RGB = 0x0000ff00u;
 static const uint8_t WINXTERM_HOVER_OUTLINE_ALPHA = 128u;
 static const uint8_t WINXTERM_CLICK_PREVIEW_ALPHA = 255u;
 static const uint32_t WINXTERM_COPY_OVERLAY_RGB = 0x00ff9900u;
-
-enum {
-    WINXTERM_OUTPUT_COMMIT_MAX_PASSES =
-        (WINXTERM_BRIDGE_OUTPUT_MAX_CAPACITY / WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES) + 1u
-};
 
 enum {
     WINXTERM_ALT_DRAG_EDGE_LEFT = 1u,
@@ -92,29 +89,6 @@ typedef struct WinxtermCloseDialog {
     wchar_t child_text[65536];
 } WinxtermCloseDialog;
 
-typedef struct WinxtermRenderWorker {
-    struct WinxtermRenderWorkerPool *pool;
-    HANDLE thread;
-    HANDLE work_event;
-    HANDLE done_event;
-    DWORD thread_id;
-    unsigned int index;
-    int row_start;
-    int row_count;
-    const WinxtermScreenRenderSnapshot *snapshot;
-    uint32_t *pixels;
-    uint64_t render_ns;
-    WinxtermRenderContext context;
-} WinxtermRenderWorker;
-
-struct WinxtermRenderWorkerPool {
-    HINSTANCE instance;
-    WinxtermLog *log;
-    HANDLE shutdown_event;
-    unsigned int worker_count;
-    WinxtermRenderWorker workers[WINXTERM_MAX_RENDER_THREADS];
-};
-
 enum {
     WINXTERM_MENU_COPY = 1001,
     WINXTERM_MENU_PASTE,
@@ -124,19 +98,14 @@ enum {
     WINXTERM_MENU_SCALE_2,
     WINXTERM_MENU_SCALE_3,
     WINXTERM_MENU_SCALE_4,
-    WINXTERM_MENU_RENDER_SPANS,
-    WINXTERM_MENU_RENDER_ROW_MASKS,
-    WINXTERM_MENU_RENDER_PRECOLORED,
     WINXTERM_MENU_DUMP_SCREEN,
-    WINXTERM_MENU_DIAGNOSTICS,
-    WINXTERM_MENU_RENDER_THREADS_BASE = 1100,
-    WINXTERM_MENU_RENDER_THREADS_LAST =
-        WINXTERM_MENU_RENDER_THREADS_BASE + WINXTERM_MAX_RENDER_THREADS - 1
+    WINXTERM_MENU_DIAGNOSTICS
 };
 
 static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK winxterm_close_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes);
+static void winxterm_app_set_frame_timer(WinxtermApp *app, UINT delay_ms);
 static void winxterm_app_handle_macro_update(WinxtermApp *app);
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam);
 static void winxterm_app_dump_screen_to_file(WinxtermApp *app);
@@ -157,245 +126,6 @@ static bool winxterm_app_adjust_window_rect(RECT *rect, DWORD style, DWORD ex_st
     return true;
 }
 
-static unsigned int winxterm_app_clamp_render_thread_count(unsigned int count)
-{
-    if (count == 0u) {
-        return 1u;
-    }
-    return count > WINXTERM_MAX_RENDER_THREADS ? WINXTERM_MAX_RENDER_THREADS : count;
-}
-
-static unsigned int winxterm_app_active_render_thread_count(const WinxtermApp *app)
-{
-    if (app == 0) {
-        return 1u;
-    }
-    if (app->render_workers != 0 && app->render_workers->worker_count != 0u) {
-        return app->render_workers->worker_count;
-    }
-    return winxterm_app_clamp_render_thread_count(app->render_thread_count);
-}
-
-static DWORD WINAPI winxterm_render_worker_thread_proc(void *context)
-{
-    WinxtermRenderWorker *worker = (WinxtermRenderWorker *)context;
-    if (worker == 0 || worker->pool == 0) {
-        return 1;
-    }
-
-    winxterm_render_context_init(&worker->context);
-    (void)winxterm_render_context_load_fallback_fonts(&worker->context,
-                                                      worker->pool->instance,
-                                                      worker->pool->log);
-
-    HANDLE waits[2] = {worker->pool->shutdown_event, worker->work_event};
-    for (;;) {
-        DWORD wait_result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-        if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_FAILED) {
-            break;
-        }
-        if (wait_result == WAIT_OBJECT_0 + 1u) {
-            uint64_t start_ns = winxterm_bridge_timestamp_ns();
-            worker->context.active_diagnostics = 0;
-            if (worker->snapshot != 0 && worker->pixels != 0 && worker->row_count > 0) {
-                winxterm_screen_render_snapshot_range(worker->snapshot,
-                                                       &worker->context,
-                                                       worker->pixels,
-                                                       worker->row_start,
-                                                       worker->row_count);
-            }
-            uint64_t end_ns = winxterm_bridge_timestamp_ns();
-            worker->render_ns = end_ns >= start_ns ? end_ns - start_ns : 0u;
-            SetEvent(worker->done_event);
-        }
-    }
-
-    winxterm_render_context_dispose(&worker->context);
-    return 0;
-}
-
-static void winxterm_render_worker_close_handle(HANDLE *handle)
-{
-    if (handle != 0 && *handle != 0) {
-        CloseHandle(*handle);
-        *handle = 0;
-    }
-}
-
-static void winxterm_render_worker_pool_destroy(WinxtermRenderWorkerPool *pool)
-{
-    if (pool == 0) {
-        return;
-    }
-    if (pool->shutdown_event != 0) {
-        SetEvent(pool->shutdown_event);
-    }
-    for (unsigned int i = 0u; i < pool->worker_count; ++i) {
-        if (pool->workers[i].work_event != 0) {
-            SetEvent(pool->workers[i].work_event);
-        }
-    }
-    for (unsigned int i = 0u; i < pool->worker_count; ++i) {
-        if (pool->workers[i].thread != 0) {
-            WaitForSingleObject(pool->workers[i].thread, INFINITE);
-        }
-        winxterm_render_worker_close_handle(&pool->workers[i].thread);
-        winxterm_render_worker_close_handle(&pool->workers[i].work_event);
-        winxterm_render_worker_close_handle(&pool->workers[i].done_event);
-    }
-    winxterm_render_worker_close_handle(&pool->shutdown_event);
-    free(pool);
-}
-
-static WinxtermRenderWorkerPool *winxterm_render_worker_pool_create(HINSTANCE instance,
-                                                                    WinxtermLog *log,
-                                                                    unsigned int requested_count)
-{
-    unsigned int worker_count = winxterm_app_clamp_render_thread_count(requested_count);
-    WinxtermRenderWorkerPool *pool = (WinxtermRenderWorkerPool *)calloc(1u, sizeof(*pool));
-    if (pool == 0) {
-        return 0;
-    }
-
-    pool->instance = instance;
-    pool->log = log;
-    pool->worker_count = worker_count;
-    pool->shutdown_event = CreateEventW(0, TRUE, FALSE, 0);
-    if (pool->shutdown_event == 0) {
-        free(pool);
-        return 0;
-    }
-
-    for (unsigned int i = 0u; i < worker_count; ++i) {
-        WinxtermRenderWorker *worker = &pool->workers[i];
-        worker->pool = pool;
-        worker->index = i;
-        worker->work_event = CreateEventW(0, FALSE, FALSE, 0);
-        worker->done_event = CreateEventW(0, TRUE, FALSE, 0);
-        if (worker->work_event == 0 || worker->done_event == 0) {
-            winxterm_render_worker_pool_destroy(pool);
-            return 0;
-        }
-        worker->thread = CreateThread(0,
-                                      0,
-                                      winxterm_render_worker_thread_proc,
-                                      worker,
-                                      0,
-                                      &worker->thread_id);
-        if (worker->thread == 0) {
-            winxterm_render_worker_pool_destroy(pool);
-            return 0;
-        }
-    }
-
-    return pool;
-}
-
-static void winxterm_app_apply_render_thread_count(WinxtermApp *app, unsigned int requested_count)
-{
-    if (app == 0) {
-        return;
-    }
-
-    unsigned int count = winxterm_app_clamp_render_thread_count(requested_count);
-    if (winxterm_app_active_render_thread_count(app) == count) {
-        return;
-    }
-
-    winxterm_render_worker_pool_destroy(app->render_workers);
-    app->render_workers = 0;
-    app->render_thread_count = count;
-    app->render_workers = winxterm_render_worker_pool_create(app->instance, app->log, count);
-    if (app->render_workers == 0) {
-        winxterm_log_writef(app->log,
-                            "render worker pool unavailable after thread count change to %u; using UI-thread renderer",
-                            count);
-    } else {
-        winxterm_log_writef(app->log,
-                            "render worker pool changed threads=%u",
-                            app->render_workers->worker_count);
-    }
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
-}
-
-static unsigned int winxterm_render_worker_effective_count(const WinxtermRenderWorkerPool *pool,
-                                                           int rows)
-{
-    if (pool == 0 || pool->worker_count == 0u || rows <= 0) {
-        return 0u;
-    }
-    unsigned int count = pool->worker_count;
-    if (count > (unsigned int)rows) {
-        count = (unsigned int)rows;
-    }
-    return count;
-}
-
-static bool winxterm_render_worker_pool_render(WinxtermRenderWorkerPool *pool,
-                                               const WinxtermScreenRenderSnapshot *snapshot,
-                                               uint32_t *pixels,
-                                               uint64_t *worker_total_ns,
-                                               uint64_t *worker_max_ns)
-{
-    if (worker_total_ns != 0) {
-        *worker_total_ns = 0u;
-    }
-    if (worker_max_ns != 0) {
-        *worker_max_ns = 0u;
-    }
-    unsigned int count = winxterm_render_worker_effective_count(pool, snapshot != 0 ? snapshot->rows : 0);
-    if (pool == 0 || snapshot == 0 || pixels == 0 || count == 0u) {
-        return false;
-    }
-
-    HANDLE done_events[WINXTERM_MAX_RENDER_THREADS];
-    int row = 0;
-    int base_rows = snapshot->rows / (int)count;
-    int extra_rows = snapshot->rows % (int)count;
-    for (unsigned int i = 0u; i < count; ++i) {
-        int rows = base_rows + ((int)i < extra_rows ? 1 : 0);
-        WinxtermRenderWorker *worker = &pool->workers[i];
-        worker->snapshot = snapshot;
-        worker->pixels = pixels;
-        worker->row_start = row;
-        worker->row_count = rows;
-        worker->render_ns = 0u;
-        ResetEvent(worker->done_event);
-        done_events[i] = worker->done_event;
-        row += rows;
-    }
-
-    for (unsigned int i = 0u; i < count; ++i) {
-        SetEvent(pool->workers[i].work_event);
-    }
-
-    DWORD wait_result = WaitForMultipleObjects(count, done_events, TRUE, INFINITE);
-    if (wait_result == WAIT_FAILED) {
-        return false;
-    }
-
-    uint64_t total_ns = 0u;
-    uint64_t max_ns = 0u;
-    for (unsigned int i = 0u; i < count; ++i) {
-        uint64_t elapsed = pool->workers[i].render_ns;
-        total_ns += elapsed;
-        if (elapsed > max_ns) {
-            max_ns = elapsed;
-        }
-        pool->workers[i].snapshot = 0;
-        pool->workers[i].pixels = 0;
-        pool->workers[i].row_start = 0;
-        pool->workers[i].row_count = 0;
-    }
-    if (worker_total_ns != 0) {
-        *worker_total_ns = total_ns;
-    }
-    if (worker_max_ns != 0) {
-        *worker_max_ns = max_ns;
-    }
-    return true;
-}
-
 static int winxterm_app_min_int(int a, int b)
 {
     return a < b ? a : b;
@@ -403,8 +133,8 @@ static int winxterm_app_min_int(int a, int b)
 
 static uint32_t winxterm_app_paint_background_rgb(const WinxtermApp *app)
 {
-    (void)app;
-    return WINXTERM_DEFAULT_BACKGROUND_RGB;
+    return app != 0 ? app->rendered_background_rgb :
+        WINXTERM_DEFAULT_BACKGROUND_RGB;
 }
 
 static COLORREF winxterm_app_colorref_from_rgb(uint32_t rgb)
@@ -427,80 +157,37 @@ static void winxterm_app_fill_rect_rgb(HDC dc, const RECT *rect, uint32_t rgb)
     DeleteObject(brush);
 }
 
-static void winxterm_app_copy_front_overlap(uint32_t *dst,
-                                            int dst_width,
-                                            int dst_height,
-                                            const uint32_t *src,
-                                            int src_width,
-                                            int src_height)
-{
-    if (dst == 0 || src == 0 || dst_width <= 0 || dst_height <= 0 ||
-        src_width <= 0 || src_height <= 0) {
-        return;
-    }
-    int copy_width = winxterm_app_min_int(dst_width, src_width);
-    int copy_height = winxterm_app_min_int(dst_height, src_height);
-    for (int row = 0; row < copy_height; ++row) {
-        memcpy(dst + (size_t)row * (size_t)dst_width,
-               src + (size_t)row * (size_t)src_width,
-               (size_t)copy_width * sizeof(*dst));
-    }
-}
-
 static void winxterm_app_free_buffers(WinxtermApp *app)
 {
-    free(app->front_pixels);
-    free(app->back_pixels);
-    app->front_pixels = 0;
-    app->back_pixels = 0;
-    app->bitmap_width = 0;
-    app->bitmap_height = 0;
+    if (app != 0) {
+        winxterm_surface_dispose(&app->surface);
+    }
 }
 
 static bool winxterm_app_resize_bitmap(WinxtermApp *app, int width, int height)
 {
     if (width <= 0 || height <= 0) {
-        winxterm_app_free_buffers(app);
         return true;
     }
-
-    if (app->bitmap_width == width && app->bitmap_height == height &&
-        app->front_pixels != 0 && app->back_pixels != 0) {
-        return true;
+    bool had_surface = app->surface.pixels != 0;
+    bool dimensions_changed = app->surface.width != width || app->surface.height != height;
+    HDC reference_dc = app->hwnd != 0 ? GetDC(app->hwnd) : 0;
+    bool ok = app->surface.pixels == 0 ?
+        winxterm_surface_init(&app->surface, reference_dc, width, height) :
+        winxterm_surface_resize(&app->surface, reference_dc, width, height);
+    if (app->hwnd != 0 && reference_dc != 0) {
+        ReleaseDC(app->hwnd, reference_dc);
     }
-
-    if ((size_t)width > SIZE_MAX / (size_t)height) {
-        return false;
+    if (ok && (!had_surface || dimensions_changed)) {
+        winxterm_surface_flush_before_cpu_write(&app->surface);
+        winxterm_render_clear(app->surface.pixels, width, height,
+                             WINXTERM_DEFAULT_BACKGROUND_RGB);
+        if (dimensions_changed) {
+            WinxtermCellSize cells = winxterm_pixels_to_cells(width, height);
+            (void)winxterm_render_damage_resize(&app->render_damage, cells.rows);
+        }
     }
-
-    size_t pixel_count = (size_t)width * (size_t)height;
-    if (pixel_count > SIZE_MAX / sizeof(uint32_t)) {
-        return false;
-    }
-
-    uint32_t *front = (uint32_t *)malloc(pixel_count * sizeof(uint32_t));
-    uint32_t *back = (uint32_t *)malloc(pixel_count * sizeof(uint32_t));
-    if (front == 0 || back == 0) {
-        free(front);
-        free(back);
-        return false;
-    }
-
-    winxterm_render_clear(front, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-    winxterm_render_clear(back, width, height, WINXTERM_DEFAULT_BACKGROUND_RGB);
-    winxterm_app_copy_front_overlap(front,
-                                    width,
-                                    height,
-                                    app->front_pixels,
-                                    app->bitmap_width,
-                                    app->bitmap_height);
-
-    winxterm_app_free_buffers(app);
-    app->front_pixels = front;
-    app->back_pixels = back;
-    app->bitmap_width = width;
-    app->bitmap_height = height;
-    return true;
+    return ok;
 }
 
 static unsigned int winxterm_app_display_scale(const WinxtermApp *app)
@@ -551,8 +238,8 @@ static WinxtermCellSize winxterm_app_visible_cells_locked(const WinxtermApp *app
         return cells;
     }
     return winxterm_app_visible_cells_for_bitmap(&app->bridge->screen,
-                                                 app->bitmap_width,
-                                                 app->bitmap_height);
+                                                 app->surface.width,
+                                                 app->surface.height);
 }
 
 static bool winxterm_app_hit_test_lparam(WinxtermApp *app,
@@ -590,10 +277,11 @@ static void winxterm_app_clear_hover(WinxtermApp *app)
     if (app == 0 || !app->hover_valid) {
         return;
     }
+    winxterm_render_damage_mark_row(&app->render_damage, app->hover_view_row);
     app->hover_valid = false;
     app->hover_column = 0;
     app->hover_view_row = 0;
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
 }
 
 static void winxterm_app_update_hover(WinxtermApp *app, LPARAM lparam)
@@ -622,10 +310,14 @@ static void winxterm_app_update_hover(WinxtermApp *app, LPARAM lparam)
         app->hover_view_row == view_row) {
         return;
     }
+    if (app->hover_valid) {
+        winxterm_render_damage_mark_row(&app->render_damage, app->hover_view_row);
+    }
     app->hover_valid = true;
     app->hover_column = position.column;
     app->hover_view_row = view_row;
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_render_damage_mark_row(&app->render_damage, view_row);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
 }
 
 static bool winxterm_app_capture_scale_anchor_locked(WinxtermApp *app)
@@ -713,17 +405,15 @@ static void winxterm_app_update_title(WinxtermApp *app)
         written = terminal_title_wide[0] != L'\0' ?
             swprintf_s(title,
                        title_count,
-                       L"%ls%ls - %S %.1f FPS",
+                       L"%ls%ls - %.1f FPS",
                        bell_prefix,
                        terminal_title_wide,
-                       winxterm_render_backend_name(winxterm_bridge_backend(app->bridge)),
                        app->bridge->last_fps) :
             swprintf_s(title,
                        title_count,
-                       L"%ls%ls - %S %.1f FPS",
+                       L"%ls%ls - %.1f FPS",
                        bell_prefix,
                        WINXTERM_WINDOW_TITLE,
-                       winxterm_render_backend_name(winxterm_bridge_backend(app->bridge)),
                        app->bridge->last_fps);
     } else {
         written = terminal_title_wide[0] != L'\0' ?
@@ -736,20 +426,20 @@ static void winxterm_app_update_title(WinxtermApp *app)
 }
 
 static void winxterm_app_note_rendered_cursor(WinxtermApp *app,
-                                              const WinxtermScreenRenderSnapshot *snapshot)
+                                              const WinxtermScreenRenderState *snapshot)
 {
     if (app == 0 || snapshot == 0 ||
         !snapshot->cursor_visible ||
         !snapshot->screen_cursor_visible ||
-        snapshot->cursor_global_row < snapshot->first_row + (size_t)snapshot->row_offset ||
-        snapshot->cursor_global_row >= snapshot->first_row + (size_t)snapshot->row_offset + (size_t)snapshot->rows) {
+        snapshot->cursor_global_row < snapshot->first_row ||
+        snapshot->cursor_global_row >= snapshot->first_row + (size_t)snapshot->rows) {
         if (app != 0) {
             app->rendered_cursor_valid = false;
             app->rendered_cursor_row = 0;
         }
         return;
     }
-    size_t local_row = snapshot->cursor_global_row - snapshot->first_row - (size_t)snapshot->row_offset;
+    size_t local_row = snapshot->cursor_global_row - snapshot->first_row;
     if (local_row >= (size_t)snapshot->rows) {
         app->rendered_cursor_valid = false;
         app->rendered_cursor_row = 0;
@@ -777,7 +467,7 @@ static void winxterm_app_include_render_row(int *top, int *bottom, int row)
     winxterm_app_include_render_row_range(top, bottom, row, row);
 }
 
-static bool winxterm_app_snapshot_cursor_local_row(const WinxtermScreenRenderSnapshot *snapshot, int *row)
+static bool winxterm_app_snapshot_cursor_local_row(const WinxtermScreenRenderState *snapshot, int *row)
 {
     if (row != 0) {
         *row = 0;
@@ -785,11 +475,11 @@ static bool winxterm_app_snapshot_cursor_local_row(const WinxtermScreenRenderSna
     if (snapshot == 0 ||
         !snapshot->cursor_visible ||
         !snapshot->screen_cursor_visible ||
-        snapshot->cursor_global_row < snapshot->first_row + (size_t)snapshot->row_offset ||
-        snapshot->cursor_global_row >= snapshot->first_row + (size_t)snapshot->row_offset + (size_t)snapshot->rows) {
+        snapshot->cursor_global_row < snapshot->first_row ||
+        snapshot->cursor_global_row >= snapshot->first_row + (size_t)snapshot->rows) {
         return false;
     }
-    size_t local_row = snapshot->cursor_global_row - snapshot->first_row - (size_t)snapshot->row_offset;
+    size_t local_row = snapshot->cursor_global_row - snapshot->first_row;
     if (local_row >= (size_t)snapshot->rows) {
         return false;
     }
@@ -801,16 +491,16 @@ static bool winxterm_app_snapshot_cursor_local_row(const WinxtermScreenRenderSna
 
 static void winxterm_app_draw_hover_outline(WinxtermApp *app)
 {
-    if (app == 0 || !app->hover_valid || app->back_pixels == 0 ||
+    if (app == 0 || !app->hover_valid || app->surface.pixels == 0 ||
         app->hover_column < 0 || app->hover_view_row < 0) {
         return;
     }
 
     int x = app->hover_column * WINXTERM_CELL_WIDTH_PIXELS;
     int y = app->hover_view_row * WINXTERM_CELL_HEIGHT_PIXELS;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        x,
                                        y,
                                        WINXTERM_CELL_WIDTH_PIXELS,
@@ -887,15 +577,15 @@ static void winxterm_app_draw_copy_overlay_column_span(WinxtermApp *app,
                                                        int end_column,
                                                        uint8_t alpha)
 {
-    if (app == 0 || app->back_pixels == 0 || start_column > end_column) {
+    if (app == 0 || app->surface.pixels == 0 || start_column > end_column) {
         return;
     }
     int x = start_column * WINXTERM_CELL_WIDTH_PIXELS;
     int y = view_row * WINXTERM_CELL_HEIGHT_PIXELS + y_offset;
     int width = (end_column - start_column + 1) * WINXTERM_CELL_WIDTH_PIXELS;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        x,
                                        y,
                                        width,
@@ -949,16 +639,16 @@ static void winxterm_app_draw_copy_overlay_vertical_edge(WinxtermApp *app,
                                                         bool right_edge,
                                                         uint8_t alpha)
 {
-    if (app == 0 || app->back_pixels == 0) {
+    if (app == 0 || app->surface.pixels == 0) {
         return;
     }
     int x = right_edge ?
         (column + 1) * WINXTERM_CELL_WIDTH_PIXELS - 1 :
         column * WINXTERM_CELL_WIDTH_PIXELS;
     int y = view_row * WINXTERM_CELL_HEIGHT_PIXELS;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        x,
                                        y,
                                        1,
@@ -971,13 +661,13 @@ static void winxterm_app_draw_click_preview_row(WinxtermApp *app,
                                                 int view_row,
                                                 int columns)
 {
-    if (app == 0 || app->back_pixels == 0 || columns <= 0) {
+    if (app == 0 || app->surface.pixels == 0 || columns <= 0) {
         return;
     }
     int y = view_row * WINXTERM_CELL_HEIGHT_PIXELS + WINXTERM_CELL_HEIGHT_PIXELS / 2;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        0,
                                        y,
                                        columns * WINXTERM_CELL_WIDTH_PIXELS,
@@ -992,15 +682,15 @@ static void winxterm_app_draw_click_preview_column_span(WinxtermApp *app,
                                                         int start_column,
                                                         int end_column)
 {
-    if (app == 0 || app->back_pixels == 0 || start_column > end_column) {
+    if (app == 0 || app->surface.pixels == 0 || start_column > end_column) {
         return;
     }
     int x = start_column * WINXTERM_CELL_WIDTH_PIXELS;
     int y = view_row * WINXTERM_CELL_HEIGHT_PIXELS + y_offset;
     int width = (end_column - start_column + 1) * WINXTERM_CELL_WIDTH_PIXELS;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        x,
                                        y,
                                        width,
@@ -1014,16 +704,16 @@ static void winxterm_app_draw_click_preview_vertical_edge(WinxtermApp *app,
                                                          int column,
                                                          bool right_edge)
 {
-    if (app == 0 || app->back_pixels == 0) {
+    if (app == 0 || app->surface.pixels == 0) {
         return;
     }
     int x = right_edge ?
         (column + 1) * WINXTERM_CELL_WIDTH_PIXELS - 1 :
         column * WINXTERM_CELL_WIDTH_PIXELS;
     int y = view_row * WINXTERM_CELL_HEIGHT_PIXELS;
-    winxterm_render_blend_rect_outline(app->back_pixels,
-                                       app->bitmap_width,
-                                       app->bitmap_height,
+    winxterm_render_blend_rect_outline(app->surface.pixels,
+                                       app->surface.width,
+                                       app->surface.height,
                                        x,
                                        y,
                                        1,
@@ -1068,9 +758,9 @@ static void winxterm_app_draw_click_preview_uncovered_span(WinxtermApp *app,
 }
 
 static void winxterm_app_draw_click_preview(WinxtermApp *app,
-                                            const WinxtermScreenRenderSnapshot *snapshot)
+                                            const WinxtermScreenRenderState *snapshot)
 {
-    if (app == 0 || snapshot == 0 || app->back_pixels == 0 ||
+    if (app == 0 || snapshot == 0 || app->surface.pixels == 0 ||
         app->click_preview_kind == WINXTERM_CLICK_PREVIEW_NONE ||
         !app->click_preview_range.enabled ||
         app->click_preview_range.alternate != snapshot->alternate_active ||
@@ -1079,7 +769,7 @@ static void winxterm_app_draw_click_preview(WinxtermApp *app,
     }
 
     const WinxtermScreenSelectionRange *range = &app->click_preview_range;
-    size_t visible_first = snapshot->first_row + (size_t)snapshot->row_offset;
+    size_t visible_first = snapshot->first_row;
     size_t visible_last = visible_first + (size_t)(snapshot->rows - 1);
     if (range->end_row < visible_first || range->start_row > visible_last) {
         return;
@@ -1149,9 +839,9 @@ static void winxterm_app_draw_click_preview(WinxtermApp *app,
 }
 
 static void winxterm_app_draw_copy_overlay(WinxtermApp *app,
-                                           const WinxtermScreenRenderSnapshot *snapshot)
+                                           const WinxtermScreenRenderState *snapshot)
 {
-    if (app == 0 || snapshot == 0 || app->back_pixels == 0 ||
+    if (app == 0 || snapshot == 0 || app->surface.pixels == 0 ||
         snapshot->columns <= 0 || snapshot->rows <= 0) {
         return;
     }
@@ -1162,7 +852,7 @@ static void winxterm_app_draw_copy_overlay(WinxtermApp *app,
     }
 
     const WinxtermScreenSelectionRange *range = &app->copy_overlay_range;
-    size_t visible_first = snapshot->first_row + (size_t)snapshot->row_offset;
+    size_t visible_first = snapshot->first_row;
     size_t visible_last = visible_first + (size_t)(snapshot->rows - 1);
     if (range->end_row < visible_first || range->start_row > visible_last) {
         return;
@@ -1226,42 +916,37 @@ static void winxterm_app_draw_copy_overlay(WinxtermApp *app,
 }
 
 static bool winxterm_app_try_render_scroll_frame(WinxtermApp *app,
-                                                 const WinxtermScreenRenderSnapshot *snapshot)
+                                                 const WinxtermScreenRenderState *snapshot,
+                                                 uint64_t *scroll_ns)
 {
-    if (app == 0 || snapshot == 0 || app->front_pixels == 0 || app->back_pixels == 0 ||
-        app->bridge == 0 || !app->render_damage_valid || snapshot->alternate_active ||
+    if (scroll_ns != 0) *scroll_ns = 0u;
+    if (app == 0 || snapshot == 0 || app->surface.pixels == 0 ||
+        app->bridge == 0 || !winxterm_render_damage_any(&app->render_damage) ||
+        snapshot->alternate_active ||
         !app->ux.viewport.follow_output || winxterm_ux_has_selection(&app->ux) || app->hover_valid ||
         app->copy_overlay_active || app->click_preview_kind != WINXTERM_CLICK_PREVIEW_NONE) {
         return false;
     }
 
-    const WinxtermScreenDamage *damage = &app->render_damage;
-    if (damage->full_repaint || damage->scroll_delta <= 0 || damage->scroll_delta >= snapshot->rows) {
+    const WinxtermRenderDamage *damage = &app->render_damage;
+    if (damage->full || !damage->scroll_valid || damage->scroll_rows <= 0 ||
+        damage->scroll_rows >= snapshot->rows) {
         return false;
     }
 
     int top = -1;
     int bottom = -1;
-    int exposed_top = snapshot->rows - damage->scroll_delta;
+    int exposed_top = snapshot->rows - damage->scroll_rows;
     winxterm_app_include_render_row_range(&top, &bottom, exposed_top, snapshot->rows - 1);
 
-    if (damage->dirty) {
-        size_t global_top = app->bridge->screen.scrollback_count + (size_t)damage->dirty_top;
-        size_t global_bottom = app->bridge->screen.scrollback_count + (size_t)damage->dirty_bottom;
-        size_t visible_top = snapshot->first_row + (size_t)snapshot->row_offset;
-        size_t visible_bottom = visible_top + (size_t)snapshot->rows - 1u;
-        if (global_bottom >= visible_top && global_top <= visible_bottom) {
-            size_t clipped_top = global_top > visible_top ? global_top : visible_top;
-            size_t clipped_bottom = global_bottom < visible_bottom ? global_bottom : visible_bottom;
-            winxterm_app_include_render_row_range(&top,
-                                                  &bottom,
-                                                  (int)(clipped_top - visible_top),
-                                                  (int)(clipped_bottom - visible_top));
+    for (int row = 0; row < snapshot->rows; ++row) {
+        if (winxterm_render_damage_row(damage, row)) {
+            winxterm_app_include_render_row(&top, &bottom, row);
         }
     }
 
     if (app->rendered_cursor_valid) {
-        int moved_cursor_row = app->rendered_cursor_row - damage->scroll_delta;
+        int moved_cursor_row = app->rendered_cursor_row - damage->scroll_rows;
         if (moved_cursor_row >= 0 && moved_cursor_row < snapshot->rows) {
             winxterm_app_include_render_row(&top, &bottom, moved_cursor_row);
         }
@@ -1276,38 +961,66 @@ static bool winxterm_app_try_render_scroll_frame(WinxtermApp *app,
         return false;
     }
     int row_count = bottom - top + 1;
-    if (row_count > snapshot->rows / 2) {
-        return false;
-    }
 
-    winxterm_render_scroll_lines(app->front_pixels,
-                                 app->back_pixels,
-                                 app->bitmap_width,
-                                 app->bitmap_height,
-                                 damage->scroll_delta,
+    uint64_t scroll_start_ns = winxterm_bridge_timestamp_ns();
+    winxterm_render_scroll_lines(app->surface.pixels,
+                                 app->surface.width,
+                                 app->surface.height,
+                                 damage->scroll_rows,
                                  snapshot->clear_rgb);
-    winxterm_screen_render_snapshot_range(snapshot,
-                                          &app->render_context,
-                                          app->back_pixels,
-                                          top,
-                                          row_count);
+    uint64_t scroll_end_ns = winxterm_bridge_timestamp_ns();
+    if (scroll_ns != 0 && scroll_end_ns >= scroll_start_ns) {
+        *scroll_ns = scroll_end_ns - scroll_start_ns;
+    }
+    winxterm_screen_render_state_rows(snapshot,
+                                      &app->bridge->screen,
+                                      &app->render_context,
+                                      app->surface.pixels,
+                                      top,
+                                      row_count);
     return true;
+}
+
+static void winxterm_app_mark_selection_rows(
+    WinxtermRenderDamage *damage,
+    const WinxtermScreenRenderState *state,
+    const WinxtermScreenSelectionRange *selection)
+{
+    if (damage == 0 || state == 0 || selection == 0 || !selection->enabled ||
+        selection->alternate != state->alternate_active || state->rows <= 0) {
+        return;
+    }
+    size_t visible_first = state->first_row;
+    size_t visible_last = visible_first + (size_t)state->rows - 1u;
+    if (selection->end_row < visible_first || selection->start_row > visible_last) {
+        return;
+    }
+    size_t first = selection->start_row > visible_first ?
+        selection->start_row : visible_first;
+    size_t last = selection->end_row < visible_last ?
+        selection->end_row : visible_last;
+    winxterm_render_damage_mark_rows(damage,
+                                     (int)(first - visible_first),
+                                     (int)(last - visible_first));
 }
 
 static void winxterm_app_render_main_area(WinxtermApp *app)
 {
-    if (app == 0 || app->bridge == 0 || app->front_pixels == 0 || app->back_pixels == 0 || app->bitmap_width <= 0 ||
-        app->bitmap_height <= 0) {
+    if (app == 0 || app->bridge == 0 || app->surface.pixels == 0 || app->surface.width <= 0 ||
+        app->surface.height <= 0) {
         return;
     }
-    app->render_invalid_full = false;
-
-    uint64_t worker_total_ns = 0u;
-    uint64_t worker_max_ns = 0u;
-    WinxtermScreenRenderSnapshot snapshot;
+    WinxtermScreenRenderState snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
-
+    uint64_t lock_start_ns = winxterm_bridge_timestamp_ns();
     EnterCriticalSection(&app->bridge->screen_lock);
+    uint64_t lock_end_ns = winxterm_bridge_timestamp_ns();
+    if (lock_end_ns >= lock_start_ns) {
+        uint64_t duration_ns = lock_end_ns - lock_start_ns;
+        winxterm_diag_add_u64(&app->bridge->screen_lock_wait_ns, duration_ns);
+        winxterm_timing_histogram_note(&app->bridge->screen_lock_wait_histogram,
+                                       duration_ns);
+    }
     WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
     winxterm_ux_note_screen_changed_for_rows(&app->ux, &app->bridge->screen, visible.rows);
     WinxtermScreenRenderView view;
@@ -1315,38 +1028,147 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
     view.primary_first_row =
         winxterm_ux_primary_first_row_for_rows(&app->ux, &app->bridge->screen, visible.rows);
     view.selection = winxterm_ux_render_selection(&app->ux, &app->bridge->screen);
-    bool snapshot_ready = winxterm_screen_render_snapshot_init(&snapshot,
-                                                              &app->bridge->screen,
-                                                              app->bitmap_width,
-                                                              app->bitmap_height,
-                                                              winxterm_bridge_backend(app->bridge),
-                                                              app->cursor_visible,
-                                                              &view);
-    LeaveCriticalSection(&app->bridge->screen_lock);
-
-    if (!snapshot_ready) {
-        winxterm_log_writef(app->log, "render snapshot allocation failed");
+    bool state_ready = winxterm_screen_render_state_init(&snapshot,
+                                                        &app->bridge->screen,
+                                                        app->surface.width,
+                                                        app->surface.height,
+                                                        app->cursor_visible,
+                                                        &view);
+    if (!state_ready) {
+        LeaveCriticalSection(&app->bridge->screen_lock);
         return;
     }
-
-    bool used_scroll_blit = winxterm_app_try_render_scroll_frame(app, &snapshot);
-    if (!used_scroll_blit &&
-        !winxterm_render_worker_pool_render(app->render_workers,
-                                            &snapshot,
-                                            app->back_pixels,
-                                            &worker_total_ns,
-                                            &worker_max_ns)) {
-        winxterm_screen_render_snapshot(&snapshot, &app->render_context, app->back_pixels);
+    if (app->rendered_cursor_valid) {
+        winxterm_render_damage_mark_row(&app->render_damage, app->rendered_cursor_row);
+    }
+    int current_cursor_row = 0;
+    if (winxterm_app_snapshot_cursor_local_row(&snapshot, &current_cursor_row)) {
+        winxterm_render_damage_mark_row(&app->render_damage, current_cursor_row);
+    }
+    if (app->rendered_selection_valid) {
+        winxterm_app_mark_selection_rows(&app->render_damage, &snapshot,
+                                         &app->rendered_selection);
+    }
+    winxterm_app_mark_selection_rows(&app->render_damage, &snapshot,
+                                     &snapshot.selection);
+    if (app->hover_valid) {
+        winxterm_render_damage_mark_row(&app->render_damage, app->hover_view_row);
+    }
+    if (app->copy_overlay_active && app->copy_overlay_range.enabled) {
+        size_t first = snapshot.first_row;
+        size_t last = first + (size_t)snapshot.rows - 1u;
+        size_t overlay_first = app->copy_overlay_range.start_row;
+        size_t overlay_last = app->copy_overlay_range.end_row;
+        if (overlay_last >= first && overlay_first <= last) {
+            if (overlay_first < first) overlay_first = first;
+            if (overlay_last > last) overlay_last = last;
+            winxterm_render_damage_mark_rows(&app->render_damage,
+                                             (int)(overlay_first - first),
+                                             (int)(overlay_last - first));
+        }
+    }
+    if (app->click_preview_kind != WINXTERM_CLICK_PREVIEW_NONE &&
+        app->click_preview_range.enabled) {
+        size_t first = snapshot.first_row;
+        size_t last = first + (size_t)snapshot.rows - 1u;
+        size_t preview_first = app->click_preview_range.start_row;
+        size_t preview_last = app->click_preview_range.end_row;
+        if (preview_last >= first && preview_first <= last) {
+            if (preview_first < first) preview_first = first;
+            if (preview_last > last) preview_last = last;
+            winxterm_render_damage_mark_rows(&app->render_damage,
+                                             (int)(preview_first - first),
+                                             (int)(preview_last - first));
+        }
+    }
+    int dirty_row_count = 0;
+    for (int row = 0; row < snapshot.rows; ++row) {
+        if (winxterm_render_damage_row(&app->render_damage, row)) ++dirty_row_count;
+    }
+    uint64_t raster_start_ns = winxterm_bridge_timestamp_ns();
+    winxterm_surface_flush_before_cpu_write(&app->surface);
+    uint64_t scroll_ns = 0u;
+    bool used_scroll_blit = winxterm_app_try_render_scroll_frame(app, &snapshot,
+                                                                 &scroll_ns);
+    if (!used_scroll_blit) {
+        for (int row = 0; row < snapshot.rows;) {
+            while (row < snapshot.rows &&
+                   !winxterm_render_damage_row(&app->render_damage, row)) ++row;
+            int first = row;
+            while (row < snapshot.rows &&
+                   winxterm_render_damage_row(&app->render_damage, row)) ++row;
+            if (first < row) {
+                winxterm_screen_render_state_rows(&snapshot,
+                                                  &app->bridge->screen,
+                                                  &app->render_context,
+                                                  app->surface.pixels,
+                                                  first,
+                                                  row - first);
+            }
+        }
     }
     winxterm_app_note_rendered_cursor(app, &snapshot);
+    app->rendered_selection = snapshot.selection;
+    app->rendered_selection_valid = true;
     winxterm_app_draw_copy_overlay(app, &snapshot);
     winxterm_app_draw_click_preview(app, &snapshot);
     winxterm_app_draw_hover_outline(app);
-    winxterm_screen_render_snapshot_dispose(&snapshot);
+    app->rendered_background_rgb = snapshot.clear_rgb;
+    uint64_t raster_end_ns = winxterm_bridge_timestamp_ns();
+    LeaveCriticalSection(&app->bridge->screen_lock);
+    if (raster_end_ns >= raster_start_ns) {
+        uint64_t duration_ns = raster_end_ns - raster_start_ns;
+        winxterm_diag_add_u64(&app->bridge->render_raster_ns, duration_ns);
+        winxterm_timing_histogram_note(&app->bridge->render_raster_histogram,
+                                       duration_ns);
+    }
+    winxterm_diag_add_u64(&app->bridge->render_scroll_ns, scroll_ns);
+    if (used_scroll_blit) {
+        winxterm_timing_histogram_note(&app->bridge->render_scroll_histogram,
+                                       scroll_ns);
+    }
+    winxterm_diag_add_u64(&app->bridge->dirty_rows_rendered,
+                          (uint64_t)dirty_row_count);
 
-    winxterm_render_swap(&app->front_pixels, &app->back_pixels);
-    app->render_invalid_full = true;
-    app->render_damage_valid = false;
+    ++app->surface.generation;
+    if (app->invalidation_start_ns == 0u) {
+        app->invalidation_start_ns = winxterm_bridge_timestamp_ns();
+    }
+    unsigned int scale = winxterm_app_display_scale(app);
+    if (app->render_damage.full || used_scroll_blit) {
+        if (app->render_damage.full) {
+            winxterm_diag_inc_u64(&app->bridge->full_repaints);
+        }
+        if (used_scroll_blit) {
+            winxterm_diag_inc_u64(&app->bridge->scroll_blits);
+        }
+        InvalidateRect(app->hwnd, 0, FALSE);
+        winxterm_diag_add_u64(&app->bridge->invalidated_pixels,
+                              (uint64_t)winxterm_logical_to_physical_pixels(app->surface.width, scale) *
+                              (uint64_t)winxterm_logical_to_physical_pixels(app->surface.height, scale));
+    } else {
+        for (int row = 0; row < snapshot.rows;) {
+            while (row < snapshot.rows &&
+                   !winxterm_render_damage_row(&app->render_damage, row)) ++row;
+            int first = row;
+            while (row < snapshot.rows &&
+                   winxterm_render_damage_row(&app->render_damage, row)) ++row;
+            if (first < row) {
+                RECT rect;
+                rect.left = 0;
+                rect.right = winxterm_logical_to_physical_pixels(app->surface.width, scale);
+                rect.top = winxterm_logical_to_physical_pixels(
+                    first * WINXTERM_CELL_HEIGHT_PIXELS, scale);
+                rect.bottom = winxterm_logical_to_physical_pixels(
+                    row * WINXTERM_CELL_HEIGHT_PIXELS, scale);
+                InvalidateRect(app->hwnd, &rect, FALSE);
+                winxterm_diag_add_u64(&app->bridge->invalidated_pixels,
+                                      (uint64_t)(rect.right - rect.left) *
+                                      (uint64_t)(rect.bottom - rect.top));
+            }
+        }
+    }
+    winxterm_render_damage_clear(&app->render_damage);
     winxterm_bridge_note_frame(app->bridge);
     if (!winxterm_bridge_bell_enabled(app->bridge) && app->ux.bell.active) {
         app->ux.bell.active = false;
@@ -1365,18 +1187,6 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
         }
     }
     winxterm_app_update_title(app);
-}
-
-static void winxterm_app_invalidate_rendered_area(WinxtermApp *app, HWND hwnd)
-{
-    if (app == 0 || hwnd == 0) {
-        return;
-    }
-    if (app->render_invalid_full) {
-        InvalidateRect(hwnd, 0, FALSE);
-        app->render_present_pending = true;
-    }
-    app->render_invalid_full = false;
 }
 
 static void winxterm_app_log_client_size(WinxtermApp *app, const char *event_name)
@@ -1439,8 +1249,7 @@ bool winxterm_app_init(WinxtermApp *app,
                        WinxtermLog *log,
                        WinxtermBridge *bridge,
                        HANDLE shutdown_event,
-                       unsigned int display_scale,
-                       unsigned int render_thread_count)
+                       unsigned int display_scale)
 {
     if (app == 0) {
         return false;
@@ -1451,9 +1260,9 @@ bool winxterm_app_init(WinxtermApp *app,
     app->log = log;
     app->bridge = bridge;
     app->shutdown_event = shutdown_event;
+    app->rendered_background_rgb = WINXTERM_DEFAULT_BACKGROUND_RGB;
     app->display_scale = winxterm_display_scale_valid(display_scale) ?
         display_scale : WINXTERM_DEFAULT_DISPLAY_SCALE;
-    app->render_thread_count = winxterm_app_clamp_render_thread_count(render_thread_count);
     app->windowed_placement.length = sizeof(app->windowed_placement);
     app->last_size_kind = SIZE_RESTORED;
     app->cursor_visible = true;
@@ -1516,16 +1325,6 @@ bool winxterm_app_init(WinxtermApp *app,
     }
 
     winxterm_bridge_set_hwnd(bridge, hwnd);
-    app->render_workers =
-        winxterm_render_worker_pool_create(instance, log, app->render_thread_count);
-    if (app->render_workers == 0) {
-        winxterm_log_writef(log,
-                            "render worker pool unavailable; using UI-thread renderer");
-    } else {
-        winxterm_log_writef(log,
-                            "render worker pool started threads=%u",
-                            app->render_workers->worker_count);
-    }
     app->cursor_timer_id = SetTimer(hwnd, WINXTERM_CURSOR_TIMER_ID, app->cursor_blink_ms, 0);
     if (app->cursor_timer_id == 0u) {
         winxterm_log_writef(log, "cursor blink timer unavailable");
@@ -1667,9 +1466,8 @@ void winxterm_app_dispose(WinxtermApp *app)
         return;
     }
 
-    winxterm_render_worker_pool_destroy(app->render_workers);
-    app->render_workers = 0;
     winxterm_render_context_dispose(&app->render_context);
+    winxterm_render_damage_dispose(&app->render_damage);
     if (app->hwnd != 0 && app->cursor_timer_id != 0u) {
         KillTimer(app->hwnd, app->cursor_timer_id);
         app->cursor_timer_id = 0u;
@@ -1745,14 +1543,21 @@ static bool winxterm_app_commit_pending_resize(WinxtermApp *app)
     LeaveCriticalSection(&app->bridge->screen_lock);
 
     if (!winxterm_app_resize_bitmap(app, logical_width, logical_height)) {
-        winxterm_log_writef(app->log,
-                            "failed to allocate bitmap for %dx%d logical area",
-                            logical_width,
-                            logical_height);
-        DestroyWindow(app->hwnd);
-        app->pending_resize = false;
+        DWORD now = GetTickCount();
+        if (app->last_resize_failure_log_tick == 0u ||
+            now - app->last_resize_failure_log_tick >= 1000u) {
+            winxterm_log_writef(app->log,
+                                "failed to allocate bitmap for %dx%d logical area",
+                                logical_width,
+                                logical_height);
+            app->last_resize_failure_log_tick = now;
+        }
+        app->pending_resize = true;
+        app->deferred_frame_causes |= WINXTERM_FRAME_CAUSE_RESIZE;
+        winxterm_app_set_frame_timer(app, WINXTERM_FRAME_THROTTLE_MS);
         return false;
     }
+    app->last_resize_failure_log_tick = 0u;
 
     WinxtermCellSize cells = winxterm_pixels_to_cells(logical_width, logical_height);
     if (size_kind == SIZE_MINIMIZED ||
@@ -1843,7 +1648,7 @@ static void winxterm_app_reset_cursor_blink(WinxtermApp *app)
     }
     app->cursor_timer_id = SetTimer(app->hwnd, WINXTERM_CURSOR_TIMER_ID, app->cursor_blink_ms, 0);
     if (!was_visible) {
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
     }
 }
 
@@ -1924,7 +1729,7 @@ static void winxterm_app_start_copy_overlay(WinxtermApp *app,
     if (app->copy_overlay_timer_id == 0u) {
         winxterm_log_writef(app->log, "copy overlay timer unavailable");
     }
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
 }
 
 static void winxterm_app_tick_copy_overlay(WinxtermApp *app)
@@ -1936,7 +1741,7 @@ static void winxterm_app_tick_copy_overlay(WinxtermApp *app)
         winxterm_app_clear_copy_overlay(app, true);
         return;
     }
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
 }
 
 static size_t winxterm_app_click_position_global_row(const WinxtermScreen *screen,
@@ -2087,7 +1892,7 @@ static bool winxterm_app_copy_selection_and_clear_format(WinxtermApp *app,
         EnterCriticalSection(&app->bridge->screen_lock);
         winxterm_ux_clear_selection(&app->ux);
         LeaveCriticalSection(&app->bridge->screen_lock);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
     }
     return ok;
 }
@@ -2099,7 +1904,7 @@ static bool winxterm_app_copy_selection_and_clear(WinxtermApp *app)
         EnterCriticalSection(&app->bridge->screen_lock);
         winxterm_ux_clear_selection(&app->ux);
         LeaveCriticalSection(&app->bridge->screen_lock);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
     }
     return ok;
 }
@@ -2134,42 +1939,57 @@ static bool winxterm_app_paste_clipboard(WinxtermApp *app)
     return ok;
 }
 
-static bool winxterm_app_damage_affects_visible(WinxtermApp *app, const WinxtermScreenDamage *damage)
+static void winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
+                                                    WinxtermRenderDamage *damage)
 {
-    if (app == 0 || app->bridge == 0 || damage == 0) {
-        return false;
-    }
-    if (damage->full_repaint) {
-        return true;
-    }
+    if (app == 0 || app->bridge == 0 || damage == 0) return;
     WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
-    if (visible.rows <= 0) {
-        return false;
+    size_t visible_words = visible.rows > 0 ? ((size_t)visible.rows + 63u) / 64u : 0u;
+    if (visible.rows != app->render_damage.row_count ||
+        visible_words != app->render_damage.word_count) {
+        (void)winxterm_render_damage_resize(&app->render_damage, visible.rows);
     }
-    if (app->bridge->screen.alternate_active) {
-        return damage->scroll_delta != 0 ||
-               (damage->dirty &&
-                damage->dirty_bottom >= 0 &&
-                damage->dirty_top < visible.rows);
+    if (damage->full) {
+        int damage_rows = damage->row_count;
+        size_t required_words = damage_rows > 0 ?
+            ((size_t)damage_rows + 63u) / 64u : 0u;
+        bool retry_storage = required_words != damage->word_count;
+        winxterm_render_damage_mark_all(&app->render_damage);
+        winxterm_render_damage_clear(damage);
+        if (retry_storage && winxterm_render_damage_resize(damage, damage_rows)) {
+            /* The full repaint has already been transferred to app damage. */
+            winxterm_render_damage_clear(damage);
+        }
+        return;
     }
-    size_t first_row =
-        winxterm_ux_primary_first_row_for_rows(&app->ux, &app->bridge->screen, visible.rows);
-    size_t last_row = first_row + (size_t)visible.rows - 1u;
-    if (damage->scroll_delta != 0) {
-        size_t bottom_first_row =
-            winxterm_screen_default_primary_first_row_for_rows(&app->bridge->screen,
-                                                               visible.rows,
-                                                               0u);
-        if (first_row == bottom_first_row) {
-            return true;
+    bool scroll_eligible = damage->scroll_valid && damage->scroll_rows > 0 &&
+        damage->scroll_rows < visible.rows && !app->bridge->screen.alternate_active &&
+        app->ux.viewport.follow_output && !winxterm_ux_has_selection(&app->ux) &&
+        !app->hover_valid && !app->copy_overlay_active &&
+        app->click_preview_kind == WINXTERM_CLICK_PREVIEW_NONE;
+    if (damage->scroll_valid) {
+        if (scroll_eligible) {
+            winxterm_render_damage_record_scroll(&app->render_damage, damage->scroll_rows);
+        } else if (app->bridge->screen.alternate_active || app->ux.viewport.follow_output) {
+            winxterm_render_damage_mark_all(&app->render_damage);
         }
     }
-    if (!damage->dirty) {
-        return false;
+    size_t first = winxterm_ux_primary_first_row_for_rows(&app->ux,
+                                                          &app->bridge->screen,
+                                                          visible.rows);
+    size_t last = visible.rows > 0 ? first + (size_t)visible.rows : first;
+    for (int row = 0; row < damage->row_count; ++row) {
+        if (!winxterm_render_damage_row(damage, row)) continue;
+        if (app->bridge->screen.alternate_active) {
+            winxterm_render_damage_mark_row(&app->render_damage, row);
+        } else {
+            size_t global = app->bridge->screen.scrollback_count + (size_t)row;
+            if (global >= first && global < last) {
+                winxterm_render_damage_mark_row(&app->render_damage, (int)(global - first));
+            }
+        }
     }
-    size_t global_top = app->bridge->screen.scrollback_count + (size_t)damage->dirty_top;
-    size_t global_bottom = app->bridge->screen.scrollback_count + (size_t)damage->dirty_bottom;
-    return global_bottom >= first_row && global_top <= last_row;
+    winxterm_render_damage_clear(damage);
 }
 
 static bool winxterm_app_output_waiting_to_commit(WinxtermApp *app)
@@ -2191,58 +2011,67 @@ static bool winxterm_app_commit_visible_changes(WinxtermApp *app, unsigned int c
         return false;
     }
 
-    app->render_damage_valid = false;
-    bool redraw = (causes & WINXTERM_FRAME_CAUSE_PRESENTATION) != 0u;
+    bool redraw = (causes & (WINXTERM_FRAME_CAUSE_PRESENTATION |
+                             WINXTERM_FRAME_CAUSE_ROW_PRESENTATION)) != 0u;
+    if ((causes & WINXTERM_FRAME_CAUSE_PRESENTATION) != 0u) {
+        winxterm_render_damage_mark_all(&app->render_damage);
+    }
     if ((causes & WINXTERM_FRAME_CAUSE_RESIZE) != 0u || app->pending_resize) {
         redraw = winxterm_app_commit_pending_resize(app) || redraw;
     }
 
     bool output_more_pending = false;
-    bool committed_content = false;
     bool presentation_changed = false;
-    for (unsigned int pass = 0u; pass < WINXTERM_OUTPUT_COMMIT_MAX_PASSES; ++pass) {
-        bool pass_content_changed = false;
-        bool pass_more_pending = false;
-        bool pass_presentation_changed = false;
+    size_t parse_turn_bytes = 0u;
+    uint64_t parse_turn_start_ns = winxterm_bridge_timestamp_ns();
+    do {
+        bool slice_presentation = false;
         if (!winxterm_bridge_commit_output(app->bridge,
-                                           WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
-                                           &pass_content_changed,
-                                           &pass_more_pending,
-                                           &pass_presentation_changed)) {
+                                           WINXTERM_PARSE_SLICE_BYTES,
+                                           0,
+                                           &output_more_pending,
+                                           &slice_presentation)) {
             winxterm_log_writef(app->log, "output commit failed");
-            output_more_pending = pass_more_pending;
             break;
         }
-        committed_content = committed_content || pass_content_changed;
-        presentation_changed = presentation_changed || pass_presentation_changed;
-        output_more_pending = pass_more_pending;
-        if (!output_more_pending) {
+        presentation_changed = presentation_changed || slice_presentation;
+        parse_turn_bytes += WINXTERM_PARSE_SLICE_BYTES;
+        uint64_t now_ns = winxterm_bridge_timestamp_ns();
+        if (!output_more_pending ||
+            parse_turn_bytes >= WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES ||
+            (now_ns >= parse_turn_start_ns &&
+             now_ns - parse_turn_start_ns >= WINXTERM_PARSE_TURN_BUDGET_NS)) {
             break;
         }
-    }
+    } while (true);
     if (presentation_changed) {
         redraw = true;
+        winxterm_render_damage_mark_all(&app->render_damage);
     }
-    if (output_more_pending || winxterm_app_output_waiting_to_commit(app)) {
-        winxterm_bridge_request_frame(app->bridge, WINXTERM_FRAME_CAUSE_CONTENT);
-        return false;
-    }
-
     EnterCriticalSection(&app->bridge->screen_lock);
     WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
     winxterm_ux_note_screen_changed_for_rows(&app->ux, &app->bridge->screen, visible.rows);
-    WinxtermScreenDamage damage;
-    bool has_damage = winxterm_screen_take_damage(&app->bridge->screen, &damage);
-    if (committed_content && has_damage) {
-        bool damage_affects_visible = winxterm_app_damage_affects_visible(app, &damage);
-        if (damage_affects_visible) {
-            app->render_damage = damage;
-            app->render_damage_valid = true;
-            redraw = true;
-        }
+    if (winxterm_render_damage_any(&app->bridge->screen.damage)) {
+        winxterm_app_merge_screen_damage_locked(app, &app->bridge->screen.damage);
+        redraw = redraw || winxterm_render_damage_any(&app->render_damage);
     }
     LeaveCriticalSection(&app->bridge->screen_lock);
-    return redraw;
+
+    bool pending = output_more_pending || winxterm_app_output_waiting_to_commit(app);
+    if (pending) {
+        winxterm_bridge_request_frame(app->bridge, WINXTERM_FRAME_CAUSE_CONTENT);
+        bool interactive = (causes & (WINXTERM_FRAME_CAUSE_PRESENTATION |
+                                      WINXTERM_FRAME_CAUSE_ROW_PRESENTATION |
+                                      WINXTERM_FRAME_CAUSE_RESIZE)) != 0u;
+        DWORD now = GetTickCount();
+        DWORD elapsed = app->last_frame_tick != 0u ? now - app->last_frame_tick :
+            WINXTERM_FRAME_THROTTLE_MS;
+        if (!interactive && elapsed < WINXTERM_FRAME_THROTTLE_MS) {
+            winxterm_app_set_frame_timer(app, WINXTERM_FRAME_THROTTLE_MS - elapsed);
+            return false;
+        }
+    }
+    return redraw || winxterm_render_damage_any(&app->render_damage);
 }
 
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes)
@@ -2270,15 +2099,6 @@ static void winxterm_app_handle_frame_due(WinxtermApp *app, HWND hwnd, unsigned 
         return;
     }
     app->deferred_frame_causes |= causes;
-    DWORD now = GetTickCount();
-    if (app->last_frame_tick != 0u) {
-        DWORD elapsed = now - app->last_frame_tick;
-        if (elapsed < WINXTERM_FRAME_THROTTLE_MS) {
-            winxterm_app_set_frame_timer(app, WINXTERM_FRAME_THROTTLE_MS - elapsed);
-            return;
-        }
-    }
-
     if (app->frame_timer_id != 0u) {
         KillTimer(hwnd, app->frame_timer_id);
         app->frame_timer_id = 0u;
@@ -2291,7 +2111,6 @@ static void winxterm_app_handle_frame_due(WinxtermApp *app, HWND hwnd, unsigned 
         return;
     }
     winxterm_app_render_main_area(app);
-    winxterm_app_invalidate_rendered_area(app, hwnd);
     app->last_frame_tick = GetTickCount();
 }
 
@@ -2741,7 +2560,7 @@ static void winxterm_app_begin_local_selection_at(WinxtermApp *app,
     LeaveCriticalSection(&app->bridge->screen_lock);
     winxterm_bridge_set_output_paused(app->bridge, true);
     SetCapture(app->hwnd);
-    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
 }
 
 static void winxterm_app_update_local_selection(WinxtermApp *app, LPARAM lparam)
@@ -2766,7 +2585,7 @@ static void winxterm_app_update_local_selection(WinxtermApp *app, LPARAM lparam)
     }
     LeaveCriticalSection(&app->bridge->screen_lock);
     if (hit) {
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
     }
 }
 
@@ -3405,39 +3224,6 @@ static void winxterm_app_show_context_menu(WinxtermApp *app, LPARAM lparam)
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)scale_menu, L"Scale");
     }
 
-    HMENU render_menu = CreatePopupMenu();
-    if (render_menu != 0) {
-        WinxtermRenderBackend backend = winxterm_bridge_backend(app->bridge);
-        AppendMenuW(render_menu,
-                    MF_STRING | (backend == WINXTERM_RENDER_BACKEND_SPANS ? MF_CHECKED : 0u),
-                    WINXTERM_MENU_RENDER_SPANS,
-                    L"Spans");
-        AppendMenuW(render_menu,
-                    MF_STRING | (backend == WINXTERM_RENDER_BACKEND_ROW_MASKS ? MF_CHECKED : 0u),
-                    WINXTERM_MENU_RENDER_ROW_MASKS,
-                    L"Row masks");
-        AppendMenuW(render_menu,
-                    MF_STRING | (backend == WINXTERM_RENDER_BACKEND_PRECLORED_CACHE ? MF_CHECKED : 0u),
-                    WINXTERM_MENU_RENDER_PRECOLORED,
-                    L"Precolored cache");
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)render_menu, L"Renderer");
-    }
-
-    HMENU render_threads_menu = CreatePopupMenu();
-    if (render_threads_menu != 0) {
-        unsigned int active_threads = winxterm_app_active_render_thread_count(app);
-        unsigned int thread_limit = winxterm_options_default_render_thread_count();
-        for (unsigned int count = 1u; count <= thread_limit; ++count) {
-            wchar_t label[16];
-            if (swprintf_s(label, 16, L"%u", count) > 0) {
-                AppendMenuW(render_threads_menu,
-                            MF_STRING | (active_threads == count ? MF_CHECKED : 0u),
-                            (UINT_PTR)(WINXTERM_MENU_RENDER_THREADS_BASE + count - 1u),
-                            label);
-            }
-        }
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)render_threads_menu, L"renderthreads");
-    }
     AppendMenuW(menu, MF_STRING, WINXTERM_MENU_DIAGNOSTICS, L"Diagnostics");
 
     POINT point;
@@ -3467,15 +3253,6 @@ static void winxterm_app_show_context_menu(WinxtermApp *app, LPARAM lparam)
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
 {
     unsigned int id = LOWORD(wparam);
-    if (id >= WINXTERM_MENU_RENDER_THREADS_BASE &&
-        id <= WINXTERM_MENU_RENDER_THREADS_LAST) {
-        unsigned int count = id - WINXTERM_MENU_RENDER_THREADS_BASE + 1u;
-        if (count <= winxterm_options_default_render_thread_count()) {
-            winxterm_app_apply_render_thread_count(app, count);
-        }
-        return;
-    }
-
     switch (id) {
     case WINXTERM_MENU_COPY:
         (void)winxterm_app_copy_selection_and_clear(app);
@@ -3504,19 +3281,62 @@ static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
     case WINXTERM_MENU_SCALE_4:
         winxterm_bridge_request_display_scale(app->bridge, 4u);
         break;
-    case WINXTERM_MENU_RENDER_SPANS:
-        winxterm_bridge_set_backend(app->bridge, WINXTERM_RENDER_BACKEND_SPANS);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
-        break;
-    case WINXTERM_MENU_RENDER_ROW_MASKS:
-        winxterm_bridge_set_backend(app->bridge, WINXTERM_RENDER_BACKEND_ROW_MASKS);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
-        break;
-    case WINXTERM_MENU_RENDER_PRECOLORED:
-        winxterm_bridge_set_backend(app->bridge, WINXTERM_RENDER_BACKEND_PRECLORED_CACHE);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
-        break;
     case WINXTERM_MENU_DIAGNOSTICS:
+        if (app->bridge != 0) {
+            WinxtermBridgeDiagnostics diagnostics;
+            winxterm_bridge_copy_diagnostics(app->bridge, &diagnostics);
+            winxterm_log_writef(
+                app->log,
+                "pipeline diagnostics: queue=%zu/%zu high=%zu copy_ns=%llu "
+                "parse_ns=%llu lock_wait_ns=%llu raster_ns=%llu scroll_ns=%llu "
+                "invalidate_to_paint_ns=%llu present_ns=%llu frames=%llu "
+                "dirty_rows=%llu full=%llu scrolls=%llu invalidated_pixels=%llu",
+                diagnostics.output_queue_count,
+                diagnostics.output_queue_capacity,
+                diagnostics.output_queue_high_water,
+                (unsigned long long)diagnostics.output_queue_copy_ns,
+                (unsigned long long)diagnostics.parser_apply_ns,
+                (unsigned long long)diagnostics.screen_lock_wait_ns,
+                (unsigned long long)diagnostics.render_raster_ns,
+                (unsigned long long)diagnostics.render_scroll_ns,
+                (unsigned long long)diagnostics.render_invalidate_to_paint_ns,
+                (unsigned long long)diagnostics.render_present_ns,
+                (unsigned long long)diagnostics.rendered_frames,
+                (unsigned long long)diagnostics.dirty_rows_rendered,
+                (unsigned long long)diagnostics.full_repaints,
+                (unsigned long long)diagnostics.scroll_blits,
+                (unsigned long long)diagnostics.invalidated_pixels);
+            winxterm_log_writef(
+                app->log,
+                "pipeline p50/p95/p99 ns: queue=%llu/%llu/%llu "
+                "parse=%llu/%llu/%llu lock=%llu/%llu/%llu "
+                "raster=%llu/%llu/%llu scroll=%llu/%llu/%llu",
+                (unsigned long long)diagnostics.output_queue_copy_latency.p50_ns,
+                (unsigned long long)diagnostics.output_queue_copy_latency.p95_ns,
+                (unsigned long long)diagnostics.output_queue_copy_latency.p99_ns,
+                (unsigned long long)diagnostics.parser_apply_latency.p50_ns,
+                (unsigned long long)diagnostics.parser_apply_latency.p95_ns,
+                (unsigned long long)diagnostics.parser_apply_latency.p99_ns,
+                (unsigned long long)diagnostics.screen_lock_wait_latency.p50_ns,
+                (unsigned long long)diagnostics.screen_lock_wait_latency.p95_ns,
+                (unsigned long long)diagnostics.screen_lock_wait_latency.p99_ns,
+                (unsigned long long)diagnostics.render_raster_latency.p50_ns,
+                (unsigned long long)diagnostics.render_raster_latency.p95_ns,
+                (unsigned long long)diagnostics.render_raster_latency.p99_ns,
+                (unsigned long long)diagnostics.render_scroll_latency.p50_ns,
+                (unsigned long long)diagnostics.render_scroll_latency.p95_ns,
+                (unsigned long long)diagnostics.render_scroll_latency.p99_ns);
+            winxterm_log_writef(
+                app->log,
+                "pipeline p50/p95/p99 ns: invalidate_to_paint=%llu/%llu/%llu "
+                "present=%llu/%llu/%llu",
+                (unsigned long long)diagnostics.invalidate_to_paint_latency.p50_ns,
+                (unsigned long long)diagnostics.invalidate_to_paint_latency.p95_ns,
+                (unsigned long long)diagnostics.invalidate_to_paint_latency.p99_ns,
+                (unsigned long long)diagnostics.render_present_latency.p50_ns,
+                (unsigned long long)diagnostics.render_present_latency.p95_ns,
+                (unsigned long long)diagnostics.render_present_latency.p99_ns);
+        }
         MessageBoxW(app->hwnd,
                     winxterm_log_enabled(app->log) ?
                         winxterm_log_path(app->log) :
@@ -4300,8 +4120,8 @@ static wchar_t *winxterm_app_screenshot_path(const wchar_t *path, bool append_bm
 
 static bool winxterm_app_macro_write_bmp_screenshot(WinxtermApp *app, const wchar_t *path)
 {
-    if (app == 0 || path == 0 || app->front_pixels == 0 || app->bitmap_width <= 0 ||
-        app->bitmap_height <= 0) {
+    if (app == 0 || path == 0 || app->surface.pixels == 0 || app->surface.width <= 0 ||
+        app->surface.height <= 0) {
         return false;
     }
     bool append_bmp = !winxterm_app_path_has_suffix(path, L".bmp");
@@ -4314,13 +4134,13 @@ static bool winxterm_app_macro_write_bmp_screenshot(WinxtermApp *app, const wcha
     BITMAPINFOHEADER info_header;
     memset(&file_header, 0, sizeof(file_header));
     memset(&info_header, 0, sizeof(info_header));
-    DWORD pixel_bytes = (DWORD)((size_t)app->bitmap_width * (size_t)app->bitmap_height * sizeof(uint32_t));
+    DWORD pixel_bytes = (DWORD)((size_t)app->surface.width * (size_t)app->surface.height * sizeof(uint32_t));
     file_header.bfType = 0x4d42u;
     file_header.bfOffBits = sizeof(file_header) + sizeof(info_header);
     file_header.bfSize = file_header.bfOffBits + pixel_bytes;
     info_header.biSize = sizeof(info_header);
-    info_header.biWidth = app->bitmap_width;
-    info_header.biHeight = -app->bitmap_height;
+    info_header.biWidth = app->surface.width;
+    info_header.biHeight = -app->surface.height;
     info_header.biPlanes = 1u;
     info_header.biBitCount = 32u;
     info_header.biCompression = BI_RGB;
@@ -4334,7 +4154,7 @@ static bool winxterm_app_macro_write_bmp_screenshot(WinxtermApp *app, const wcha
     }
     memcpy(bytes, &file_header, sizeof(file_header));
     memcpy(bytes + sizeof(file_header), &info_header, sizeof(info_header));
-    memcpy(bytes + sizeof(file_header) + sizeof(info_header), app->front_pixels, pixel_bytes);
+    memcpy(bytes + sizeof(file_header) + sizeof(info_header), app->surface.pixels, pixel_bytes);
     bool ok = winxterm_app_write_file_bytes(bmp_path, bytes, total);
     free(bytes);
     free(bmp_path);
@@ -4386,19 +4206,19 @@ static uint8_t *winxterm_app_copy_screenshot_bgr24(const uint32_t *pixels,
 
 static bool winxterm_app_macro_write_png_screenshot(WinxtermApp *app, const wchar_t *path)
 {
-    if (app == 0 || path == 0 || path[0] == L'\0' || app->front_pixels == 0 ||
-        app->bitmap_width <= 0 || app->bitmap_height <= 0) {
+    if (app == 0 || path == 0 || path[0] == L'\0' || app->surface.pixels == 0 ||
+        app->surface.width <= 0 || app->surface.height <= 0) {
         return false;
     }
-    if ((size_t)app->bitmap_width > UINT_MAX || (size_t)app->bitmap_height > UINT_MAX) {
+    if ((size_t)app->surface.width > UINT_MAX || (size_t)app->surface.height > UINT_MAX) {
         return false;
     }
 
     UINT stride = 0u;
     UINT byte_count = 0u;
-    uint8_t *pixels = winxterm_app_copy_screenshot_bgr24(app->front_pixels,
-                                                         app->bitmap_width,
-                                                         app->bitmap_height,
+    uint8_t *pixels = winxterm_app_copy_screenshot_bgr24(app->surface.pixels,
+                                                         app->surface.width,
+                                                         app->surface.height,
                                                          &stride,
                                                          &byte_count);
     if (pixels == 0) {
@@ -4442,7 +4262,7 @@ static bool winxterm_app_macro_write_png_screenshot(WinxtermApp *app, const wcha
         hr = frame->lpVtbl->Initialize(frame, property_bag);
     }
     if (SUCCEEDED(hr)) {
-        hr = frame->lpVtbl->SetSize(frame, (UINT)app->bitmap_width, (UINT)app->bitmap_height);
+        hr = frame->lpVtbl->SetSize(frame, (UINT)app->surface.width, (UINT)app->surface.height);
     }
     if (SUCCEEDED(hr)) {
         WICPixelFormatGUID pixel_format = GUID_WICPixelFormat24bppBGR;
@@ -4452,7 +4272,7 @@ static bool winxterm_app_macro_write_png_screenshot(WinxtermApp *app, const wcha
         }
     }
     if (SUCCEEDED(hr)) {
-        hr = frame->lpVtbl->WritePixels(frame, (UINT)app->bitmap_height, stride, byte_count, pixels);
+        hr = frame->lpVtbl->WritePixels(frame, (UINT)app->surface.height, stride, byte_count, pixels);
     }
     if (SUCCEEDED(hr)) {
         hr = frame->lpVtbl->Commit(frame);
@@ -4486,7 +4306,7 @@ static bool winxterm_app_macro_write_png_screenshot(WinxtermApp *app, const wcha
 static bool winxterm_app_macro_write_screenshot(void *context, const wchar_t *path)
 {
     WinxtermApp *app = (WinxtermApp *)context;
-    if (app == 0 || app->front_pixels == 0 || app->bitmap_width <= 0 || app->bitmap_height <= 0) {
+    if (app == 0 || app->surface.pixels == 0 || app->surface.width <= 0 || app->surface.height <= 0) {
         return false;
     }
     if (winxterm_app_path_has_suffix(path, L".png")) {
@@ -4735,7 +4555,7 @@ static bool winxterm_app_macro_redraw_ready(const WinxtermApp *app)
     }
 
     bool pending = app->pending_resize ||
-                   app->render_damage_valid ||
+                   winxterm_render_damage_any(&app->render_damage) ||
                    app->frame_timer_id != 0u ||
                    app->deferred_frame_causes != WINXTERM_FRAME_CAUSE_NONE;
     EnterCriticalSection(&app->bridge->input_lock);
@@ -5031,6 +4851,8 @@ static void winxterm_app_handle_macro_update(WinxtermApp *app)
 
 static void winxterm_app_paint(WinxtermApp *app)
 {
+    uint64_t paint_start_ns = winxterm_bridge_timestamp_ns();
+    bool presented_generation = false;
     PAINTSTRUCT paint;
     HDC dc = BeginPaint(app->hwnd, &paint);
     if (dc == 0) {
@@ -5045,53 +4867,24 @@ static void winxterm_app_paint(WinxtermApp *app)
         client.bottom = 0;
     }
     uint32_t background_rgb = winxterm_app_paint_background_rgb(app);
-    if (app->front_pixels != 0 && app->bitmap_width > 0 && app->bitmap_height > 0) {
-        BITMAPINFO info;
-        memset(&info, 0, sizeof(info));
-        info.bmiHeader.biSize = sizeof(info.bmiHeader);
-        info.bmiHeader.biWidth = app->bitmap_width;
-        info.bmiHeader.biHeight = -app->bitmap_height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-        info.bmiHeader.biSizeImage =
-            (DWORD)((size_t)app->bitmap_width * (size_t)app->bitmap_height * WINXTERM_BYTES_PER_PIXEL);
-
+    if (app->surface.pixels != 0 && app->surface.memory_dc != 0 &&
+        app->surface.width > 0 && app->surface.height > 0) {
         unsigned int scale = winxterm_app_display_scale(app);
-        int dest_width = app->bitmap_width;
-        int dest_height = app->bitmap_height;
+        int dest_width = app->surface.width;
+        int dest_height = app->surface.height;
         if (scale == WINXTERM_DEFAULT_DISPLAY_SCALE) {
-            StretchDIBits(dc,
-                          0,
-                          0,
-                          dest_width,
-                          dest_height,
-                          0,
-                          0,
-                          app->bitmap_width,
-                          app->bitmap_height,
-                          app->front_pixels,
-                          &info,
-                          DIB_RGB_COLORS,
-                          SRCCOPY);
+            presented_generation = BitBlt(dc, 0, 0, dest_width, dest_height,
+                                          app->surface.memory_dc, 0, 0, SRCCOPY) != 0;
         } else {
             SetStretchBltMode(dc, COLORONCOLOR);
-            dest_width = winxterm_logical_to_physical_pixels(app->bitmap_width, scale);
-            dest_height = winxterm_logical_to_physical_pixels(app->bitmap_height, scale);
-            StretchDIBits(dc,
-                          0,
-                          0,
-                          dest_width,
-                          dest_height,
-                          0,
-                          0,
-                          app->bitmap_width,
-                          app->bitmap_height,
-                          app->front_pixels,
-                          &info,
-                          DIB_RGB_COLORS,
-                          SRCCOPY);
+            dest_width = winxterm_logical_to_physical_pixels(app->surface.width, scale);
+            dest_height = winxterm_logical_to_physical_pixels(app->surface.height, scale);
+            presented_generation = StretchBlt(dc, 0, 0, dest_width, dest_height,
+                                               app->surface.memory_dc, 0, 0,
+                                               app->surface.width, app->surface.height,
+                                               SRCCOPY) != 0;
         }
+        winxterm_surface_note_gdi_access(&app->surface);
         if (dest_width < client.right) {
             RECT gutter;
             gutter.left = dest_width;
@@ -5113,9 +4906,29 @@ static void winxterm_app_paint(WinxtermApp *app)
     }
 
     EndPaint(app->hwnd, &paint);
-    if (app->render_present_pending) {
-        app->render_present_pending = false;
+    uint64_t paint_end_ns = winxterm_bridge_timestamp_ns();
+    if (paint_end_ns >= paint_start_ns) {
+        uint64_t duration_ns = paint_end_ns - paint_start_ns;
+        winxterm_diag_add_u64(&app->bridge->render_present_ns, duration_ns);
+        winxterm_timing_histogram_note(&app->bridge->render_present_histogram,
+                                       duration_ns);
+    }
+    if (presented_generation &&
+        app->surface.painted_generation != app->surface.generation) {
+        uint64_t now_ns = winxterm_bridge_timestamp_ns();
+        if (app->invalidation_start_ns != 0u && now_ns >= app->invalidation_start_ns) {
+            uint64_t duration_ns = now_ns - app->invalidation_start_ns;
+            winxterm_diag_add_u64(&app->bridge->render_invalidate_to_paint_ns,
+                                  duration_ns);
+            winxterm_timing_histogram_note(
+                &app->bridge->invalidate_to_paint_histogram, duration_ns);
+        }
+        app->invalidation_start_ns = 0u;
+        app->surface.painted_generation = app->surface.generation;
         winxterm_bridge_mark_painted(app->bridge);
+    } else if (!presented_generation &&
+               app->surface.painted_generation != app->surface.generation) {
+        InvalidateRect(app->hwnd, 0, FALSE);
     }
 }
 
@@ -5326,19 +5139,19 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
     case WM_SETFOCUS:
         app->cursor_visible = true;
         winxterm_app_send_focus_report(app, true);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
         return 0;
 
     case WM_KILLFOCUS:
         app->cursor_visible = false;
         winxterm_app_send_focus_report(app, false);
-        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
         return 0;
 
     case WM_TIMER:
         if (wparam == app->cursor_timer_id) {
             app->cursor_visible = !app->cursor_visible;
-            winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+            winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_ROW_PRESENTATION);
             return 0;
         }
         if (wparam == app->frame_timer_id) {

@@ -186,7 +186,6 @@ static void winxterm_text_parser_reset_transient(WinxtermUtf8Decoder *decoder)
     }
     decoder->codepoint = 0u;
     decoder->remaining = 0u;
-    decoder->expected = 0u;
     decoder->escape_state = WINXTERM_TEXT_ESCAPE_NONE;
     decoder->string_kind = 0u;
     decoder->string_length = 0u;
@@ -1175,8 +1174,7 @@ static bool winxterm_text_feed_escape_byte(WinxtermUtf8Decoder *decoder,
 
 static bool winxterm_text_emit_codepoint(WinxtermTerminalOpSink sink,
                                          void *sink_context,
-                                         uint32_t codepoint,
-                                         size_t source_byte_count)
+                                         uint32_t codepoint)
 {
     if (codepoint == 0x08u) {
         return winxterm_text_emit_control(sink, sink_context, WINXTERM_TERMINAL_CONTROL_BS);
@@ -1203,7 +1201,6 @@ static bool winxterm_text_emit_codepoint(WinxtermTerminalOpSink sink,
         WinxtermTerminalOp op;
         memset(&op, 0, sizeof(op));
         op.type = WINXTERM_TERMINAL_OP_PRINT;
-        op.source_byte_count = source_byte_count;
         op.data.codepoint = codepoint;
         return winxterm_text_emit(sink, sink_context, &op);
     }
@@ -1211,12 +1208,11 @@ static bool winxterm_text_emit_codepoint(WinxtermTerminalOpSink sink,
 
 static bool winxterm_text_emit_replacement(WinxtermTerminalOpSink sink, void *sink_context)
 {
-    return winxterm_text_emit_codepoint(sink, sink_context, 0xfffdu, 1u);
+    return winxterm_text_emit_codepoint(sink, sink_context, 0xfffdu);
 }
 
 static bool winxterm_text_feed_codepoint(WinxtermUtf8Decoder *decoder,
                                          uint32_t codepoint,
-                                         size_t source_byte_count,
                                          WinxtermTerminalOpSink sink,
                                          void *sink_context)
 {
@@ -1224,7 +1220,7 @@ static bool winxterm_text_feed_codepoint(WinxtermUtf8Decoder *decoder,
         decoder->escape_state = WINXTERM_TEXT_ESCAPE_ESC;
         return true;
     }
-    return winxterm_text_emit_codepoint(sink, sink_context, codepoint, source_byte_count);
+    return winxterm_text_emit_codepoint(sink, sink_context, codepoint);
 }
 
 static bool winxterm_text_feed_c1_control(WinxtermUtf8Decoder *decoder,
@@ -1315,28 +1311,25 @@ bool winxterm_text_feed_bytes_to_sink(WinxtermUtf8Decoder *decoder,
             continue;
         }
         if (byte < 0x20u) {
-            if (!winxterm_text_emit_codepoint(sink, sink_context, byte, 1u)) {
+            if (!winxterm_text_emit_codepoint(sink, sink_context, byte)) {
                 return false;
             }
             continue;
         }
         if (decoder->remaining == 0u) {
             if (byte < 0x80u) {
-                if (!winxterm_text_emit_codepoint(sink, sink_context, byte, 1u)) {
+                if (!winxterm_text_emit_codepoint(sink, sink_context, byte)) {
                     return false;
                 }
             } else if ((byte & 0xe0u) == 0xc0u) {
                 decoder->codepoint = byte & 0x1fu;
                 decoder->remaining = 1u;
-                decoder->expected = 2u;
             } else if ((byte & 0xf0u) == 0xe0u) {
                 decoder->codepoint = byte & 0x0fu;
                 decoder->remaining = 2u;
-                decoder->expected = 3u;
             } else if ((byte & 0xf8u) == 0xf0u) {
                 decoder->codepoint = byte & 0x07u;
                 decoder->remaining = 3u;
-                decoder->expected = 4u;
             } else if (!winxterm_text_emit_replacement(sink, sink_context)) {
                 return false;
             }
@@ -1345,11 +1338,8 @@ bool winxterm_text_feed_bytes_to_sink(WinxtermUtf8Decoder *decoder,
             --decoder->remaining;
             if (decoder->remaining == 0u) {
                 uint32_t codepoint = decoder->codepoint;
-                size_t source_byte_count = decoder->expected != 0u ? decoder->expected : 1u;
-                decoder->expected = 0u;
                 if (!winxterm_text_feed_codepoint(decoder,
                                                   codepoint,
-                                                  source_byte_count,
                                                   sink,
                                                   sink_context)) {
                     return false;
@@ -1357,7 +1347,6 @@ bool winxterm_text_feed_bytes_to_sink(WinxtermUtf8Decoder *decoder,
             }
         } else {
             decoder->remaining = 0u;
-            decoder->expected = 0u;
             if (!winxterm_text_emit_replacement(sink, sink_context)) {
                 return false;
             }

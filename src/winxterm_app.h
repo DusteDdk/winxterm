@@ -4,6 +4,7 @@
 #include "winxterm_bridge.h"
 #include "winxterm_log.h"
 #include "winxterm_render.h"
+#include "winxterm_surface.h"
 #include "winxterm_ux.h"
 
 #include <stdbool.h>
@@ -23,7 +24,6 @@ typedef enum WinxtermClickPreviewKind {
     WINXTERM_CLICK_PREVIEW_BOX
 } WinxtermClickPreviewKind;
 
-typedef struct WinxtermRenderWorkerPool WinxtermRenderWorkerPool;
 typedef struct WinxtermMacro WinxtermMacro;
 typedef struct WinxtermAppSessionUx WinxtermAppSessionUx;
 
@@ -33,10 +33,8 @@ typedef struct WinxtermApp {
     HWND previous_focus_hwnd;
     WinxtermLog *log;
 
-    uint32_t *front_pixels;
-    uint32_t *back_pixels;
-    int bitmap_width;
-    int bitmap_height;
+    WinxtermSurface surface;
+    uint32_t rendered_background_rgb;
     WinxtermRenderContext render_context;
     WinxtermBridge *bridge;
     HANDLE shutdown_event;
@@ -44,23 +42,22 @@ typedef struct WinxtermApp {
     uint64_t ux_session_id;
     WinxtermAppSessionUx *session_ux;
     unsigned int display_scale;
-    unsigned int render_thread_count;
-    WinxtermRenderWorkerPool *render_workers;
     WinxtermMacro *macro;
-    bool render_invalid_full;
-    bool render_present_pending;
-    bool render_damage_valid;
-    WinxtermScreenDamage render_damage;
+    WinxtermRenderDamage render_damage;
     bool rendered_cursor_valid;
     int rendered_cursor_row;
+    bool rendered_selection_valid;
+    WinxtermScreenSelectionRange rendered_selection;
     unsigned int deferred_frame_causes;
     UINT_PTR frame_timer_id;
     UINT_PTR macro_timer_id;
     UINT_PTR click_event_timer_id;
     UINT_PTR copy_overlay_timer_id;
     DWORD last_frame_tick;
+    uint64_t invalidation_start_ns;
     bool pending_resize;
     WPARAM pending_resize_kind;
+    DWORD last_resize_failure_log_tick;
 
     WinxtermScreenPrimaryAnchor scale_resize_anchor;
     bool fullscreen;
@@ -112,8 +109,7 @@ bool winxterm_app_init(WinxtermApp *app,
                        WinxtermLog *log,
                        WinxtermBridge *bridge,
                        HANDLE shutdown_event,
-                       unsigned int display_scale,
-                       unsigned int render_thread_count);
+                       unsigned int display_scale);
 int winxterm_app_run(WinxtermApp *app);
 void winxterm_app_dispose(WinxtermApp *app);
 

@@ -211,9 +211,7 @@ static DWORD WINAPI winxterm_input_thread_proc(void *context)
                            &runtime->bridge,
                            runtime->shutdown_event,
                            runtime->options != 0 ?
-                               runtime->options->display_scale : WINXTERM_DEFAULT_DISPLAY_SCALE,
-                           runtime->options != 0 ?
-                               runtime->options->render_thread_count : 1u)) {
+                               runtime->options->display_scale : WINXTERM_DEFAULT_DISPLAY_SCALE)) {
         winxterm_log_writef(runtime->log, "input thread failed to initialize window");
         runtime->input_exit_code = 1;
         SetEvent(runtime->shutdown_event);
@@ -307,8 +305,6 @@ int winxterm_threads_run(HINSTANCE instance,
         return 1;
     }
     if (options != 0) {
-        winxterm_bridge_set_backend(&runtime.bridge, options->render_backend);
-        runtime.bridge.cycle_render_backends = options->render_backend_all;
         runtime.bridge.show_render_stats_in_title = options->demo;
         winxterm_bridge_set_unpainted_line_limit(&runtime.bridge, options->unpainted_line_limit);
         if (options->macro_path != 0 &&

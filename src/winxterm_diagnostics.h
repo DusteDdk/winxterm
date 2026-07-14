@@ -24,43 +24,15 @@ typedef struct WinxtermCommandDiagnostics {
     uint64_t builtin_output_bytes;
     uint64_t external_output_bytes;
     uint64_t total_output_bytes;
-    uint64_t rendered_output_bytes;
-    uint64_t skipped_output_bytes;
     uint64_t shell_write_calls;
     uint64_t external_read_calls;
     uint64_t output_feed_calls;
     uint64_t input_enqueue_calls;
     uint64_t input_enqueue_bytes;
     uint64_t terminal_refresh_calls;
-    uint64_t update_requests;
-    uint64_t coalesced_update_requests;
-    uint64_t render_messages_handled;
     uint64_t output_batches;
     uint64_t output_batch_bytes;
     uint64_t output_batch_max_bytes;
-    uint64_t rendered_frames;
-    uint64_t rendered_cells;
-    uint64_t skipped_cells;
-    uint64_t empty_cell_skips;
-    uint64_t continuation_cell_skips;
-    uint64_t glyph_draw_calls;
-    uint64_t glyph_rendered_count;
-    uint64_t glyph_cache_hits;
-    uint64_t glyph_cache_misses;
-    uint64_t precolored_cache_hits;
-    uint64_t precolored_cache_misses;
-    uint64_t fallback_cache_hits;
-    uint64_t fallback_cache_misses;
-    uint64_t render_prepare_ns;
-    uint64_t render_snapshot_ns;
-    uint64_t render_dispatch_wait_ns;
-    uint64_t render_worker_total_ns;
-    uint64_t render_worker_max_ns;
-    uint64_t render_flip_ns;
-    uint64_t render_present_ns;
-    uint64_t dirty_rows_rendered;
-    uint64_t full_repaints;
-    uint64_t scroll_blits;
 } WinxtermCommandDiagnostics;
 
 static inline void winxterm_diag_add_u64(uint64_t *field, uint64_t value)
@@ -75,6 +47,12 @@ static inline void winxterm_diag_inc_u64(uint64_t *field)
     if (field != 0) {
         (void)InterlockedIncrement64((volatile LONG64 *)field);
     }
+}
+
+static inline uint64_t winxterm_diag_load_u64(const uint64_t *field)
+{
+    return field != 0 ? (uint64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)field, 0, 0) : 0u;
 }
 
 static inline bool winxterm_diag_format_grouped_u64(uint64_t value, wchar_t *buffer, size_t buffer_count)

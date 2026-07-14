@@ -5,8 +5,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef struct WinxtermCommandDiagnostics WinxtermCommandDiagnostics;
-
 #define WINXTERM_TERMINAL_COLUMNS 80
 #define WINXTERM_TERMINAL_ROWS 24
 
@@ -34,14 +32,24 @@ typedef struct WinxtermCellSize {
     int rows;
 } WinxtermCellSize;
 
-typedef enum WinxtermRenderBackend {
-    WINXTERM_RENDER_BACKEND_SPANS = 0,
-    WINXTERM_RENDER_BACKEND_ROW_MASKS = 1,
-    WINXTERM_RENDER_BACKEND_PRECLORED_CACHE = 2,
-    WINXTERM_RENDER_BACKEND_COUNT = 3,
-} WinxtermRenderBackend;
+typedef struct WinxtermRenderDamage {
+    uint64_t *dirty_rows;
+    size_t word_count;
+    int row_count;
+    bool full;
+    bool scroll_valid;
+    int scroll_rows;
+} WinxtermRenderDamage;
 
-#define WINXTERM_DEFAULT_RENDER_BACKEND WINXTERM_RENDER_BACKEND_ROW_MASKS
+bool winxterm_render_damage_resize(WinxtermRenderDamage *damage, int rows);
+void winxterm_render_damage_dispose(WinxtermRenderDamage *damage);
+void winxterm_render_damage_clear(WinxtermRenderDamage *damage);
+void winxterm_render_damage_mark_row(WinxtermRenderDamage *damage, int row);
+void winxterm_render_damage_mark_rows(WinxtermRenderDamage *damage, int first, int last);
+void winxterm_render_damage_mark_all(WinxtermRenderDamage *damage);
+void winxterm_render_damage_record_scroll(WinxtermRenderDamage *damage, int rows);
+bool winxterm_render_damage_row(const WinxtermRenderDamage *damage, int row);
+bool winxterm_render_damage_any(const WinxtermRenderDamage *damage);
 
 typedef struct WinxtermRenderGlyphCell {
     uint32_t glyph_index;
@@ -49,19 +57,8 @@ typedef struct WinxtermRenderGlyphCell {
     uint32_t background_rgb;
 } WinxtermRenderGlyphCell;
 
-typedef struct WinxtermPrecoloredGlyph {
-    uint32_t glyph_index;
-    uint32_t foreground_rgb;
-    uint32_t background_rgb;
-    uint32_t pixels[WINXTERM_CELL_WIDTH_PIXELS * WINXTERM_CELL_HEIGHT_PIXELS];
-} WinxtermPrecoloredGlyph;
-
 typedef struct WinxtermRenderContext {
-    WinxtermPrecoloredGlyph *precolored_glyphs;
-    size_t precolored_count;
-    size_t precolored_capacity;
     WinxtermGlyphFallbackState *glyph_fallback;
-    WinxtermCommandDiagnostics *active_diagnostics;
 } WinxtermRenderContext;
 
 static inline WinxtermCellSize winxterm_pixels_to_cells(int pixel_width, int pixel_height)
@@ -72,7 +69,6 @@ static inline WinxtermCellSize winxterm_pixels_to_cells(int pixel_width, int pix
     return size;
 }
 
-const char *winxterm_render_backend_name(WinxtermRenderBackend backend);
 uint32_t winxterm_render_bgra_from_rgb(uint32_t rgb);
 
 void winxterm_render_context_init(WinxtermRenderContext *context);
@@ -102,23 +98,19 @@ void winxterm_render_blend_rect_outline(uint32_t *pixels,
                                         int height,
                                         uint32_t rgb,
                                         uint8_t alpha);
-void winxterm_render_scroll_lines(uint32_t *front_pixels,
-                                  uint32_t *back_pixels,
+void winxterm_render_scroll_lines(uint32_t *pixels,
                                   int width,
                                   int height,
                                   int line_delta,
                                   uint32_t background_rgb);
-void winxterm_render_swap(uint32_t **front_pixels, uint32_t **back_pixels);
-void winxterm_render_draw_glyph(WinxtermRenderContext *context,
-                                uint32_t *pixels,
+void winxterm_render_draw_glyph(uint32_t *pixels,
                                 int bitmap_width,
                                 int bitmap_height,
                                 int cell_x,
                                 int cell_y,
                                 uint32_t glyph_index,
                                 uint32_t foreground_rgb,
-                                uint32_t background_rgb,
-                                WinxtermRenderBackend backend);
+                                uint32_t background_rgb);
 void winxterm_render_draw_cell_glyph(WinxtermRenderContext *context,
                                      uint32_t *pixels,
                                      int bitmap_width,
@@ -131,7 +123,6 @@ void winxterm_render_draw_cell_glyph(WinxtermRenderContext *context,
                                      uint8_t combining_count,
                                      uint8_t width_cells,
                                      uint32_t foreground_rgb,
-                                     uint32_t background_rgb,
-                                     WinxtermRenderBackend backend);
+                                     uint32_t background_rgb);
 
 #endif
