@@ -1,3 +1,5 @@
+[![Windows build](https://github.com/DusteDdk/winxterm/actions/workflows/windows-build.yml/badge.svg?event=push)](https://github.com/DusteDdk/winxterm/actions/workflows/windows-build.yml)
+
 # winxterm
 
 `winxterm` is a native Windows terminal host inspired by xterm behavior. It uses
