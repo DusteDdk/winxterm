@@ -8,6 +8,7 @@
 #include "winxterm_options.h"
 #include "winxterm_render.h"
 #include "winxterm_scale.h"
+#include "winxterm_settings.h"
 #include "winxterm_ux.h"
 #include "winxterm_window_placement.h"
 
@@ -138,6 +139,20 @@ static void winxterm_app_handle_macro_update(WinxtermApp *app);
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam);
 static SIZE winxterm_app_min_window_size(WinxtermApp *app);
 static void winxterm_app_snap_window_to_cells(WinxtermApp *app);
+static void winxterm_app_update_scrollbar(WinxtermApp *app);
+
+/* AdjustWindowRectEx ignores WS_VSCROLL, so client-to-outer sizing must add the
+   scrollbar width itself whenever the style carries one. */
+static bool winxterm_app_adjust_window_rect(RECT *rect, DWORD style, DWORD ex_style)
+{
+    if (rect == 0 || !AdjustWindowRectEx(rect, style, FALSE, ex_style)) {
+        return false;
+    }
+    if ((style & WS_VSCROLL) != 0u) {
+        rect->right += GetSystemMetrics(SM_CXVSCROLL);
+    }
+    return true;
+}
 
 static unsigned int winxterm_app_clamp_render_thread_count(unsigned int count)
 {
@@ -1439,6 +1454,10 @@ bool winxterm_app_init(WinxtermApp *app,
     app->windowed_placement.length = sizeof(app->windowed_placement);
     app->last_size_kind = SIZE_RESTORED;
     app->cursor_visible = true;
+    WinxtermSettings settings;
+    winxterm_settings_init(&settings);
+    (void)winxterm_settings_load(&settings);
+    app->scrollbar_enabled = settings.scrollbar;
     winxterm_ux_init(&app->ux);
     app->cursor_blink_ms = GetCaretBlinkTime();
     if (app->cursor_blink_ms == 0u || app->cursor_blink_ms == INFINITE) {
@@ -1459,6 +1478,9 @@ bool winxterm_app_init(WinxtermApp *app,
     }
 
     DWORD style = WS_OVERLAPPEDWINDOW;
+    if (app->scrollbar_enabled) {
+        style |= WS_VSCROLL;
+    }
     DWORD ex_style = 0;
     RECT window_rect = {0,
                         0,
@@ -1466,7 +1488,7 @@ bool winxterm_app_init(WinxtermApp *app,
                                                             app->display_scale),
                         winxterm_logical_to_physical_pixels(WINXTERM_INITIAL_PIXEL_HEIGHT,
                                                             app->display_scale)};
-    if (!AdjustWindowRectEx(&window_rect, style, FALSE, ex_style)) {
+    if (!winxterm_app_adjust_window_rect(&window_rect, style, ex_style)) {
         winxterm_log_writef(log, "failed to calculate initial window rectangle");
         return false;
     }
@@ -1505,6 +1527,7 @@ bool winxterm_app_init(WinxtermApp *app,
     if (app->cursor_timer_id == 0u) {
         winxterm_log_writef(log, "cursor blink timer unavailable");
     }
+    winxterm_app_update_scrollbar(app);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
     winxterm_window_placement_apply_startup(hwnd,
@@ -2259,7 +2282,9 @@ static void winxterm_app_handle_frame_due(WinxtermApp *app, HWND hwnd, unsigned 
     }
     causes = app->deferred_frame_causes;
     app->deferred_frame_causes = WINXTERM_FRAME_CAUSE_NONE;
-    if (!winxterm_app_commit_visible_changes(app, causes)) {
+    bool redraw = winxterm_app_commit_visible_changes(app, causes);
+    winxterm_app_update_scrollbar(app);
+    if (!redraw) {
         return;
     }
     winxterm_app_render_main_area(app);
@@ -2404,6 +2429,98 @@ static void winxterm_app_scroll_bottom(WinxtermApp *app)
     }
     winxterm_ux_scroll_to_bottom(&app->ux);
     winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+}
+
+static void winxterm_app_update_scrollbar(WinxtermApp *app)
+{
+    if (app == 0 || app->hwnd == 0 || app->bridge == 0 || !app->scrollbar_enabled) {
+        return;
+    }
+
+    size_t total_rows = 0u;
+    size_t first_row = 0u;
+    int view_rows = 0;
+    EnterCriticalSection(&app->bridge->screen_lock);
+    WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
+    view_rows = visible.rows;
+    if (!app->bridge->screen.alternate_active) {
+        total_rows = winxterm_screen_primary_view_row_count(&app->bridge->screen);
+        first_row = winxterm_ux_primary_first_row_for_rows(&app->ux,
+                                                           &app->bridge->screen,
+                                                           view_rows);
+    }
+    LeaveCriticalSection(&app->bridge->screen_lock);
+
+    SCROLLINFO info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    info.nMin = 0;
+    info.nMax = total_rows > 0u ? (int)(total_rows - 1u) : 0;
+    info.nPage = view_rows > 0 ? (UINT)view_rows : 1u;
+    info.nPos = (int)first_row;
+    (void)SetScrollInfo(app->hwnd, SB_VERT, &info, TRUE);
+}
+
+static void winxterm_app_scroll_to_row(WinxtermApp *app, int target_first_row)
+{
+    if (app == 0 || app->bridge == 0) {
+        return;
+    }
+    if (target_first_row < 0) {
+        target_first_row = 0;
+    }
+    EnterCriticalSection(&app->bridge->screen_lock);
+    WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
+    size_t bottom_first =
+        winxterm_screen_default_primary_first_row_for_rows(&app->bridge->screen,
+                                                           visible.rows,
+                                                           0u);
+    size_t offset = (size_t)target_first_row >= bottom_first ?
+        0u : bottom_first - (size_t)target_first_row;
+    winxterm_ux_scroll_to_offset_for_rows(&app->ux, &app->bridge->screen, visible.rows, offset);
+    LeaveCriticalSection(&app->bridge->screen_lock);
+    winxterm_app_request_frame(app, WINXTERM_FRAME_CAUSE_PRESENTATION);
+}
+
+static void winxterm_app_handle_vscroll(WinxtermApp *app, WPARAM wparam)
+{
+    if (app == 0 || app->hwnd == 0 || !app->scrollbar_enabled) {
+        return;
+    }
+    switch (LOWORD(wparam)) {
+    case SB_LINEUP:
+        winxterm_app_scroll_lines(app, 1);
+        break;
+    case SB_LINEDOWN:
+        winxterm_app_scroll_lines(app, -1);
+        break;
+    case SB_PAGEUP:
+        winxterm_app_scroll_page(app, 1);
+        break;
+    case SB_PAGEDOWN:
+        winxterm_app_scroll_page(app, -1);
+        break;
+    case SB_TOP:
+        winxterm_app_scroll_home(app);
+        break;
+    case SB_BOTTOM:
+        winxterm_app_scroll_bottom(app);
+        break;
+    case SB_THUMBTRACK:
+    case SB_THUMBPOSITION: {
+        SCROLLINFO info;
+        memset(&info, 0, sizeof(info));
+        info.cbSize = sizeof(info);
+        info.fMask = SIF_TRACKPOS;
+        if (GetScrollInfo(app->hwnd, SB_VERT, &info)) {
+            winxterm_app_scroll_to_row(app, info.nTrackPos);
+        }
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 static void winxterm_app_clear_scrollback(WinxtermApp *app)
@@ -3850,7 +3967,7 @@ static SIZE winxterm_app_min_window_size(WinxtermApp *app)
                                                   winxterm_app_display_scale(app))};
     DWORD style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_STYLE);
     DWORD ex_style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_EXSTYLE);
-    if (AdjustWindowRectEx(&rect, style, FALSE, ex_style)) {
+    if (winxterm_app_adjust_window_rect(&rect, style, ex_style)) {
         size.cx = rect.right - rect.left;
         size.cy = rect.bottom - rect.top;
     }
@@ -3901,7 +4018,7 @@ static void winxterm_app_snap_window_to_cells(WinxtermApp *app)
                    winxterm_rows_to_physical_pixels(rows, winxterm_app_display_scale(app))};
     DWORD style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_STYLE);
     DWORD ex_style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_EXSTYLE);
-    if (!AdjustWindowRectEx(&target, style, FALSE, ex_style)) {
+    if (!winxterm_app_adjust_window_rect(&target, style, ex_style)) {
         return;
     }
     SetWindowPos(app->hwnd,
@@ -3951,7 +4068,7 @@ static void winxterm_app_apply_display_scale(WinxtermApp *app, unsigned int scal
                    winxterm_rows_to_physical_pixels(rows, scale)};
     DWORD style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_STYLE);
     DWORD ex_style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_EXSTYLE);
-    if (!AdjustWindowRectEx(&target, style, FALSE, ex_style)) {
+    if (!winxterm_app_adjust_window_rect(&target, style, ex_style)) {
         app->scale_resize_anchor_valid = false;
         winxterm_app_handle_size(app, app->last_size_kind);
         return;
@@ -3964,6 +4081,94 @@ static void winxterm_app_apply_display_scale(WinxtermApp *app, unsigned int scal
                  target.right - target.left,
                  target.bottom - target.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+static void winxterm_app_apply_scrollbar(WinxtermApp *app, bool enabled)
+{
+    if (app == 0 || app->hwnd == 0 || app->bridge == 0) {
+        return;
+    }
+
+    if (app->scrollbar_enabled == enabled) {
+        return;
+    }
+
+    EnterCriticalSection(&app->bridge->screen_lock);
+    (void)winxterm_app_capture_scale_anchor_locked(app);
+    int columns = app->bridge->screen.columns;
+    int rows = app->bridge->screen.rows;
+    LeaveCriticalSection(&app->bridge->screen_lock);
+
+    app->scrollbar_enabled = enabled;
+    winxterm_log_writef(app->log, "scrollbar: %s", enabled ? "on" : "off");
+
+    WinxtermSettings settings;
+    winxterm_settings_init(&settings);
+    (void)winxterm_settings_load(&settings);
+    settings.scrollbar = enabled;
+    if (!winxterm_settings_save(&settings)) {
+        winxterm_log_writef(app->log, "scrollbar: settings save failed");
+    }
+
+    DWORD style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_STYLE);
+    DWORD new_style = enabled ? (style | WS_VSCROLL) : (style & ~(DWORD)WS_VSCROLL);
+    if (new_style != style) {
+        SetWindowLongPtrW(app->hwnd, GWL_STYLE, (LONG_PTR)new_style);
+    }
+    if (app->fullscreen) {
+        app->windowed_style = enabled ? (app->windowed_style | WS_VSCROLL) :
+                                        (app->windowed_style & ~(DWORD)WS_VSCROLL);
+    }
+    if (enabled) {
+        winxterm_app_update_scrollbar(app);
+    }
+
+    if (app->fullscreen || IsZoomed(app->hwnd)) {
+        SetWindowPos(app->hwnd,
+                     0,
+                     0,
+                     0,
+                     0,
+                     0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        winxterm_app_handle_size(app, app->last_size_kind);
+        return;
+    }
+
+    if (columns < 1) {
+        columns = 1;
+    }
+    if (rows < 1) {
+        rows = 1;
+    }
+    RECT target = {0,
+                   0,
+                   winxterm_columns_to_physical_pixels(columns, winxterm_app_display_scale(app)),
+                   winxterm_rows_to_physical_pixels(rows, winxterm_app_display_scale(app))};
+    DWORD ex_style = (DWORD)GetWindowLongPtrW(app->hwnd, GWL_EXSTYLE);
+    if (!winxterm_app_adjust_window_rect(&target, new_style, ex_style)) {
+        app->scale_resize_anchor_valid = false;
+        SetWindowPos(app->hwnd,
+                     0,
+                     0,
+                     0,
+                     0,
+                     0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        winxterm_app_handle_size(app, app->last_size_kind);
+        return;
+    }
+
+    SetWindowPos(app->hwnd,
+                 0,
+                 0,
+                 0,
+                 target.right - target.left,
+                 target.bottom - target.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    winxterm_app_handle_size(app, app->last_size_kind);
 }
 
 static void winxterm_app_toggle_fullscreen(WinxtermApp *app)
@@ -4949,6 +5154,18 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
         }
         return 0;
     }
+
+    case WINXTERM_WM_SCROLLBAR_UPDATE: {
+        bool scrollbar_enabled = false;
+        while (winxterm_bridge_take_pending_scrollbar(app->bridge, &scrollbar_enabled)) {
+            winxterm_app_apply_scrollbar(app, scrollbar_enabled);
+        }
+        return 0;
+    }
+
+    case WM_VSCROLL:
+        winxterm_app_handle_vscroll(app, wparam);
+        return 0;
 
     case WM_GETMINMAXINFO:
         winxterm_app_handle_minmax(app, (MINMAXINFO *)lparam);

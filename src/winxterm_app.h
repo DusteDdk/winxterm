@@ -67,6 +67,7 @@ typedef struct WinxtermApp {
     bool closing;
     bool cursor_visible;
     bool scale_resize_anchor_valid;
+    bool scrollbar_enabled;
     UINT_PTR cursor_timer_id;
     UINT_PTR bell_timer_id;
     UINT cursor_blink_ms;

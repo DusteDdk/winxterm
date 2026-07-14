@@ -36,6 +36,7 @@ add_executable(winxterm WIN32
     src/winxterm_replies.c
     src/winxterm_render.c
     src/winxterm_screen.c
+    src/winxterm_settings.c
     src/winxterm_smoke.c
     src/winxterm_text.c
     src/winxterm_terminal_session.c

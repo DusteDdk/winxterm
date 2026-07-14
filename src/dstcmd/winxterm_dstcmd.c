@@ -8296,7 +8296,7 @@ static bool winxterm_dstcmd_smoke_run_help(WinxtermDstcmdShell *shell)
         "  popd\r\n",
         "  pushd DIRECTORY\r\n",
         "  rm [-rf] PATH...\r\n",
-        "  set scale <1-100> | timing on|off|verbose | bell on|off | debuglog on|off | env SAVE | CWD save|clear\r\n",
+        "  set scale <1-100> | timing on|off|verbose | bell on|off | scrollbar on|off | debuglog on|off | env SAVE | CWD save|clear\r\n",
         "  which NAME\r\n",
         "  exit\r\n",
         "Line editor:\r\n",

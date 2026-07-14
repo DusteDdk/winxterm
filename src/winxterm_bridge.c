@@ -150,7 +150,7 @@ static bool winxterm_bridge_handle_winxterm_osc(WinxtermBridge *bridge, const ch
         return winxterm_bridge_queue_winxterm_reply(bridge,
                                                     id,
                                                     true,
-                                                    "caps=query,set-scale,set-bell,set-debuglog,playmacro");
+                                                    "caps=query,set-scale,set-bell,set-scrollbar,set-debuglog,playmacro");
     }
     if (strcmp(command, "set-scale") == 0) {
         if (!winxterm_bridge_osc_field(payload, "value", value, sizeof(value))) {
@@ -171,6 +171,19 @@ static bool winxterm_bridge_handle_winxterm_osc(WinxtermBridge *bridge, const ch
             winxterm_bridge_set_bell_enabled(bridge, true);
         } else if (strcmp(value, "off") == 0) {
             winxterm_bridge_set_bell_enabled(bridge, false);
+        } else {
+            return winxterm_bridge_queue_winxterm_reply(bridge, id, false, "invalid-value");
+        }
+        return winxterm_bridge_queue_winxterm_reply(bridge, id, true, "ok");
+    }
+    if (strcmp(command, "set-scrollbar") == 0) {
+        if (!winxterm_bridge_osc_field(payload, "value", value, sizeof(value))) {
+            return winxterm_bridge_queue_winxterm_reply(bridge, id, false, "missing-value");
+        }
+        if (strcmp(value, "on") == 0) {
+            winxterm_bridge_request_scrollbar(bridge, true);
+        } else if (strcmp(value, "off") == 0) {
+            winxterm_bridge_request_scrollbar(bridge, false);
         } else {
             return winxterm_bridge_queue_winxterm_reply(bridge, id, false, "invalid-value");
         }
@@ -729,6 +742,43 @@ bool winxterm_bridge_take_pending_display_scale(WinxtermBridge *bridge, unsigned
     }
     LeaveCriticalSection(&bridge->input_lock);
     return has_scale;
+}
+
+void winxterm_bridge_request_scrollbar(WinxtermBridge *bridge, bool enabled)
+{
+    if (bridge == 0) {
+        return;
+    }
+
+    HWND hwnd = 0;
+    bool headless = false;
+    EnterCriticalSection(&bridge->input_lock);
+    bridge->pending_scrollbar_enabled = enabled;
+    bridge->pending_scrollbar = true;
+    hwnd = bridge->hwnd;
+    headless = bridge->host_headless;
+    LeaveCriticalSection(&bridge->input_lock);
+
+    if (hwnd != 0 && !headless) {
+        PostMessageW(hwnd, WINXTERM_WM_SCROLLBAR_UPDATE, 0, 0);
+    }
+}
+
+bool winxterm_bridge_take_pending_scrollbar(WinxtermBridge *bridge, bool *enabled)
+{
+    if (bridge == 0 || enabled == 0) {
+        return false;
+    }
+
+    bool has_scrollbar = false;
+    EnterCriticalSection(&bridge->input_lock);
+    if (bridge->pending_scrollbar) {
+        *enabled = bridge->pending_scrollbar_enabled;
+        bridge->pending_scrollbar = false;
+        has_scrollbar = true;
+    }
+    LeaveCriticalSection(&bridge->input_lock);
+    return has_scrollbar;
 }
 
 static wchar_t *winxterm_bridge_clone_wide(const wchar_t *text)

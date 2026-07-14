@@ -36,7 +36,7 @@ static const WinxtermDstcmdCommandEntry winxterm_dstcmd_commands[] = {
     {L"pushd", winxterm_dstcmd_cmd_pushd, L"DIRECTORY"},
     {L"pwd", winxterm_dstcmd_cmd_pwd, L""},
     {L"rm", winxterm_dstcmd_cmd_rm, L"[-rf] PATH..."},
-    {L"set", winxterm_dstcmd_cmd_set, L"scale <1-100> | timing on|off|verbose | bell on|off | debuglog on|off | env SAVE | CWD save|clear"},
+    {L"set", winxterm_dstcmd_cmd_set, L"scale <1-100> | timing on|off|verbose | bell on|off | scrollbar on|off | debuglog on|off | env SAVE | CWD save|clear"},
     {L"which", winxterm_dstcmd_cmd_which, L"NAME"},
     {L"exit", 0, L""},
 };

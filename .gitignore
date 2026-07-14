@@ -1,6 +1,8 @@
 # Build outputs
 /build*/
 /dist*/
+/*-build*/
+/*-dist*/
 
 # Local editor/tool metadata
 /.cursor/

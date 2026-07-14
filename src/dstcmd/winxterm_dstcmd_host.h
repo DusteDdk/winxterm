@@ -8,6 +8,7 @@
 int winxterm_dstcmd_host_query(WinxtermDstcmdShell *shell);
 int winxterm_dstcmd_host_set_scale(WinxtermDstcmdShell *shell, unsigned int scale);
 int winxterm_dstcmd_host_set_bell(WinxtermDstcmdShell *shell, bool enabled);
+int winxterm_dstcmd_host_set_scrollbar(WinxtermDstcmdShell *shell, bool enabled);
 int winxterm_dstcmd_host_set_debuglog(WinxtermDstcmdShell *shell, bool enabled);
 int winxterm_dstcmd_host_playmacro(WinxtermDstcmdShell *shell, const wchar_t *path);
 

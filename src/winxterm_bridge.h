@@ -18,6 +18,7 @@
 #define WINXTERM_WM_MACRO_UPDATE (WM_APP + 3u)
 #define WINXTERM_WM_JOB_VIEW (WM_APP + 4u)
 #define WINXTERM_WM_JOB_UI (WM_APP + 5u)
+#define WINXTERM_WM_SCROLLBAR_UPDATE (WM_APP + 6u)
 #define WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY 16384u
 #define WINXTERM_BRIDGE_INPUT_MAX_CAPACITY (16u * 1024u * 1024u)
 #define WINXTERM_BRIDGE_OUTPUT_INITIAL_CAPACITY 65536u
@@ -140,6 +141,8 @@ typedef struct WinxtermBridge {
     bool pending_resize;
     unsigned int pending_display_scale;
     bool pending_scale;
+    bool pending_scrollbar_enabled;
+    bool pending_scrollbar;
     bool render_update_pending;
     unsigned int pending_frame_causes;
     bool output_paused;
@@ -194,6 +197,8 @@ bool winxterm_bridge_peek_pending_resize(WinxtermBridge *bridge, int *columns, i
 bool winxterm_bridge_ack_pending_resize(WinxtermBridge *bridge, int columns, int rows);
 void winxterm_bridge_request_display_scale(WinxtermBridge *bridge, unsigned int scale);
 bool winxterm_bridge_take_pending_display_scale(WinxtermBridge *bridge, unsigned int *scale);
+void winxterm_bridge_request_scrollbar(WinxtermBridge *bridge, bool enabled);
+bool winxterm_bridge_take_pending_scrollbar(WinxtermBridge *bridge, bool *enabled);
 bool winxterm_bridge_request_macro(WinxtermBridge *bridge, const wchar_t *path);
 wchar_t *winxterm_bridge_take_macro_request(WinxtermBridge *bridge);
 bool winxterm_bridge_queue_input(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);

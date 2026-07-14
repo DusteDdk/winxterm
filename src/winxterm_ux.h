@@ -92,6 +92,10 @@ void winxterm_ux_scroll_to_top_for_rows(WinxtermUxState *ux,
                                         const WinxtermScreen *screen,
                                         int visible_rows);
 void winxterm_ux_scroll_to_top(WinxtermUxState *ux, const WinxtermScreen *screen);
+void winxterm_ux_scroll_to_offset_for_rows(WinxtermUxState *ux,
+                                           const WinxtermScreen *screen,
+                                           int visible_rows,
+                                           size_t line_offset_from_bottom);
 size_t winxterm_ux_primary_first_row_for_rows(const WinxtermUxState *ux,
                                               const WinxtermScreen *screen,
                                               int visible_rows);

@@ -291,6 +291,14 @@ int winxterm_dstcmd_host_set_bell(WinxtermDstcmdShell *shell, bool enabled)
                                              enabled ? "on" : "off");
 }
 
+int winxterm_dstcmd_host_set_scrollbar(WinxtermDstcmdShell *shell, bool enabled)
+{
+    return winxterm_dstcmd_host_send_request(shell,
+                                             "set-scrollbar",
+                                             "value",
+                                             enabled ? "on" : "off");
+}
+
 int winxterm_dstcmd_host_set_debuglog(WinxtermDstcmdShell *shell, bool enabled)
 {
     return winxterm_dstcmd_host_send_request(shell,

@@ -10,6 +10,12 @@ XWIN_SDK_VERSION="${XWIN_SDK_VERSION:-10.0.26100}"
 XWIN_CRT_VERSION="${XWIN_CRT_VERSION:-14.44.17.14}"
 JOBS="${JOBS:-$(nproc)}"
 
+# Default generated directories are prefixed with the current username so that
+# builds run by different users against the same working tree do not clobber
+# each other's CMake caches, sysroots, or outputs. Explicit BUILD_DIR/DIST_DIR/
+# XWIN_DIR overrides are used as-is.
+BUILD_USER="${BUILD_USER:-$(id -un)}"
+
 abs_path() {
     case "$1" in
         /*) printf '%s\n' "$1" ;;
@@ -17,9 +23,9 @@ abs_path() {
     esac
 }
 
-BUILD_DIR="$(abs_path "${BUILD_DIR:-build-msvc-clang-probe}")"
-DIST_DIR="$(abs_path "${DIST_DIR:-dist-linux-msvc}")"
-XWIN_DIR="$(abs_path "${XWIN_DIR:-build-xwin}")"
+BUILD_DIR="$(abs_path "${BUILD_DIR:-${BUILD_USER}-build-msvc-clang-probe}")"
+DIST_DIR="$(abs_path "${DIST_DIR:-${BUILD_USER}-dist-linux-msvc}")"
+XWIN_DIR="$(abs_path "${XWIN_DIR:-${BUILD_USER}-build-xwin}")"
 XWIN_SYSROOT="${XWIN_DIR}/splat"
 XWIN_CACHE="${XWIN_DIR}/cache"
 TOOLCHAIN_BIN="${XWIN_DIR}/toolchain-bin"
@@ -37,21 +43,6 @@ log() {
 die() {
     printf '[build-windows-on-linux] error: %s\n' "$*" >&2
     exit 1
-}
-
-print_wine_conpty_note() {
-    cat <<'EOF'
-
-Wine ConPTY note:
-  This script builds the Windows executables; it does not use Wine to validate
-  the hosted-shell path. During the investigation, Ubuntu Wine 9.0 accepted
-  PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE but left the child process standard
-  handles NULL. As a result, winxterm.exe --demo can run under Wine while
-  winxterm.exe hosting dstshell.exe or cmd.exe can close immediately. Treat that
-  as a Wine 9.0 ConPTY implementation gap unless testing on real Windows or a
-  newer Wine build proves otherwise.
-
-EOF
 }
 
 add_missing_command_package() {
@@ -241,99 +232,7 @@ configure_and_build() {
     cp -f "$BUILD_DIR/dstshell.exe" "$DIST_DIR/dstshell.exe"
 }
 
-write_linux_tools_log() {
-    local log_file="${SCRIPT_DIR}/LinuxTools.md"
-    local tmp_file="${log_file}.tmp.$$"
-    local completed_at
-
-    completed_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-
-    if [[ -f "$log_file" ]]; then
-        awk '
-            /<!-- BEGIN build-windows-on-linux.sh generated tool log -->/ { skip = 1; next }
-            /<!-- END build-windows-on-linux.sh generated tool log -->/ { skip = 0; next }
-            !skip { print }
-        ' "$log_file" > "$tmp_file"
-    else
-        {
-            printf '# Linux Tools Investigation Log\n\n'
-            printf 'This file tracks third-party software installed, downloaded, or built during Linux-hosted Windows build work.\n'
-        } > "$tmp_file"
-    fi
-
-    cat >> "$tmp_file" <<EOF
-
-<!-- BEGIN build-windows-on-linux.sh generated tool log -->
-## build-windows-on-linux.sh generated tool log
-
-- Run completed: ${completed_at}
-- Output directory: \`${DIST_DIR}\`
-- Build directory: \`${BUILD_DIR}\`
-
-### cmake
-
-- Name: \`cmake\`
-- Why: Configures the Windows cross-build with the Ninja generator.
-- How acquired: Checked locally first; if missing, installed from Ubuntu apt with \`sudo apt-get install cmake\`.
-- Usefulness: Useful. It generated the Ninja build files for the MSVC-ABI cross-build.
-
-### ninja-build
-
-- Name: \`ninja-build\`
-- Why: Provides the Ninja build executor used by CMake.
-- How acquired: Checked locally first; if missing, installed from Ubuntu apt with \`sudo apt-get install ninja-build\`.
-- Usefulness: Useful. It built \`winxterm.exe\` and \`dstshell.exe\`.
-
-### wget and ca-certificates
-
-- Name: \`wget\` and \`ca-certificates\`
-- Why: Download the pinned \`xwin\` release over HTTPS.
-- How acquired: Checked locally first; if missing, installed from Ubuntu apt.
-- Usefulness: Useful. They allow the script to retrieve the \`xwin\` archive.
-
-### clang-19
-
-- Name: \`clang-19\`
-- Why: Provides a Linux-hosted \`clang-cl\` compatible compiler targeting \`x86_64-pc-windows-msvc\`.
-- How acquired: Checked locally first; if missing, installed from Ubuntu apt with \`sudo apt-get install clang-19\`.
-- Usefulness: Useful. It compiles the existing MSVC-oriented source without modifying the implementation.
-
-### lld-19 and llvm-19
-
-- Name: \`lld-19\` and \`llvm-19\`
-- Why: Provide \`lld-link\`, \`llvm-lib\`, \`llvm-rc\`, and \`llvm-mt\` for MSVC-style linking, static libraries, resources, and manifests.
-- How acquired: Checked locally first; if missing, installed from Ubuntu apt.
-- Usefulness: Useful. They provide the Windows/MSVC ABI build tools used by CMake.
-
-### xwin
-
-- Name: \`xwin ${XWIN_VERSION}\`
-- Why: Downloads and assembles Microsoft CRT and Windows SDK files into a Linux-hosted sysroot.
-- How acquired: Downloaded from \`${XWIN_URL}\` and verified with SHA256 \`${XWIN_SHA256}\`.
-- Usefulness: Useful. It creates \`${XWIN_SYSROOT}\`, which supplies the official Microsoft headers and import libraries needed by this build.
-
-### Microsoft CRT and Windows SDK via xwin
-
-- Name: Microsoft Visual C++ CRT \`${XWIN_CRT_VERSION}\` and Windows SDK \`${XWIN_SDK_VERSION}\`
-- Why: Provide MSVC CRT headers/libraries plus Windows SDK headers/import libraries, including the Direct2D/DirectWrite and ConPTY declarations required by \`winxterm\`.
-- How acquired: Downloaded and assembled by \`xwin --accept-license --arch x86_64 --sdk-version ${XWIN_SDK_VERSION} --crt-version ${XWIN_CRT_VERSION} splat\`.
-- Usefulness: Useful. This sysroot is what makes the feasible Linux-hosted Windows build work.
-
-### Wine ConPTY runtime note
-
-- Name: Wine ConPTY behavior note
-- Why: Runtime testing under Ubuntu Wine 9.0 exposed a ConPTY bug separate from the build.
-- How acquired: Source/runtime investigation, not installed by this build script.
-- Usefulness: Useful context. Wine 9.0 can leave pseudoconsole child standard handles NULL, so \`winxterm.exe --demo\` may work under Wine while hosting \`dstshell.exe\` or \`cmd.exe\` fails. This is not evidence that the produced executables are invalid.
-<!-- END build-windows-on-linux.sh generated tool log -->
-EOF
-
-    mv -f "$tmp_file" "$log_file"
-}
-
 main() {
-    print_wine_conpty_note
-
     if [[ -r /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -348,11 +247,9 @@ main() {
     prepare_xwin_sysroot
     prepare_toolchain_bin
     configure_and_build
-    write_linux_tools_log
 
     log "built Windows executables:"
     ls -lh "$DIST_DIR/winxterm.exe" "$DIST_DIR/dstshell.exe"
-    print_wine_conpty_note
 }
 
 main "$@"

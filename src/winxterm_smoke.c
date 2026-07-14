@@ -24,6 +24,7 @@
 #include "winxterm_terminal_session.h"
 #include "winxterm_transfer_format.h"
 #include "dstcmd/winxterm_dstcmd_job_client.h"
+#include "winxterm_settings.h"
 #include "winxterm_ux.h"
 #include "winxterm_window_placement.h"
 
@@ -1028,6 +1029,53 @@ static void winxterm_smoke_test_window_placement(WinxtermSmokeState *state)
                           "window placement center fallback should center on the monitor");
 }
 
+static void winxterm_smoke_test_settings(WinxtermSmokeState *state)
+{
+    WinxtermSettings settings;
+    winxterm_settings_init(&settings);
+    winxterm_smoke_expect(state,
+                          !settings.scrollbar,
+                          "settings scrollbar should default off");
+
+    settings.scrollbar = true;
+    char text[512];
+    winxterm_smoke_expect(state,
+                          winxterm_settings_format(&settings, text, sizeof(text)),
+                          "settings should format");
+
+    WinxtermSettings parsed;
+    winxterm_settings_init(&parsed);
+    winxterm_smoke_expect(state,
+                          winxterm_settings_parse(text, &parsed) && parsed.scrollbar,
+                          "settings scrollbar on should round trip");
+
+    winxterm_settings_init(&parsed);
+    winxterm_smoke_expect(state,
+                          winxterm_settings_parse("winxterm-settings-v1\r\n"
+                                                  "future-key=value\r\n"
+                                                  "scrollbar=on\r\n",
+                                                  &parsed) &&
+                              parsed.scrollbar,
+                          "settings parser should accept CRLF and unknown keys");
+
+    parsed.scrollbar = true;
+    winxterm_smoke_expect(state,
+                          winxterm_settings_parse("scrollbar=off\n", &parsed) &&
+                              !parsed.scrollbar,
+                          "settings parser should apply scrollbar off");
+
+    parsed.scrollbar = false;
+    winxterm_smoke_expect(state,
+                          winxterm_settings_parse("scrollbar=sideways\n", &parsed) &&
+                              !parsed.scrollbar,
+                          "settings parser should keep prior value for invalid scrollbar values");
+
+    char tiny[8];
+    winxterm_smoke_expect(state,
+                          !winxterm_settings_format(&settings, tiny, sizeof(tiny)),
+                          "settings formatting should reject tiny buffers");
+}
+
 static void winxterm_smoke_test_grouped_u64_format(WinxtermSmokeState *state)
 {
     wchar_t grouped[WINXTERM_DIAG_GROUPED_U64_CAPACITY];
@@ -1240,6 +1288,11 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                           winxterm_smoke_bytes_contain(reply, reply_count, "set-bell") &&
                               !winxterm_bridge_bell_enabled(&bridge),
                           "winxterm OSC query should advertise bell control and default off");
+    bool scrollbar_enabled = false;
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "set-scrollbar") &&
+                              !winxterm_bridge_take_pending_scrollbar(&bridge, &scrollbar_enabled),
+                          "winxterm OSC query should advertise scrollbar control with none pending");
     winxterm_bridge_clear_input(&bridge);
 
     size_t large_count = WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY + 1024u;
@@ -1494,6 +1547,65 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                               !winxterm_bridge_bell_enabled(&bridge) &&
                               !winxterm_bridge_take_bell(&bridge),
                           "set-bell off should suppress a following BEL");
+    winxterm_bridge_clear_input(&bridge);
+
+    static const uint8_t scrollbar_on[] = "\x1b]9001;winxterm;v=1;id=10;cmd=set-scrollbar;value=on\a";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, scrollbar_on, sizeof(scrollbar_on) - 1u),
+                          "bridge should enqueue set-scrollbar on control");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit set-scrollbar on control");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    bool pending_scrollbar_enabled = false;
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=10;status=ok") &&
+                              winxterm_bridge_take_pending_scrollbar(&bridge, &pending_scrollbar_enabled) &&
+                              pending_scrollbar_enabled &&
+                              !winxterm_bridge_take_pending_scrollbar(&bridge, &pending_scrollbar_enabled),
+                          "set-scrollbar on should queue a single pending enable toggle");
+    winxterm_bridge_clear_input(&bridge);
+
+    static const uint8_t scrollbar_off[] = "\x1b]9001;winxterm;v=1;id=11;cmd=set-scrollbar;value=off\a";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, scrollbar_off, sizeof(scrollbar_off) - 1u),
+                          "bridge should enqueue set-scrollbar off control");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit set-scrollbar off control");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    pending_scrollbar_enabled = true;
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=11;status=ok") &&
+                              winxterm_bridge_take_pending_scrollbar(&bridge, &pending_scrollbar_enabled) &&
+                              !pending_scrollbar_enabled,
+                          "set-scrollbar off should queue a pending disable toggle");
+    winxterm_bridge_clear_input(&bridge);
+
+    static const uint8_t scrollbar_invalid[] = "\x1b]9001;winxterm;v=1;id=12;cmd=set-scrollbar;value=maybe\a";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge, scrollbar_invalid, sizeof(scrollbar_invalid) - 1u),
+                          "bridge should enqueue invalid set-scrollbar control");
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_commit_output(&bridge,
+                                                        WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                        &content_changed,
+                                                        &more_pending,
+                                                        &presentation_changed),
+                          "bridge should commit invalid set-scrollbar control");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=12;status=error") &&
+                              !winxterm_bridge_take_pending_scrollbar(&bridge, &pending_scrollbar_enabled),
+                          "invalid set-scrollbar value should report an error and queue nothing");
     winxterm_bridge_clear_input(&bridge);
 
     winxterm_bridge_set_unpainted_line_limit(&bridge, 1u);
@@ -2725,6 +2837,21 @@ static void winxterm_smoke_test_daily_ux_helpers(WinxtermSmokeState *state)
                           winxterm_ux_primary_first_row(&ux, &screen) ==
                               winxterm_screen_default_primary_first_row(&screen, 0u),
                           "viewport bottom should use live screen rows");
+    winxterm_ux_scroll_to_offset_for_rows(&ux, &screen, screen.rows, 1u);
+    winxterm_smoke_expect(state,
+                          ux.viewport.line_offset_from_bottom == 1u &&
+                              !ux.viewport.follow_output,
+                          "viewport absolute offset should stop following output");
+    winxterm_ux_scroll_to_offset_for_rows(&ux, &screen, screen.rows, 1000u);
+    winxterm_smoke_expect(state,
+                          ux.viewport.line_offset_from_bottom ==
+                              winxterm_screen_scrollback_count(&screen),
+                          "viewport absolute offset should clamp to available history");
+    winxterm_ux_scroll_to_offset_for_rows(&ux, &screen, screen.rows, 0u);
+    winxterm_smoke_expect(state,
+                          ux.viewport.line_offset_from_bottom == 0u &&
+                              ux.viewport.follow_output,
+                          "viewport zero offset should resume following output");
 
     WinxtermUxPosition start = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 0};
     WinxtermUxPosition end = {WINXTERM_UX_ROW_PRIMARY_VISIBLE, 0u, 1};
@@ -3389,6 +3516,7 @@ int winxterm_smoke_run(void)
     winxterm_smoke_test_font_contract(&state);
     winxterm_smoke_test_log_names(&state);
     winxterm_smoke_test_window_placement(&state);
+    winxterm_smoke_test_settings(&state);
     winxterm_smoke_test_grouped_u64_format(&state);
     winxterm_smoke_test_options(&state);
     winxterm_smoke_test_job_control_contracts(&state);

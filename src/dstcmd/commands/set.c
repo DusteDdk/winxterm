@@ -12,7 +12,7 @@ static const wchar_t WINXTERM_DSTCMD_SET_SCALE_ERROR[] = L"must be an integer >=
 static const wchar_t WINXTERM_DSTCMD_SET_LOG_ERROR[] =
     L"set debuglog: failed to create %USERPROFILE%\\.winxterm\\logs debug log\r\n";
 static const wchar_t WINXTERM_DSTCMD_SET_USAGE[] =
-    L"usage: set scale <1-100> | set timing on|off|verbose | set bell on|off | set debuglog on|off | set env SAVE | set CWD save|clear\r\n";
+    L"usage: set scale <1-100> | set timing on|off|verbose | set bell on|off | set scrollbar on|off | set debuglog on|off | set env SAVE | set CWD save|clear\r\n";
 
 static const wchar_t *winxterm_dstcmd_set_username(wchar_t *username, size_t username_count)
 {
@@ -159,6 +159,17 @@ int winxterm_dstcmd_cmd_set(WinxtermDstcmdShell *shell, const WinxtermDstcmdArgv
         }
         if (wcscmp(argv->items[2], L"off") == 0) {
             return winxterm_dstcmd_host_set_bell(shell, false);
+        }
+        (void)winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_SET_USAGE);
+        return 2;
+    }
+
+    if (wcscmp(argv->items[1], L"scrollbar") == 0) {
+        if (wcscmp(argv->items[2], L"on") == 0) {
+            return winxterm_dstcmd_host_set_scrollbar(shell, true);
+        }
+        if (wcscmp(argv->items[2], L"off") == 0) {
+            return winxterm_dstcmd_host_set_scrollbar(shell, false);
         }
         (void)winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_SET_USAGE);
         return 2;

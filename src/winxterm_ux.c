@@ -290,6 +290,20 @@ void winxterm_ux_scroll_to_top(WinxtermUxState *ux, const WinxtermScreen *screen
     winxterm_ux_scroll_to_top_for_rows(ux, screen, screen != 0 ? screen->rows : 0);
 }
 
+void winxterm_ux_scroll_to_offset_for_rows(WinxtermUxState *ux,
+                                           const WinxtermScreen *screen,
+                                           int visible_rows,
+                                           size_t line_offset_from_bottom)
+{
+    if (ux == 0) {
+        return;
+    }
+    ux->viewport.line_offset_from_bottom = line_offset_from_bottom;
+    ux->viewport.follow_output = line_offset_from_bottom == 0u;
+    winxterm_ux_clamp_viewport_for_rows(ux, screen, visible_rows);
+    winxterm_ux_record_bottom_anchor_for_rows(ux, screen, visible_rows);
+}
+
 size_t winxterm_ux_primary_first_row_for_rows(const WinxtermUxState *ux,
                                               const WinxtermScreen *screen,
                                               int visible_rows)
