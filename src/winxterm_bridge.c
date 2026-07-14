@@ -133,7 +133,7 @@ static bool winxterm_bridge_handle_winxterm_osc(WinxtermBridge *bridge, const ch
 {
     char id[32];
     char command[64];
-    char value[1024];
+    char value[WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY];
     if (bridge == 0 || payload == 0 || strncmp(payload, "winxterm;", 9u) != 0 ||
         !winxterm_bridge_osc_field(payload, "id", id, sizeof(id)) ||
         !winxterm_bridge_osc_field(payload, "cmd", command, sizeof(command))) {
@@ -208,6 +208,16 @@ static bool winxterm_bridge_handle_winxterm_osc(WinxtermBridge *bridge, const ch
     if (strcmp(command, "playmacro") == 0) {
         char decoded[WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY];
         wchar_t path[32768];
+        if (winxterm_bridge_osc_field(payload, "text", value, sizeof(value))) {
+            if (!winxterm_bridge_percent_decode(value, decoded, sizeof(decoded))) {
+                return winxterm_bridge_queue_winxterm_reply(bridge, id, false, "invalid-text");
+            }
+            bool ok = winxterm_bridge_request_macro_text(bridge, decoded, strlen(decoded));
+            return winxterm_bridge_queue_winxterm_reply(bridge,
+                                                        id,
+                                                        ok,
+                                                        ok ? "ok" : "macro-queue-failed");
+        }
         if (!winxterm_bridge_osc_field(payload, "path", value, sizeof(value)) ||
             !winxterm_bridge_percent_decode(value, decoded, sizeof(decoded)) ||
             !winxterm_bridge_utf8_to_wide(decoded, path, sizeof(path) / sizeof(path[0]))) {
@@ -537,6 +547,9 @@ void winxterm_bridge_dispose(WinxtermBridge *bridge)
     bridge->transcript_count = 0u;
     free(bridge->pending_macro_path);
     bridge->pending_macro_path = 0;
+    free(bridge->pending_macro_text_utf8);
+    bridge->pending_macro_text_utf8 = 0;
+    bridge->pending_macro_text_length = 0u;
     bridge->macro_update_pending = false;
     winxterm_screen_dispose(&bridge->screen);
     if (bridge->hwnd_ready_event != 0) {
@@ -578,7 +591,8 @@ void winxterm_bridge_set_hwnd(WinxtermBridge *bridge, HWND hwnd)
         bridge->render_update_pending = false;
         bridge->pending_frame_causes = WINXTERM_FRAME_CAUSE_NONE;
         bridge->macro_update_pending = false;
-    } else if (bridge->pending_macro_path != 0 && !bridge->host_headless &&
+    } else if ((bridge->pending_macro_path != 0 || bridge->pending_macro_text_utf8 != 0) &&
+               !bridge->host_headless &&
                !bridge->macro_update_pending) {
         bridge->macro_update_pending = true;
         post_macro = true;
@@ -809,7 +823,10 @@ bool winxterm_bridge_request_macro(WinxtermBridge *bridge, const wchar_t *path)
     bool post = false;
     EnterCriticalSection(&bridge->input_lock);
     free(bridge->pending_macro_path);
+    free(bridge->pending_macro_text_utf8);
     bridge->pending_macro_path = path_copy;
+    bridge->pending_macro_text_utf8 = 0;
+    bridge->pending_macro_text_length = 0u;
     hwnd = bridge->hwnd;
     if (hwnd != 0 && !bridge->host_headless && !bridge->macro_update_pending) {
         bridge->macro_update_pending = true;
@@ -823,18 +840,56 @@ bool winxterm_bridge_request_macro(WinxtermBridge *bridge, const wchar_t *path)
     return true;
 }
 
-wchar_t *winxterm_bridge_take_macro_request(WinxtermBridge *bridge)
+bool winxterm_bridge_request_macro_text(WinxtermBridge *bridge,
+                                        const char *text_utf8,
+                                        size_t text_length)
 {
-    if (bridge == 0) {
-        return 0;
+    if (bridge == 0 || text_utf8 == 0 || text_length >= WINXTERM_TERMINAL_OSC_PAYLOAD_CAPACITY) {
+        return false;
     }
-    wchar_t *path = 0;
+    char *text_copy = (char *)calloc(text_length + 1u, sizeof(*text_copy));
+    if (text_copy == 0) {
+        return false;
+    }
+    memcpy(text_copy, text_utf8, text_length);
+
+    HWND hwnd = 0;
+    bool post = false;
     EnterCriticalSection(&bridge->input_lock);
-    path = bridge->pending_macro_path;
+    free(bridge->pending_macro_path);
+    free(bridge->pending_macro_text_utf8);
     bridge->pending_macro_path = 0;
+    bridge->pending_macro_text_utf8 = text_copy;
+    bridge->pending_macro_text_length = text_length;
+    hwnd = bridge->hwnd;
+    if (hwnd != 0 && !bridge->host_headless && !bridge->macro_update_pending) {
+        bridge->macro_update_pending = true;
+        post = true;
+    }
+    LeaveCriticalSection(&bridge->input_lock);
+
+    if (post) {
+        PostMessageW(hwnd, WINXTERM_WM_MACRO_UPDATE, 0, 0);
+    }
+    return true;
+}
+
+bool winxterm_bridge_take_macro_request(WinxtermBridge *bridge, WinxtermMacroRequest *request)
+{
+    if (bridge == 0 || request == 0) {
+        return false;
+    }
+    memset(request, 0, sizeof(*request));
+    EnterCriticalSection(&bridge->input_lock);
+    request->path = bridge->pending_macro_path;
+    request->text_utf8 = bridge->pending_macro_text_utf8;
+    request->text_length = bridge->pending_macro_text_length;
+    bridge->pending_macro_path = 0;
+    bridge->pending_macro_text_utf8 = 0;
+    bridge->pending_macro_text_length = 0u;
     bridge->macro_update_pending = false;
     LeaveCriticalSection(&bridge->input_lock);
-    return path;
+    return request->path != 0 || request->text_utf8 != 0;
 }
 
 bool winxterm_bridge_ack_pending_resize(WinxtermBridge *bridge, int columns, int rows)

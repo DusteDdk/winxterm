@@ -1,0 +1,23 @@
+set typedelayms 3
+waithost 10000
+waitms 300
+waitredraw -w
+enterstring echo ctrl-l-before
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-l-before.txt
+typestring draft survives ctrl+l
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-l-typed.txt
+keydown KEY_LEFT_CTRL
+typestring l
+keyup KEY_LEFT_CTRL
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-l-cleared.txt
+keydown KEY_LEFT_CTRL
+typestring u
+keyup KEY_LEFT_CTRL
+enterstring echo ctrl-l-after
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-l-result.txt
+histdump Z:/tmp/winxterm-ctrl-l-history.log
+exit

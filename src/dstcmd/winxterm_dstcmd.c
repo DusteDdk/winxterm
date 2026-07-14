@@ -1123,6 +1123,12 @@ static WinxtermDstcmdLinePosition winxterm_dstcmd_shell_line_position(const char
         if (offset <= before) {
             offset = before + 1u;
         }
+        if (codepoint == (uint32_t)'\n') {
+            ++position.row;
+            position.column = 0u;
+            pending_wrap = false;
+            continue;
+        }
         int width = winxterm_dstcmd_codepoint_width(codepoint);
         if (width <= 0) {
             continue;
@@ -1238,6 +1244,32 @@ static bool winxterm_dstcmd_shell_save_prompt_start_from_input_end(
            winxterm_dstcmd_shell_write_utf8(shell, "\r\x1b[3G\x1b[s");
 }
 
+static bool winxterm_dstcmd_shell_write_input_range(WinxtermDstcmdShell *shell,
+                                                    const char *line,
+                                                    size_t byte_count)
+{
+    if (shell == 0 || line == 0) {
+        return false;
+    }
+    size_t start = 0u;
+    for (size_t i = 0u; i < byte_count; ++i) {
+        if (line[i] != '\n') {
+            continue;
+        }
+        if ((i == start || winxterm_dstcmd_shell_write_bytes(
+                              shell, (const uint8_t *)line + start, i - start)) &&
+            winxterm_dstcmd_shell_write_utf8(shell, "\r\n")) {
+            start = i + 1u;
+            continue;
+        }
+        return false;
+    }
+    return start == byte_count ||
+           winxterm_dstcmd_shell_write_bytes(shell,
+                                             (const uint8_t *)line + start,
+                                             byte_count - start);
+}
+
 static bool winxterm_dstcmd_shell_move_to_line_offset(WinxtermDstcmdShell *shell, size_t byte_offset)
 {
     if (shell == 0 || !shell->prompt_cursor_saved) {
@@ -1245,9 +1277,7 @@ static bool winxterm_dstcmd_shell_move_to_line_offset(WinxtermDstcmdShell *shell
     }
     if (byte_offset > shell->line_length) byte_offset = shell->line_length;
     return winxterm_dstcmd_shell_restore_prompt_start(shell) &&
-           winxterm_dstcmd_shell_write_bytes(shell,
-                                             (const uint8_t *)shell->line,
-                                             byte_offset);
+           winxterm_dstcmd_shell_write_input_range(shell, shell->line, byte_offset);
 }
 
 static bool winxterm_dstcmd_shell_clear_rendered_prompt(WinxtermDstcmdShell *shell)
@@ -1308,12 +1338,10 @@ bool winxterm_dstcmd_shell_refresh_line(WinxtermDstcmdShell *shell)
         shell->prompt_cursor_saved = ok;
     }
     if (!ok ||
-        !winxterm_dstcmd_shell_write_bytes(shell, (const uint8_t *)shell->line, shell->line_length) ||
+        !winxterm_dstcmd_shell_write_input_range(shell, shell->line, shell->line_length) ||
         !winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PROMPT_COLOR_RESET) ||
         !winxterm_dstcmd_shell_restore_prompt_start(shell) ||
-        !winxterm_dstcmd_shell_write_bytes(shell,
-                                            (const uint8_t *)shell->line,
-                                            shell->line_cursor)) {
+        !winxterm_dstcmd_shell_write_input_range(shell, shell->line, shell->line_cursor)) {
         if (shell->output_lock_initialized) {
             LeaveCriticalSection(&shell->output_lock);
         }
@@ -4861,6 +4889,27 @@ static bool winxterm_dstcmd_shell_append_input_byte(WinxtermDstcmdShell *shell, 
     return winxterm_dstcmd_shell_refresh_line(shell);
 }
 
+static bool winxterm_dstcmd_shell_line_has_open_quote(const WinxtermDstcmdShell *shell)
+{
+    if (shell == 0) {
+        return false;
+    }
+    char quote = '\0';
+    for (size_t i = 0u; i < shell->line_length; ++i) {
+        char ch = shell->line[i];
+        if (ch == '\\' && quote != '\'' && i + 1u < shell->line_length) {
+            ++i;
+            continue;
+        }
+        if ((ch == '\'' || ch == '"') && quote == '\0') {
+            quote = ch;
+        } else if (quote != '\0' && ch == quote) {
+            quote = '\0';
+        }
+    }
+    return quote != '\0';
+}
+
 static void winxterm_dstcmd_shell_history_previous(WinxtermDstcmdShell *shell)
 {
     if (shell == 0) {
@@ -6334,6 +6383,9 @@ static bool winxterm_dstcmd_shell_handle_input_byte(WinxtermDstcmdShell *shell, 
         return winxterm_dstcmd_history_search_enter(shell);
     }
     if (byte == '\r' || byte == '\n') {
+        if (winxterm_dstcmd_shell_line_has_open_quote(shell)) {
+            return winxterm_dstcmd_shell_append_input_byte(shell, (uint8_t)'\n');
+        }
         uint64_t command_entered_ns = winxterm_dstcmd_shell_timestamp_ns();
         return winxterm_dstcmd_shell_submit_current_line(shell, command_entered_ns);
     }
@@ -6656,6 +6708,23 @@ static bool winxterm_dstcmd_smoke_run_line_editing(WinxtermDstcmdShell *shell)
     if (position.row != 0u || position.column != 3u || strlen(emoji) != 4u) {
         return false;
     }
+
+    static const char multiline_prefix[] = "playmacro -i \"typestring one";
+    static const char multiline_after_enter[] = "playmacro -i \"typestring one\n";
+    if (!winxterm_dstcmd_smoke_set_line(shell, multiline_prefix) ||
+        !winxterm_dstcmd_shell_handle_input_byte(shell, '\r') ||
+        strcmp(shell->line, multiline_after_enter) != 0 ||
+        shell->line_cursor != strlen(multiline_after_enter)) {
+        return false;
+    }
+    position = winxterm_dstcmd_shell_line_position(shell->line,
+                                                   shell->line_length,
+                                                   80,
+                                                   0u);
+    if (position.row != 1u || position.column != 0u) {
+        return false;
+    }
+    winxterm_dstcmd_shell_clear_line(shell);
 
     return true;
 }
@@ -8115,7 +8184,7 @@ static bool winxterm_dstcmd_smoke_run_help(WinxtermDstcmdShell *shell)
         "  highlight [-i] STRING...\r\n",
         "  ls [-ltah] [PATH]...\r\n",
         "  mv [-f] SOURCE... DESTINATION\r\n",
-        "  playmacro FILENAME\r\n",
+        "  playmacro FILENAME | -i MACRO\r\n",
         "  popd\r\n",
         "  pushd DIRECTORY\r\n",
         "  rm [-rf] PATH...\r\n",
@@ -8123,6 +8192,7 @@ static bool winxterm_dstcmd_smoke_run_help(WinxtermDstcmdShell *shell)
         "  which NAME\r\n",
         "  exit\r\n",
         "Line editor:\r\n",
+        "  Enter inside an open quote: insert a newline and continue editing\r\n",
         "  Ctrl+R: search command history; type to filter, Up/Down select, Enter insert, Ctrl+C abort, Ctrl+R recent/best, Alt+R fuzzy/contains\r\n",
         "Redirection:\r\n",
         "  command > FILE: write stdout to FILE, creating or truncating it\r\n",
@@ -8338,6 +8408,19 @@ int winxterm_dstcmd_smoke_run(void)
               wcscmp(argv.items[1], L"two words") == 0 &&
               wcscmp(argv.items[2], L"literal") == 0 &&
               wcscmp(argv.items[3], L"a b") == 0;
+    winxterm_dstcmd_argv_dispose(&argv);
+    if (!ok) {
+        return 1;
+    }
+    if (!winxterm_dstcmd_parse_line(L"playmacro -i \"typestring one\nwaitms 1\"",
+                                    &argv,
+                                    error,
+                                    128u)) {
+        return 1;
+    }
+    ok = argv.count == 3 &&
+         wcscmp(argv.items[1], L"-i") == 0 &&
+         wcscmp(argv.items[2], L"typestring one\nwaitms 1") == 0;
     winxterm_dstcmd_argv_dispose(&argv);
     if (!ok) {
         return 1;

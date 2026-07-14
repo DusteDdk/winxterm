@@ -4,7 +4,9 @@
 #include "dstcmd/winxterm_dstcmd.h"
 #include "dstcmd/winxterm_dstcmd_host.h"
 
-static const wchar_t WINXTERM_DSTCMD_PLAYMACRO_USAGE[] = L"usage: playmacro FILENAME\r\n";
+static const wchar_t WINXTERM_DSTCMD_PLAYMACRO_USAGE[] =
+    L"usage: playmacro FILENAME\r\n"
+    L"       playmacro -i MACRO\r\n";
 static const wchar_t WINXTERM_DSTCMD_PLAYMACRO_ERROR[] = L"playmacro: failed to start macro\r\n";
 
 static void winxterm_dstcmd_playmacro_write_not_found(WinxtermDstcmdShell *shell, const wchar_t *path)
@@ -16,7 +18,18 @@ static void winxterm_dstcmd_playmacro_write_not_found(WinxtermDstcmdShell *shell
 
 int winxterm_dstcmd_cmd_playmacro(WinxtermDstcmdShell *shell, const WinxtermDstcmdArgv *argv)
 {
-    if (shell == 0 || argv == 0 || argv->count != 2 || argv->items[1] == 0) {
+    if (shell == 0 || argv == 0) {
+        return 2;
+    }
+    if (argv->count == 3 && argv->items[1] != 0 && argv->items[2] != 0 &&
+        wcscmp(argv->items[1], L"-i") == 0) {
+        if (winxterm_dstcmd_host_playmacro_text(shell, argv->items[2]) != 0) {
+            (void)winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PLAYMACRO_ERROR);
+            return 1;
+        }
+        return 0;
+    }
+    if (argv->count != 2 || argv->items[1] == 0) {
         if (shell != 0) {
             (void)winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PLAYMACRO_USAGE);
         }

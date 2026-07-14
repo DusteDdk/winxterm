@@ -1,0 +1,50 @@
+set typedelayms 3
+waithost 10000
+waitms 300
+waitredraw -w
+typestring playmacro -i "enterstring echo inline playback ok
+keypress KEY_ENTER 10 50
+typestring waitredraw -w
+keypress KEY_ENTER 10 50
+typestring celldump Z:/tmp/winxterm-inline-result.txt
+keypress KEY_ENTER 10 50
+typestring histdump Z:/tmp/winxterm-inline-history.log
+keypress KEY_ENTER 10 50
+typestring keydown KEY_LEFT_CTRL
+keypress KEY_ENTER 10 50
+typestring typestring l
+keypress KEY_ENTER 10 50
+typestring keyup KEY_LEFT_CTRL
+keypress KEY_ENTER 10 50
+typestring waitredraw -w
+keypress KEY_ENTER 10 50
+typestring keydown KEY_LEFT_CTRL
+keypress KEY_ENTER 10 50
+typestring typestring r
+keypress KEY_ENTER 10 50
+typestring keyup KEY_LEFT_CTRL
+keypress KEY_ENTER 10 50
+typestring waitredraw -w
+keypress KEY_ENTER 10 50
+typestring celldump Z:/tmp/winxterm-inline-search-empty.txt
+keypress KEY_ENTER 10 50
+typestring keydown KEY_LEFT_ALT
+keypress KEY_ENTER 10 50
+typestring typestring r
+keypress KEY_ENTER 10 50
+typestring keyup KEY_LEFT_ALT
+keypress KEY_ENTER 10 50
+typestring typestring zzzz
+keypress KEY_ENTER 10 50
+typestring typestring -no
+keypress KEY_ENTER 10 50
+typestring typestring -match
+keypress KEY_ENTER 10 50
+typestring waitredraw -w
+keypress KEY_ENTER 10 50
+typestring celldump Z:/tmp/winxterm-inline-search-nomatch.txt
+keypress KEY_ENTER 10 50
+typestring keypress KEY_ESCAPE
+keypress KEY_ENTER 10 50
+typestring exit"
+keypress KEY_ENTER 10 100

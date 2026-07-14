@@ -38,6 +38,7 @@ static bool winxterm_dstcmd_help_write_ctrl_r(WinxtermDstcmdShell *shell)
 {
     return winxterm_dstcmd_shell_write_wide(
         shell,
+        L"  Enter inside an open quote: insert a newline and continue editing\r\n"
         L"  Ctrl+R: search command history; type to filter, Up/Down select, "
         L"Enter insert, Ctrl+C abort, Ctrl+R recent/best, Alt+R fuzzy/contains\r\n");
 }

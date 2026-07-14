@@ -27,8 +27,9 @@ static const wchar_t WINXTERM_HELP_TEXT[] =
 
 static const wchar_t WINXTERM_MACRO_HELP_TEXT[] =
     L"Usage: winxterm.exe --macro <filename>\n"
-    L"       playmacro FILENAME\n\n"
-    L"Macro files are parsed as text lines. A command ends at the first unescaped\n"
+    L"       playmacro FILENAME\n"
+    L"       playmacro -i \"MACRO COMMANDS\"\n\n"
+    L"Macro input is parsed as text lines. A command ends at the first unescaped\n"
     L"semicolon outside double quotes, single quotes, or backtick quotes. A line\n"
     L"ending in backslash continues onto the next physical line.\n\n"
     L"Supported macro commands:\n\n"

@@ -97,6 +97,12 @@ typedef struct WinxtermBridgeDiagnostics {
     unsigned int headless_output_lines;
 } WinxtermBridgeDiagnostics;
 
+typedef struct WinxtermMacroRequest {
+    wchar_t *path;
+    char *text_utf8;
+    size_t text_length;
+} WinxtermMacroRequest;
+
 typedef struct WinxtermBridge {
     WinxtermLog *log;
     WinxtermJobManager job_manager;
@@ -149,6 +155,8 @@ typedef struct WinxtermBridge {
     bool macro_update_pending;
     WinxtermJobCoordinator job_coordinator;
     wchar_t *pending_macro_path;
+    char *pending_macro_text_utf8;
+    size_t pending_macro_text_length;
     unsigned int resize_request_count;
     unsigned int resize_coalesced_count;
     unsigned int resize_taken_count;
@@ -200,7 +208,10 @@ bool winxterm_bridge_take_pending_display_scale(WinxtermBridge *bridge, unsigned
 void winxterm_bridge_request_scrollbar(WinxtermBridge *bridge, bool enabled);
 bool winxterm_bridge_take_pending_scrollbar(WinxtermBridge *bridge, bool *enabled);
 bool winxterm_bridge_request_macro(WinxtermBridge *bridge, const wchar_t *path);
-wchar_t *winxterm_bridge_take_macro_request(WinxtermBridge *bridge);
+bool winxterm_bridge_request_macro_text(WinxtermBridge *bridge,
+                                        const char *text_utf8,
+                                        size_t text_length);
+bool winxterm_bridge_take_macro_request(WinxtermBridge *bridge, WinxtermMacroRequest *request);
 bool winxterm_bridge_queue_input(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
 bool winxterm_bridge_queue_reply(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
 bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,

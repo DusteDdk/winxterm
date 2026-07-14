@@ -4912,23 +4912,46 @@ static void winxterm_app_handle_macro_update(WinxtermApp *app)
         app->macro_timer_id = 0u;
     }
 
-    wchar_t *path = 0;
-    while ((path = winxterm_bridge_take_macro_request(app->bridge)) != 0) {
+    WinxtermMacroRequest request;
+    while (winxterm_bridge_take_macro_request(app->bridge, &request)) {
         wchar_t error[WINXTERM_LOG_PATH_CAPACITY + 64u];
         error[0] = L'\0';
-        if (!winxterm_macro_load_file(app->macro, path, error, sizeof(error) / sizeof(error[0]))) {
-            winxterm_log_writef(app->log,
-                                "macro load failed path=%ls error=%ls",
-                                path,
-                                error[0] != L'\0' ? error : L"(unknown)");
+        bool loaded = request.path != 0 ?
+            winxterm_macro_load_file(app->macro,
+                                     request.path,
+                                     error,
+                                     sizeof(error) / sizeof(error[0])) :
+            winxterm_macro_parse_text_utf8(app->macro,
+                                           request.text_utf8,
+                                           request.text_length,
+                                           error,
+                                           sizeof(error) / sizeof(error[0]));
+        if (!loaded) {
+            if (request.path != 0) {
+                winxterm_log_writef(app->log,
+                                    "macro load failed path=%ls error=%ls",
+                                    request.path,
+                                    error[0] != L'\0' ? error : L"(unknown)");
+            } else {
+                winxterm_log_writef(app->log,
+                                    "inline macro load failed error=%ls",
+                                    error[0] != L'\0' ? error : L"(unknown)");
+            }
             if (error[0] != L'\0') {
                 (void)winxterm_app_write_terminal_wide_line(app, error);
                 (void)winxterm_app_macro_render_barrier(app);
             }
         } else {
-            winxterm_log_writef(app->log, "macro started path=%ls", path);
+            if (request.path != 0) {
+                winxterm_log_writef(app->log, "macro started path=%ls", request.path);
+            } else {
+                winxterm_log_writef(app->log,
+                                    "inline macro started bytes=%zu",
+                                    request.text_length);
+            }
         }
-        free(path);
+        free(request.path);
+        free(request.text_utf8);
     }
 
     if (!winxterm_macro_running(app->macro)) {

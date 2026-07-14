@@ -1298,6 +1298,37 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
                           "winxterm OSC query should advertise scrollbar control with none pending");
     winxterm_bridge_clear_input(&bridge);
 
+    static const uint8_t inline_macro_control[] =
+        "\x1b]9001;winxterm;v=1;id=71;cmd=playmacro;"
+        "text=typestring%20one%0Awaitms%201\a";
+    winxterm_smoke_expect(state,
+                          winxterm_bridge_enqueue_output(&bridge,
+                                                         inline_macro_control,
+                                                         sizeof(inline_macro_control) - 1u) &&
+                              winxterm_bridge_commit_output(&bridge,
+                                                           WINXTERM_BRIDGE_OUTPUT_COMMIT_MAX_BYTES,
+                                                           &control_content_changed,
+                                                           &control_more_pending,
+                                                           &control_presentation_changed),
+                          "bridge should accept an inline macro control request");
+    reply_count = winxterm_bridge_read_input(&bridge, reply, sizeof(reply));
+    WinxtermMacroRequest macro_request;
+    bool took_macro_request = winxterm_bridge_take_macro_request(&bridge, &macro_request);
+    static const char expected_inline_macro[] = "typestring one\nwaitms 1";
+    winxterm_smoke_expect(state,
+                          winxterm_smoke_bytes_contain(reply, reply_count, "id=71;status=ok") &&
+                              took_macro_request &&
+                              macro_request.path == 0 &&
+                              macro_request.text_utf8 != 0 &&
+                              macro_request.text_length == sizeof(expected_inline_macro) - 1u &&
+                              memcmp(macro_request.text_utf8,
+                                     expected_inline_macro,
+                                     sizeof(expected_inline_macro) - 1u) == 0,
+                          "inline macro control should preserve decoded multiline text");
+    free(macro_request.path);
+    free(macro_request.text_utf8);
+    winxterm_bridge_clear_input(&bridge);
+
     size_t large_count = WINXTERM_BRIDGE_INPUT_INITIAL_CAPACITY + 1024u;
     uint8_t *large = (uint8_t *)malloc(large_count);
     winxterm_smoke_expect(state, large != 0, "bridge hardening large input buffer should allocate");

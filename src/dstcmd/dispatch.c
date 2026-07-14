@@ -31,7 +31,7 @@ static const WinxtermDstcmdCommandEntry winxterm_dstcmd_commands[] = {
     {L"job", winxterm_dstcmd_cmd_job, L"[ls]"},
     {L"ls", winxterm_dstcmd_cmd_ls, L"[-ltah] [PATH]..."},
     {L"mv", winxterm_dstcmd_cmd_mv, L"[-f] SOURCE... DESTINATION"},
-    {L"playmacro", winxterm_dstcmd_cmd_playmacro, L"FILENAME"},
+    {L"playmacro", winxterm_dstcmd_cmd_playmacro, L"FILENAME | -i MACRO"},
     {L"popd", winxterm_dstcmd_cmd_popd, L""},
     {L"pushd", winxterm_dstcmd_cmd_pushd, L"DIRECTORY"},
     {L"pwd", winxterm_dstcmd_cmd_pwd, L""},

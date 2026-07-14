@@ -317,3 +317,14 @@ int winxterm_dstcmd_host_playmacro(WinxtermDstcmdShell *shell, const wchar_t *pa
     free(utf8);
     return status;
 }
+
+int winxterm_dstcmd_host_playmacro_text(WinxtermDstcmdShell *shell, const wchar_t *text)
+{
+    char *utf8 = winxterm_dstcmd_host_wide_to_utf8(text);
+    if (utf8 == 0) {
+        return 1;
+    }
+    int status = winxterm_dstcmd_host_send_request(shell, "playmacro", "text", utf8);
+    free(utf8);
+    return status;
+}

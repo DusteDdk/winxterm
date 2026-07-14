@@ -1,0 +1,21 @@
+set typedelayms 3
+waithost 10000
+waitms 300
+waitredraw -w
+enterstring ls CMakeLists.txt
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-r-after-ls.txt
+keydown KEY_LEFT_CTRL
+typestring r
+keyup KEY_LEFT_CTRL
+typestring ls CMake
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-r-search.txt
+keypress KEY_ENTER 10 100
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-r-inserted.txt
+keypress KEY_ENTER 10 100
+waitredraw -w
+celldump Z:/tmp/winxterm-ctrl-r-executed.txt
+histdump Z:/tmp/winxterm-ctrl-r-history.log
+exit
