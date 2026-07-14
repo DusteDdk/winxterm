@@ -4581,7 +4581,34 @@ static bool winxterm_app_dump_row(WinxtermAppDumpBuffer *buffer, const WinxtermS
            winxterm_app_dump_buffer_append_byte(buffer, '\n');
 }
 
-static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *path)
+static bool winxterm_app_dump_row_exact(WinxtermAppDumpBuffer *buffer,
+                                        const WinxtermScreenRowView *row)
+{
+    if (buffer == 0 || row == 0 || row->cells == 0 || row->columns <= 0) {
+        return true;
+    }
+    for (int column = 0; column < row->columns; ++column) {
+        const WinxtermScreenCell *cell = row->cells + column;
+        if (cell->continuation ||
+            (cell->attribute_flags & WINXTERM_SCREEN_CELL_INVISIBLE) != 0u) {
+            if (!winxterm_app_dump_buffer_append_byte(buffer, ' ')) return false;
+            continue;
+        }
+        if (!winxterm_app_dump_buffer_append_codepoint(buffer, cell->codepoint)) return false;
+        for (uint8_t i = 0u; i < cell->combining_count; ++i) {
+            if (!winxterm_app_dump_buffer_append_codepoint(buffer,
+                                                           cell->combining_codepoints[i])) {
+                return false;
+            }
+        }
+    }
+    return winxterm_app_dump_buffer_append_byte(buffer, '\r') &&
+           winxterm_app_dump_buffer_append_byte(buffer, '\n');
+}
+
+static bool winxterm_app_macro_write_grid_dump(void *context,
+                                               const wchar_t *path,
+                                               bool exact)
 {
     WinxtermApp *app = (WinxtermApp *)context;
     if (app == 0 || app->bridge == 0 || path == 0 || path[0] == L'\0') {
@@ -4597,7 +4624,8 @@ static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *pa
         for (int row_index = 0; ok && row_index < rows; ++row_index) {
             WinxtermScreenRowView row;
             if (winxterm_screen_get_alternate_view_row(&app->bridge->screen, (size_t)row_index, &row)) {
-                ok = winxterm_app_dump_row(&buffer, &row);
+                ok = exact ? winxterm_app_dump_row_exact(&buffer, &row) :
+                             winxterm_app_dump_row(&buffer, &row);
             }
         }
     } else {
@@ -4611,7 +4639,8 @@ static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *pa
             }
             WinxtermScreenRowView row;
             if (winxterm_screen_get_primary_view_row(&app->bridge->screen, global_row, &row)) {
-                ok = winxterm_app_dump_row(&buffer, &row);
+                ok = exact ? winxterm_app_dump_row_exact(&buffer, &row) :
+                             winxterm_app_dump_row(&buffer, &row);
             }
         }
     }
@@ -4621,6 +4650,16 @@ static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *pa
     }
     free(buffer.data);
     return ok;
+}
+
+static bool winxterm_app_macro_write_screendump(void *context, const wchar_t *path)
+{
+    return winxterm_app_macro_write_grid_dump(context, path, false);
+}
+
+static bool winxterm_app_macro_write_celldump(void *context, const wchar_t *path)
+{
+    return winxterm_app_macro_write_grid_dump(context, path, true);
 }
 
 static bool winxterm_app_macro_write_histdump(void *context, const wchar_t *path)
@@ -4903,6 +4942,7 @@ static void winxterm_app_handle_macro_update(WinxtermApp *app)
     callbacks.key_up = winxterm_app_macro_queue_key_up;
     callbacks.write_screenshot = winxterm_app_macro_write_screenshot;
     callbacks.write_screendump = winxterm_app_macro_write_screendump;
+    callbacks.write_celldump = winxterm_app_macro_write_celldump;
     callbacks.write_histdump = winxterm_app_macro_write_histdump;
     callbacks.wait_redraw = winxterm_app_macro_wait_redraw;
     callbacks.wait_host = winxterm_app_macro_wait_host;

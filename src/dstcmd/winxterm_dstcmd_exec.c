@@ -136,10 +136,8 @@ static bool winxterm_dstcmd_starts_dot_slash(const wchar_t *command)
 
 static size_t winxterm_dstcmd_exec_title_room(const WinxtermDstcmdShell *shell)
 {
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
-    size_t room = columns > 0 ? (size_t)columns : 80u;
-    return room > WINXTERM_DSTCMD_CLIENT_TITLE_MAX_COLUMNS ?
-        WINXTERM_DSTCMD_CLIENT_TITLE_MAX_COLUMNS : room;
+    (void)shell;
+    return WINXTERM_DSTCMD_CLIENT_TITLE_MAX_COLUMNS;
 }
 
 static size_t winxterm_dstcmd_exec_wide_columns(const wchar_t *text)

@@ -27,10 +27,6 @@
 #define WINXTERM_DSTCMD_PROMPT_COLOR_RED L"\x1b[38;2;255;0;0m"
 #define WINXTERM_DSTCMD_PROMPT_COLOR_WHITE L"\x1b[38;2;255;255;255m"
 #define WINXTERM_DSTCMD_PROMPT_COLOR_BLUE L"\x1b[38;2;0;128;255m"
-#define WINXTERM_DSTCMD_PROMPT_WRAP_FIRST_COLUMNS 3u
-#define WINXTERM_DSTCMD_PROMPT_WRAP_NEXT_COLUMNS 3u
-#define WINXTERM_DSTCMD_PROMPT_WRAP_FIRST L" ->"
-#define WINXTERM_DSTCMD_PROMPT_WRAP_NEXT L"<- "
 #define WINXTERM_DSTCMD_COMPLETION_HIGHLIGHT_ON L"\x1b[1;48;2;0;0;0m"
 #define WINXTERM_DSTCMD_COMPLETION_HIGHLIGHT_OFF L"\x1b[22;49m"
 #define WINXTERM_DSTCMD_COMPLETION_COLOR_BUILTIN L"\x1b[38;2;255;165;0m"
@@ -50,8 +46,6 @@
 #define WINXTERM_DSTCMD_TITLE_ELLIPSIS L"...."
 #define WINXTERM_DSTCMD_TITLE_ELLIPSIS_COLUMNS 4u
 #define WINXTERM_DSTCMD_TITLE_MIN_COMPONENT_COLUMNS 5u
-#define WINXTERM_DSTCMD_TITLE_RESERVED_COLUMNS 64u
-#define WINXTERM_DSTCMD_TITLE_RESERVE_PAD L'\x2800'
 #define WINXTERM_DSTCMD_HISTORY_DB_RETRY_ATTEMPTS 10u
 #define WINXTERM_DSTCMD_HISTORY_DB_RETRY_INTERVAL_MS 200u
 #define WINXTERM_DSTCMD_HISTORY_DB_BUSY_TIMEOUT_MS 1
@@ -439,43 +433,6 @@ static size_t winxterm_dstcmd_title_columns(const wchar_t *text)
     return text != 0 ? winxterm_dstcmd_wide_range_columns(text, 0u, wcslen(text)) : 0u;
 }
 
-static size_t winxterm_dstcmd_prompt_line_limit(int columns)
-{
-    if (columns <= 1) {
-        return 1u;
-    }
-    return (size_t)columns - 1u;
-}
-
-static size_t winxterm_dstcmd_wide_fit_columns(const wchar_t *text,
-                                               size_t start,
-                                               size_t end,
-                                               size_t max_columns)
-{
-    if (text == 0 || start >= end || max_columns == 0u) {
-        return start;
-    }
-    size_t columns = 0u;
-    size_t offset = start;
-    while (offset < end) {
-        uint32_t codepoint = 0u;
-        size_t next = offset;
-        (void)winxterm_dstcmd_wide_decode_next(text, end, &next, &codepoint);
-        if (next <= offset) {
-            next = offset + 1u;
-        }
-        int width = winxterm_dstcmd_codepoint_width(codepoint);
-        if (width > 0 && columns + (size_t)width > max_columns) {
-            break;
-        }
-        if (width > 0) {
-            columns += (size_t)width;
-        }
-        offset = next;
-    }
-    return offset;
-}
-
 static bool winxterm_dstcmd_shell_write_wide_range(WinxtermDstcmdShell *shell,
                                                    const wchar_t *text,
                                                    size_t start,
@@ -498,9 +455,8 @@ static bool winxterm_dstcmd_shell_write_wide_range(WinxtermDstcmdShell *shell,
 
 static size_t winxterm_dstcmd_title_room(const WinxtermDstcmdShell *shell)
 {
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
-    size_t room = columns > 0 ? (size_t)columns : 80u;
-    return room > WINXTERM_DSTCMD_TITLE_MAX_COLUMNS ? WINXTERM_DSTCMD_TITLE_MAX_COLUMNS : room;
+    (void)shell;
+    return WINXTERM_DSTCMD_TITLE_MAX_COLUMNS;
 }
 
 static size_t winxterm_dstcmd_title_root_end(const wchar_t *path, size_t length)
@@ -705,8 +661,7 @@ bool winxterm_dstcmd_shell_set_title_wide(WinxtermDstcmdShell *shell, const wcha
         return false;
     }
     size_t title_length = wcslen(title);
-    wchar_t *sanitized =
-        (wchar_t *)calloc(title_length + WINXTERM_DSTCMD_TITLE_RESERVED_COLUMNS + 1u, sizeof(*sanitized));
+    wchar_t *sanitized = (wchar_t *)calloc(title_length + 1u, sizeof(*sanitized));
     if (sanitized == 0) {
         return false;
     }
@@ -714,17 +669,6 @@ bool winxterm_dstcmd_shell_set_title_wide(WinxtermDstcmdShell *shell, const wcha
         wchar_t ch = title[i];
         sanitized[i] = (ch < 0x20 || ch == 0x7f) ? L' ' : ch;
     }
-    size_t columns = winxterm_dstcmd_title_columns(sanitized);
-    size_t reserve = winxterm_dstcmd_title_room(shell);
-    if (reserve > WINXTERM_DSTCMD_TITLE_RESERVED_COLUMNS) {
-        reserve = WINXTERM_DSTCMD_TITLE_RESERVED_COLUMNS;
-    }
-    while (columns < reserve) {
-        sanitized[title_length++] = WINXTERM_DSTCMD_TITLE_RESERVE_PAD;
-        sanitized[title_length] = L'\0';
-        ++columns;
-    }
-
     int utf8_count = WideCharToMultiByte(CP_UTF8, 0, sanitized, -1, 0, 0, 0, 0);
     if (utf8_count <= 0) {
         free(sanitized);
@@ -976,7 +920,7 @@ size_t winxterm_dstcmd_shell_read_input(WinxtermDstcmdShell *shell,
     return (size_t)read_count;
 }
 
-int winxterm_dstcmd_shell_terminal_columns(const WinxtermDstcmdShell *shell)
+static int winxterm_dstcmd_overlay_terminal_columns(const WinxtermDstcmdShell *shell)
 {
     HANDLE output = shell != 0 && shell->output_handle != 0 &&
         shell->output_handle != INVALID_HANDLE_VALUE ?
@@ -1214,22 +1158,6 @@ static bool winxterm_dstcmd_shell_write_prompt_cwd_range(WinxtermDstcmdShell *sh
            winxterm_dstcmd_shell_write_wide_range(shell, cwd, start, end);
 }
 
-static bool winxterm_dstcmd_shell_write_prompt_wrap_first(WinxtermDstcmdShell *shell)
-{
-    return winxterm_dstcmd_shell_write_wide(shell,
-                                            WINXTERM_DSTCMD_PROMPT_COLOR_BLUE
-                                            WINXTERM_DSTCMD_PROMPT_WRAP_FIRST
-                                            WINXTERM_DSTCMD_PROMPT_COLOR_RESET);
-}
-
-static bool winxterm_dstcmd_shell_write_prompt_wrap_next(WinxtermDstcmdShell *shell)
-{
-    return winxterm_dstcmd_shell_write_wide(shell,
-                                            WINXTERM_DSTCMD_PROMPT_COLOR_BLUE
-                                            WINXTERM_DSTCMD_PROMPT_WRAP_NEXT
-                                            WINXTERM_DSTCMD_PROMPT_COLOR_RESET);
-}
-
 static bool winxterm_dstcmd_shell_write_prompt_prefix(WinxtermDstcmdShell *shell,
                                                       const SYSTEMTIME *now,
                                                       const wchar_t *username)
@@ -1270,85 +1198,17 @@ static bool winxterm_dstcmd_shell_write_prompt(WinxtermDstcmdShell *shell,
     if (shell == 0 || now == 0 || username == 0 || cwd_color == 0 || rows_before_input == 0) {
         return false;
     }
-    const wchar_t *cwd = shell->cwd;
-    size_t cwd_length = wcslen(cwd);
-    size_t line_limit = winxterm_dstcmd_prompt_line_limit(columns);
-    size_t prefix_columns = 10u + 1u + winxterm_dstcmd_title_columns(username) + 1u;
-    size_t cwd_columns = winxterm_dstcmd_title_columns(cwd);
-    if (prefix_columns + cwd_columns <= line_limit) {
-        *rows_before_input = 1u;
-        return winxterm_dstcmd_shell_write_prompt_prefix(shell, now, username) &&
-               winxterm_dstcmd_shell_write_prompt_cwd_range(shell,
-                                                            cwd_color,
-                                                            cwd,
-                                                            0u,
-                                                            cwd_length) &&
-               winxterm_dstcmd_shell_write_wide(shell,
-                                                WINXTERM_DSTCMD_PROMPT_COLOR_RESET
-                                                L"\r\n") &&
-               winxterm_dstcmd_shell_write_prompt_command_prefix(shell);
-    }
-
-    size_t rows = 0u;
-    size_t offset = 0u;
-    if (!winxterm_dstcmd_shell_write_prompt_prefix(shell, now, username)) {
-        return false;
-    }
-    size_t first_segment_columns =
-        line_limit > prefix_columns + WINXTERM_DSTCMD_PROMPT_WRAP_FIRST_COLUMNS ?
-        line_limit - prefix_columns - WINXTERM_DSTCMD_PROMPT_WRAP_FIRST_COLUMNS : 0u;
-    size_t end = winxterm_dstcmd_wide_fit_columns(cwd, offset, cwd_length, first_segment_columns);
-    if (!winxterm_dstcmd_shell_write_prompt_cwd_range(shell, cwd_color, cwd, offset, end)) {
-        return false;
-    }
-    if (end < cwd_length && !winxterm_dstcmd_shell_write_prompt_wrap_first(shell)) {
-        return false;
-    }
-    if (!winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PROMPT_COLOR_RESET L"\r\n")) {
-        return false;
-    }
-    offset = end;
-    ++rows;
-
-    while (offset < cwd_length) {
-        if (!winxterm_dstcmd_shell_write_prompt_wrap_next(shell)) {
-            return false;
-        }
-        size_t final_segment_columns =
-            line_limit > WINXTERM_DSTCMD_PROMPT_WRAP_NEXT_COLUMNS ?
-            line_limit - WINXTERM_DSTCMD_PROMPT_WRAP_NEXT_COLUMNS : 0u;
-        end = winxterm_dstcmd_wide_fit_columns(cwd, offset, cwd_length, final_segment_columns);
-        if (end < cwd_length) {
-            size_t continued_segment_columns =
-                line_limit >
-                    WINXTERM_DSTCMD_PROMPT_WRAP_NEXT_COLUMNS +
-                    WINXTERM_DSTCMD_PROMPT_WRAP_FIRST_COLUMNS ?
-                line_limit -
-                    WINXTERM_DSTCMD_PROMPT_WRAP_NEXT_COLUMNS -
-                    WINXTERM_DSTCMD_PROMPT_WRAP_FIRST_COLUMNS : 0u;
-            end = winxterm_dstcmd_wide_fit_columns(cwd,
-                                                   offset,
-                                                   cwd_length,
-                                                   continued_segment_columns);
-            if (end == offset) {
-                end = winxterm_dstcmd_wide_next_boundary(cwd, cwd_length, offset);
-            }
-        }
-        if (!winxterm_dstcmd_shell_write_prompt_cwd_range(shell, cwd_color, cwd, offset, end)) {
-            return false;
-        }
-        if (end < cwd_length && !winxterm_dstcmd_shell_write_prompt_wrap_first(shell)) {
-            return false;
-        }
-        if (!winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PROMPT_COLOR_RESET L"\r\n")) {
-            return false;
-        }
-        offset = end;
-        ++rows;
-    }
-
-    *rows_before_input = rows;
-    return winxterm_dstcmd_shell_write_prompt_command_prefix(shell);
+    (void)columns;
+    *rows_before_input = 0u;
+    return winxterm_dstcmd_shell_write_prompt_prefix(shell, now, username) &&
+           winxterm_dstcmd_shell_write_prompt_cwd_range(shell,
+                                                        cwd_color,
+                                                        shell->cwd,
+                                                        0u,
+                                                        wcslen(shell->cwd)) &&
+           winxterm_dstcmd_shell_write_wide(shell,
+                                            WINXTERM_DSTCMD_PROMPT_COLOR_RESET L"\r\n") &&
+           winxterm_dstcmd_shell_write_prompt_command_prefix(shell);
 }
 
 static bool winxterm_dstcmd_shell_write_cursor_up(WinxtermDstcmdShell *shell, size_t rows)
@@ -1358,23 +1218,6 @@ static bool winxterm_dstcmd_shell_write_cursor_up(WinxtermDstcmdShell *shell, si
     }
     char sequence[64];
     int written = sprintf_s(sequence, sizeof(sequence), "\x1b[%zuA", rows);
-    return written > 0 && winxterm_dstcmd_shell_write_utf8(shell, sequence);
-}
-
-static bool winxterm_dstcmd_shell_write_cursor_down(WinxtermDstcmdShell *shell, size_t rows)
-{
-    if (rows == 0u) {
-        return true;
-    }
-    char sequence[64];
-    int written = sprintf_s(sequence, sizeof(sequence), "\x1b[%zuB", rows);
-    return written > 0 && winxterm_dstcmd_shell_write_utf8(shell, sequence);
-}
-
-static bool winxterm_dstcmd_shell_write_cursor_column(WinxtermDstcmdShell *shell, size_t column)
-{
-    char sequence[64];
-    int written = sprintf_s(sequence, sizeof(sequence), "\x1b[%zuG", column + 1u);
     return written > 0 && winxterm_dstcmd_shell_write_utf8(shell, sequence);
 }
 
@@ -1392,16 +1235,7 @@ static bool winxterm_dstcmd_shell_save_prompt_start_from_input_end(
     size_t rows_before_input)
 {
     return winxterm_dstcmd_shell_write_cursor_up(shell, end_position.row + rows_before_input) &&
-           winxterm_dstcmd_shell_write_utf8(shell, "\r\x1b[s");
-}
-
-static bool winxterm_dstcmd_shell_move_from_prompt_start_to_input_position(
-    WinxtermDstcmdShell *shell,
-    WinxtermDstcmdLinePosition position,
-    size_t rows_before_input)
-{
-    return winxterm_dstcmd_shell_write_cursor_down(shell, position.row + rows_before_input) &&
-           winxterm_dstcmd_shell_write_cursor_column(shell, position.column);
+           winxterm_dstcmd_shell_write_utf8(shell, "\r\x1b[3G\x1b[s");
 }
 
 static bool winxterm_dstcmd_shell_move_to_line_offset(WinxtermDstcmdShell *shell, size_t byte_offset)
@@ -1409,17 +1243,11 @@ static bool winxterm_dstcmd_shell_move_to_line_offset(WinxtermDstcmdShell *shell
     if (shell == 0 || !shell->prompt_cursor_saved) {
         return true;
     }
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
-    WinxtermDstcmdLinePosition position =
-        winxterm_dstcmd_shell_line_position(shell->line,
-                                            byte_offset,
-                                            columns,
-                                            WINXTERM_DSTCMD_PROMPT_COMMAND_PREFIX_COLUMNS);
+    if (byte_offset > shell->line_length) byte_offset = shell->line_length;
     return winxterm_dstcmd_shell_restore_prompt_start(shell) &&
-           winxterm_dstcmd_shell_move_from_prompt_start_to_input_position(
-               shell,
-               position,
-               shell->prompt_rows_before_input);
+           winxterm_dstcmd_shell_write_bytes(shell,
+                                             (const uint8_t *)shell->line,
+                                             byte_offset);
 }
 
 static bool winxterm_dstcmd_shell_clear_rendered_prompt(WinxtermDstcmdShell *shell)
@@ -1428,7 +1256,7 @@ static bool winxterm_dstcmd_shell_clear_rendered_prompt(WinxtermDstcmdShell *she
         return false;
     }
     bool ok = winxterm_dstcmd_shell_restore_prompt_start(shell) &&
-              winxterm_dstcmd_shell_write_utf8(shell, "\x1b[J");
+              winxterm_dstcmd_shell_write_utf8(shell, "\x1b[J\r\n");
     shell->prompt_cursor_saved = false;
     return ok;
 }
@@ -1464,40 +1292,34 @@ bool winxterm_dstcmd_shell_refresh_line(WinxtermDstcmdShell *shell)
                    _wcsicmp(shell->cwd, home_display) == 0;
     const wchar_t *cwd_color = is_home ?
         WINXTERM_DSTCMD_PROMPT_COLOR_DARK_GREEN : WINXTERM_DSTCMD_PROMPT_COLOR_GREEN;
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
-    WinxtermDstcmdLinePosition end_position =
-        winxterm_dstcmd_shell_line_position(shell->line,
-                                            shell->line_length,
-                                            columns,
-                                            WINXTERM_DSTCMD_PROMPT_COMMAND_PREFIX_COLUMNS);
-    WinxtermDstcmdLinePosition cursor_position =
-        winxterm_dstcmd_shell_line_position(shell->line,
-                                            shell->line_cursor,
-                                            columns,
-                                            WINXTERM_DSTCMD_PROMPT_COMMAND_PREFIX_COLUMNS);
-    size_t rows_before_input = 1u;
-    if (!winxterm_dstcmd_shell_restore_prompt_start(shell) ||
-        !winxterm_dstcmd_shell_write_utf8(shell, "\x1b[J") ||
-        !winxterm_dstcmd_shell_write_prompt(shell,
-                                            &now,
-                                            username,
-                                            cwd_color,
-                                            columns,
-                                            &rows_before_input) ||
+    bool ok = true;
+    if (shell->prompt_cursor_saved) {
+        ok = winxterm_dstcmd_shell_restore_prompt_start(shell) &&
+             winxterm_dstcmd_shell_write_utf8(shell, "\x1b[J");
+    } else {
+        size_t ignored_rows = 0u;
+        ok = winxterm_dstcmd_shell_write_prompt(shell,
+                                                &now,
+                                                username,
+                                                cwd_color,
+                                                0,
+                                                &ignored_rows) &&
+             winxterm_dstcmd_shell_write_utf8(shell, "\x1b[s");
+        shell->prompt_cursor_saved = ok;
+    }
+    if (!ok ||
         !winxterm_dstcmd_shell_write_bytes(shell, (const uint8_t *)shell->line, shell->line_length) ||
         !winxterm_dstcmd_shell_write_wide(shell, WINXTERM_DSTCMD_PROMPT_COLOR_RESET) ||
-        !winxterm_dstcmd_shell_save_prompt_start_from_input_end(shell,
-                                                                end_position,
-                                                                rows_before_input) ||
-        !winxterm_dstcmd_shell_move_from_prompt_start_to_input_position(shell,
-                                                                        cursor_position,
-                                                                        rows_before_input)) {
+        !winxterm_dstcmd_shell_restore_prompt_start(shell) ||
+        !winxterm_dstcmd_shell_write_bytes(shell,
+                                            (const uint8_t *)shell->line,
+                                            shell->line_cursor)) {
         if (shell->output_lock_initialized) {
             LeaveCriticalSection(&shell->output_lock);
         }
         return false;
     }
-    shell->prompt_rows_before_input = rows_before_input;
+    shell->prompt_rows_before_input = 0u;
     shell->prompt_cursor_saved = true;
     if (shell->output_lock_initialized) {
         LeaveCriticalSection(&shell->output_lock);
@@ -3121,7 +2943,7 @@ static bool winxterm_dstcmd_history_search_enter_overlay(WinxtermDstcmdShell *sh
     if (!shell->prompt_cursor_saved && !winxterm_dstcmd_shell_refresh_line(shell)) {
         return false;
     }
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
+    int columns = winxterm_dstcmd_overlay_terminal_columns(shell);
     WinxtermDstcmdLinePosition line_end =
         winxterm_dstcmd_history_search_line_end_position(shell, columns);
     if (!winxterm_dstcmd_shell_move_to_line_offset(shell, shell->line_length)) {
@@ -3150,7 +2972,7 @@ static bool winxterm_dstcmd_history_search_clear_overlay(WinxtermDstcmdShell *sh
     if (shell == 0 || !shell->history_search_overlay_active) {
         return true;
     }
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
+    int columns = winxterm_dstcmd_overlay_terminal_columns(shell);
     WinxtermDstcmdLinePosition line_end =
         winxterm_dstcmd_history_search_line_end_position(shell, columns);
     WinxtermDstcmdHistorySearchRenderBuffer buffer = {0};
@@ -3238,7 +3060,7 @@ static bool winxterm_dstcmd_history_search_render_panel(WinxtermDstcmdShell *she
     if (!winxterm_dstcmd_history_search_enter_overlay(shell)) {
         return false;
     }
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
+    int columns = winxterm_dstcmd_overlay_terminal_columns(shell);
     int rows = winxterm_dstcmd_shell_terminal_rows(shell);
     if (columns < 20) {
         columns = 20;
@@ -6551,6 +6373,7 @@ static bool winxterm_dstcmd_shell_handle_input_byte(WinxtermDstcmdShell *shell, 
     }
     if (byte == 0x0cu) {
         (void)winxterm_dstcmd_shell_write_utf8(shell, "\x1b[H\x1b[2J");
+        shell->prompt_cursor_saved = false;
         return winxterm_dstcmd_shell_refresh_line(shell);
     }
     if (byte == 0x15u) {
@@ -8371,22 +8194,9 @@ static bool winxterm_dstcmd_smoke_run_alias(WinxtermDstcmdShell *shell)
         return false;
     }
 
-    char expected_title[256];
-    size_t offset = 0u;
-    memcpy(expected_title + offset, "\x1b]0;abc", 7u);
-    offset += 7u;
-    for (size_t i = 0u; i < 61u; ++i) {
-        expected_title[offset++] = (char)0xe2u;
-        expected_title[offset++] = (char)0xa0u;
-        expected_title[offset++] = (char)0x80u;
-    }
-    expected_title[offset++] = '\x1b';
-    expected_title[offset++] = '\\';
-    expected_title[offset] = '\0';
-
     winxterm_dstcmd_smoke_clear_capture(shell);
     return winxterm_dstcmd_shell_set_title_wide(shell, L"abc") &&
-           winxterm_dstcmd_smoke_capture_contains(shell, expected_title);
+           winxterm_dstcmd_smoke_capture_contains(shell, "\x1b]0;abc\x1b\\");
 }
 
 static bool winxterm_dstcmd_smoke_console_mode_matches(HANDLE handle, DWORD expected, bool saved)
@@ -8458,7 +8268,8 @@ static bool winxterm_dstcmd_smoke_run_console_mode_reentry(WinxtermDstcmdShell *
     }
     winxterm_dstcmd_smoke_clear_capture(shell);
     if (!winxterm_dstcmd_shell_handle_input_byte(shell, 0x0cu) ||
-        !winxterm_dstcmd_smoke_capture_contains(shell, "\x1b[H\x1b[2J")) {
+        !winxterm_dstcmd_smoke_capture_contains(shell, "\x1b[H\x1b[2J") ||
+        !winxterm_dstcmd_smoke_capture_contains(shell, "$")) {
         return false;
     }
     if (!winxterm_dstcmd_smoke_set_line(shell, "")) {

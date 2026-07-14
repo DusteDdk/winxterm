@@ -62,22 +62,26 @@ typedef struct WinxtermScreenCell {
     uint8_t width;
     bool source_rendered;
     bool continuation;
+    bool occupied;
 } WinxtermScreenCell;
 
 typedef struct WinxtermScreenLineMeta {
     bool soft_wrapped;
+    int content_columns;
 } WinxtermScreenLineMeta;
 
 typedef struct WinxtermScreenLine {
     WinxtermScreenCell *cells;
     int columns;
     bool soft_wrapped;
+    int content_columns;
 } WinxtermScreenLine;
 
 typedef struct WinxtermScreenRowView {
     const WinxtermScreenCell *cells;
     int columns;
     bool soft_wrapped;
+    int content_columns;
 } WinxtermScreenRowView;
 
 typedef struct WinxtermScreenPrimaryAnchor {
@@ -183,6 +187,7 @@ typedef struct WinxtermScreen {
     size_t scrollback_capacity;
     bool *tab_stops;
     WinxtermScreenDamage damage;
+    uint64_t visual_line_advances;
     WinxtermCommandDiagnostics *active_diagnostics;
 } WinxtermScreen;
 
@@ -233,6 +238,7 @@ bool winxterm_screen_get_alternate_view_row(const WinxtermScreen *screen,
 void winxterm_screen_clear_scrollback(WinxtermScreen *screen);
 void winxterm_screen_mark_full_repaint(WinxtermScreen *screen);
 bool winxterm_screen_take_damage(WinxtermScreen *screen, WinxtermScreenDamage *damage);
+uint64_t winxterm_screen_visual_line_advances(const WinxtermScreen *screen);
 void winxterm_screen_render(WinxtermScreen *screen,
                             WinxtermRenderContext *render_context,
                             uint32_t *pixels,

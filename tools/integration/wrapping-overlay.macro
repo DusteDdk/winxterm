@@ -1,0 +1,38 @@
+set typedelayms 5
+waithost 10000
+waitms 500
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-initial.txt
+typestring there seems to be a problem
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-typed.txt
+keydown KEY_LEFT_CTRL
+typestring l
+keyup KEY_LEFT_CTRL
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-cleared.txt
+keydown KEY_LEFT_CTRL
+typestring r
+keyup KEY_LEFT_CTRL
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-search.txt
+histdump Z:\tmp\winxterm-grid-transcript.log
+keydown KEY_LEFT_CTRL
+typestring g
+keyup KEY_LEFT_CTRL
+waitms 100
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-final.txt
+keydown KEY_LEFT_CTRL
+typestring u
+keyup KEY_LEFT_CTRL
+typestring abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-wrapped.txt
+keydown KEY_LEFT_CTRL
+typestring u
+keyup KEY_LEFT_CTRL
+typestring æøå你好
+waitredraw -w
+celldump Z:\tmp\winxterm-grid-unicode.txt
+exit

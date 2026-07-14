@@ -254,7 +254,6 @@ size_t winxterm_dstcmd_shell_read_input(WinxtermDstcmdShell *shell,
                                         uint8_t *buffer,
                                         size_t buffer_capacity,
                                         bool wait);
-int winxterm_dstcmd_shell_terminal_columns(const WinxtermDstcmdShell *shell);
 uint64_t winxterm_dstcmd_shell_timestamp_ns(void);
 void winxterm_dstcmd_output_builder_init(WinxtermDstcmdOutputBuilder *builder);
 void winxterm_dstcmd_output_builder_dispose(WinxtermDstcmdOutputBuilder *builder);

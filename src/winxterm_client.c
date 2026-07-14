@@ -13,20 +13,6 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-static unsigned int winxterm_client_count_output_lines(const uint8_t *bytes, size_t byte_count)
-{
-    unsigned int count = 0u;
-    if (bytes == 0) {
-        return 0u;
-    }
-    for (size_t i = 0u; i < byte_count; ++i) {
-        if (bytes[i] == '\n' && count != UINT_MAX) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 bool winxterm_client_write_bytes(WinxtermBridge *bridge,
                                  WinxtermUtf8Decoder *decoder,
                                  const uint8_t *bytes,
@@ -52,11 +38,7 @@ bool winxterm_client_write_bytes_with_policy(WinxtermBridge *bridge,
     }
 
     winxterm_bridge_note_output_batch(bridge, byte_count);
-    return winxterm_bridge_enqueue_output_with_unpainted_lines(
-        bridge,
-        bytes,
-        byte_count,
-        wait_for_unpainted_budget ? winxterm_client_count_output_lines(bytes, byte_count) : 0u);
+    return winxterm_bridge_enqueue_output(bridge, bytes, byte_count);
 }
 
 static HANDLE winxterm_demo_create_timer(void)

@@ -1088,10 +1088,9 @@ static void winxterm_bridge_record_transcript_locked(WinxtermBridge *bridge,
     bridge->transcript_count += byte_count;
 }
 
-bool winxterm_bridge_enqueue_output_with_unpainted_lines(WinxtermBridge *bridge,
-                                                         const uint8_t *bytes,
-                                                         size_t byte_count,
-                                                         unsigned int unpainted_lines)
+bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge,
+                                    const uint8_t *bytes,
+                                    size_t byte_count)
 {
     if (bridge == 0 || bytes == 0 || byte_count == 0u) {
         return false;
@@ -1117,21 +1116,11 @@ bool winxterm_bridge_enqueue_output_with_unpainted_lines(WinxtermBridge *bridge,
         ++bridge->output_enqueue_failures;
     }
     winxterm_bridge_update_output_room_event_locked(bridge);
-    if (ok && unpainted_lines != 0u) {
-        EnterCriticalSection(&bridge->screen_lock);
-        winxterm_bridge_add_unpainted_lines_locked(bridge, unpainted_lines);
-        LeaveCriticalSection(&bridge->screen_lock);
-    }
     LeaveCriticalSection(&bridge->input_lock);
     if (ok) {
         winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_CONTENT);
     }
     return ok;
-}
-
-bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count)
-{
-    return winxterm_bridge_enqueue_output_with_unpainted_lines(bridge, bytes, byte_count, 0u);
 }
 
 void winxterm_bridge_set_active_session(WinxtermBridge *bridge, uint64_t session_id)
@@ -1262,11 +1251,16 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
     memset(&commit, 0, sizeof(commit));
     commit.bridge = bridge;
     EnterCriticalSection(&bridge->screen_lock);
+    uint64_t visual_lines_before = winxterm_screen_visual_line_advances(&bridge->screen);
     bool ok = winxterm_text_feed_bytes_to_sink(&bridge->output_decoder,
                                                bytes,
                                                byte_count,
                                                winxterm_bridge_terminal_sink,
                                                &commit);
+    uint64_t visual_lines_after = winxterm_screen_visual_line_advances(&bridge->screen);
+    uint64_t visual_delta = visual_lines_after - visual_lines_before;
+    if (visual_delta > UINT_MAX) visual_delta = UINT_MAX;
+    winxterm_bridge_add_unpainted_lines_locked(bridge, (unsigned int)visual_delta);
     LeaveCriticalSection(&bridge->screen_lock);
     free(bytes);
 

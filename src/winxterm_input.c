@@ -91,6 +91,13 @@ size_t winxterm_input_encode_char(wchar_t ch,
         return winxterm_input_append_byte(out, out_capacity, offset, (uint8_t)ch);
     }
 
+    if (modifiers.ctrl && ch >= L'@' && ch <= L'_') {
+        return winxterm_input_append_byte(out, out_capacity, offset, (uint8_t)(ch - L'@'));
+    }
+    if (modifiers.ctrl && ch >= L'a' && ch <= L'z') {
+        return winxterm_input_append_byte(out, out_capacity, offset, (uint8_t)(ch - L'a' + 1));
+    }
+
     return winxterm_input_encode_utf8((uint32_t)ch, out, out_capacity, offset);
 }
 

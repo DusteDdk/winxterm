@@ -89,6 +89,7 @@ static WinxtermScreenCell winxterm_screen_blank_cell(const WinxtermScreen *scree
     cell.width = 1u;
     cell.source_rendered = false;
     cell.continuation = false;
+    cell.occupied = false;
     return cell;
 }
 
@@ -407,6 +408,25 @@ static void winxterm_screen_set_row_soft_wrapped(WinxtermScreen *screen, int row
     }
 }
 
+static int winxterm_screen_row_content_columns(const WinxtermScreenCell *cells, int columns)
+{
+    int end = columns;
+    while (end > 0 && !cells[end - 1].occupied) {
+        --end;
+    }
+    return end;
+}
+
+static void winxterm_screen_recompute_row_content(WinxtermScreen *screen, int row)
+{
+    WinxtermScreenCell *cells = winxterm_screen_active_cells(screen);
+    WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+    if (cells != 0 && meta != 0 && row >= 0 && row < screen->rows) {
+        meta[row].content_columns = winxterm_screen_row_content_columns(
+            &cells[(size_t)row * (size_t)screen->columns], screen->columns);
+    }
+}
+
 static uint32_t winxterm_screen_map_dec_special_graphics(uint32_t codepoint)
 {
     switch (codepoint) {
@@ -473,23 +493,7 @@ static int winxterm_screen_codepoint_width(uint32_t codepoint)
         (codepoint >= 0x7fu && codepoint < 0xa0u)) {
         return 0;
     }
-    /* Dynamic fallback glyphs, including emoji, are rasterized into one fixed cell. */
-    if (winxterm_screen_map_codepoint_to_glyph(codepoint) == WINXTERM_DYNAMIC_GLYPH_INDEX) {
-        return 1;
-    }
-    if ((codepoint >= 0x1100u && codepoint <= 0x115fu) ||
-        (codepoint >= 0x2329u && codepoint <= 0x232au) ||
-        (codepoint >= 0x2e80u && codepoint <= 0xa4cfu) ||
-        (codepoint >= 0xac00u && codepoint <= 0xd7a3u) ||
-        (codepoint >= 0xf900u && codepoint <= 0xfaffu) ||
-        (codepoint >= 0xfe10u && codepoint <= 0xfe19u) ||
-        (codepoint >= 0xfe30u && codepoint <= 0xfe6fu) ||
-        (codepoint >= 0xff00u && codepoint <= 0xff60u) ||
-        (codepoint >= 0xffe0u && codepoint <= 0xffe6u) ||
-        (codepoint >= 0x1f300u && codepoint <= 0x1faffu) ||
-        (codepoint >= 0x20000u && codepoint <= 0x3fffdu)) {
-        return 2;
-    }
+    /* Every independently rendered glyph uses one fixed terminal cell. */
     return 1;
 }
 
@@ -566,6 +570,8 @@ static bool winxterm_screen_push_scrollback_row(WinxtermScreen *screen,
     memcpy(line->cells, row_cells, (size_t)screen->columns * sizeof(*line->cells));
     line->columns = screen->columns;
     line->soft_wrapped = soft_wrapped;
+    line->content_columns = soft_wrapped ? screen->columns :
+        winxterm_screen_row_content_columns(row_cells, screen->columns);
     ++screen->scrollback_count;
     return true;
 }
@@ -583,6 +589,11 @@ static void winxterm_screen_clear_row(WinxtermScreen *screen, int row)
     for (int column = 0; column < screen->columns; ++column) {
         cells[(size_t)row * (size_t)screen->columns + (size_t)column] = blank;
     }
+    WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+    if (meta != 0) {
+        meta[row].content_columns = 0;
+    }
+    winxterm_screen_recompute_row_content(screen, row);
     winxterm_screen_mark_dirty_row(screen, row);
 }
 
@@ -605,6 +616,8 @@ static bool winxterm_screen_scroll_region_up(WinxtermScreen *screen, int count)
         return false;
     }
     WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+    WinxtermScreenCursorState *saved = screen->alternate_active ?
+        &screen->saved_alternate_cursor : &screen->saved_primary_cursor;
     for (int i = 0; i < count; ++i) {
         int top = screen->scroll_top;
         if (top == 0) {
@@ -628,6 +641,10 @@ static bool winxterm_screen_scroll_region_up(WinxtermScreen *screen, int count)
         if (meta != 0) {
             meta[screen->scroll_bottom].soft_wrapped = false;
         }
+        if (saved->row >= screen->scroll_top && saved->row <= screen->scroll_bottom) {
+            if (saved->row > screen->scroll_top) --saved->row;
+            else saved->row = screen->scroll_top;
+        }
     }
     return true;
 }
@@ -646,6 +663,8 @@ static void winxterm_screen_scroll_region_down(WinxtermScreen *screen, int count
         return;
     }
     WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+    WinxtermScreenCursorState *saved = screen->alternate_active ?
+        &screen->saved_alternate_cursor : &screen->saved_primary_cursor;
     for (int i = 0; i < count; ++i) {
         size_t row_cells = (size_t)screen->columns * sizeof(*cells);
         if (screen->scroll_bottom > screen->scroll_top) {
@@ -662,6 +681,10 @@ static void winxterm_screen_scroll_region_down(WinxtermScreen *screen, int count
         if (meta != 0) {
             meta[screen->scroll_top].soft_wrapped = false;
         }
+        if (saved->row >= screen->scroll_top && saved->row <= screen->scroll_bottom) {
+            if (saved->row < screen->scroll_bottom) ++saved->row;
+            else saved->row = screen->scroll_bottom;
+        }
     }
 }
 
@@ -669,6 +692,9 @@ static bool winxterm_screen_linefeed(WinxtermScreen *screen)
 {
     int old_row = screen->cursor_row;
     screen->pending_wrap = false;
+    if (screen->visual_line_advances != UINT64_MAX) {
+        ++screen->visual_line_advances;
+    }
     winxterm_screen_set_row_soft_wrapped(screen, screen->cursor_row, false);
     if (screen->cursor_row == screen->scroll_bottom) {
         screen->cursor_col = 0;
@@ -754,6 +780,7 @@ static void winxterm_screen_set_cell_width(WinxtermScreen *screen,
     cell->width = (uint8_t)width;
     cell->source_rendered = false;
     cell->continuation = false;
+    cell->occupied = true;
     if (width == 2 && column + 1 < screen->columns) {
         WinxtermScreenCell *next = winxterm_screen_cell_at(screen, row, column + 1);
         if (next != 0) {
@@ -767,6 +794,7 @@ static void winxterm_screen_set_cell_width(WinxtermScreen *screen,
             next->width = 0u;
             next->source_rendered = false;
             next->continuation = true;
+            next->occupied = true;
         }
     } else if (column + 1 < screen->columns) {
         WinxtermScreenCell *next = winxterm_screen_cell_at(screen, row, column + 1);
@@ -776,6 +804,11 @@ static void winxterm_screen_set_cell_width(WinxtermScreen *screen,
         }
     }
     screen->last_printed_codepoint = codepoint;
+    WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+    int extent = column + width;
+    if (meta != 0 && row >= 0 && row < screen->rows && meta[row].content_columns < extent) {
+        meta[row].content_columns = extent;
+    }
     winxterm_screen_mark_dirty_row(screen, row);
 }
 
@@ -798,6 +831,9 @@ static bool winxterm_screen_print_with_source(WinxtermScreen *screen,
         return true;
     }
     if (screen->pending_wrap) {
+        if (screen->visual_line_advances != UINT64_MAX) {
+            ++screen->visual_line_advances;
+        }
         winxterm_screen_set_row_soft_wrapped(screen, screen->cursor_row, true);
         screen->cursor_col = screen->left_margin;
         if (!winxterm_screen_index(screen)) {
@@ -974,6 +1010,13 @@ static void winxterm_screen_erase_line_range(WinxtermScreen *screen,
             *cell = blank;
         }
     }
+    winxterm_screen_recompute_row_content(screen, row);
+    if (first_col == 0 && last_col == screen->columns - 1) {
+        WinxtermScreenLineMeta *meta = winxterm_screen_active_line_meta(screen);
+        if (meta != 0 && (!selective || meta[row].content_columns == 0)) {
+            meta[row].soft_wrapped = false;
+        }
+    }
     winxterm_screen_mark_dirty_row(screen, row);
 }
 
@@ -1110,6 +1153,7 @@ static void winxterm_screen_insert_chars(WinxtermScreen *screen, int count)
     for (int i = 0; i < count; ++i) {
         row[screen->cursor_col + i] = blank;
     }
+    winxterm_screen_recompute_row_content(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_delete_chars(WinxtermScreen *screen, int count)
@@ -1135,6 +1179,7 @@ static void winxterm_screen_delete_chars(WinxtermScreen *screen, int count)
     for (int i = right - count + 1; i <= right; ++i) {
         row[i] = blank;
     }
+    winxterm_screen_recompute_row_content(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_insert_lines(WinxtermScreen *screen, int count)
@@ -1184,6 +1229,7 @@ static void winxterm_screen_insert_columns(WinxtermScreen *screen, int count)
         for (int column = left; column < left + count; ++column) {
             line[column] = blank;
         }
+        winxterm_screen_recompute_row_content(screen, row);
     }
 }
 
@@ -1211,6 +1257,7 @@ static void winxterm_screen_delete_columns(WinxtermScreen *screen, int count)
         for (int column = right - count + 1; column <= right; ++column) {
             line[column] = blank;
         }
+        winxterm_screen_recompute_row_content(screen, row);
     }
 }
 
@@ -1378,6 +1425,9 @@ static void winxterm_screen_rect_copy(WinxtermScreen *screen, const WinxtermTerm
             if (dest != 0) {
                 *dest = temporary[(size_t)row * (size_t)width + (size_t)column];
             }
+        }
+        if (dest_top + row >= 0 && dest_top + row < screen->rows) {
+            winxterm_screen_recompute_row_content(screen, dest_top + row);
         }
     }
     free(temporary);
@@ -1965,15 +2015,6 @@ bool winxterm_screen_apply_op(WinxtermScreen *screen, const WinxtermTerminalOp *
     }
 }
 
-static int winxterm_screen_trimmed_columns(const WinxtermScreenCell *cells, int columns)
-{
-    int end = columns;
-    while (end > 0 && cells[end - 1].codepoint == (uint32_t)' ') {
-        --end;
-    }
-    return end;
-}
-
 static bool winxterm_screen_append_reflowed_line(WinxtermScreen *screen,
                                                  WinxtermScreenLine **lines,
                                                  size_t *count,
@@ -2018,6 +2059,7 @@ static bool winxterm_screen_append_reflowed_line(WinxtermScreen *screen,
     }
     line->columns = screen->columns;
     line->soft_wrapped = soft_wrapped;
+    line->content_columns = soft_wrapped ? screen->columns : cell_count;
     ++*count;
     return true;
 }
@@ -2026,6 +2068,7 @@ typedef struct WinxtermScreenReflowSource {
     const WinxtermScreenCell *cells;
     int columns;
     bool soft_wrapped;
+    int content_columns;
 } WinxtermScreenReflowSource;
 
 static bool winxterm_screen_reflow_sources(WinxtermScreen *screen,
@@ -2061,7 +2104,7 @@ static bool winxterm_screen_reflow_sources(WinxtermScreen *screen,
         for (size_t line_index = start; line_index <= end; ++line_index) {
             int columns = sources[line_index].columns;
             if (line_index == end) {
-                columns = winxterm_screen_trimmed_columns(sources[line_index].cells, sources[line_index].columns);
+                columns = sources[line_index].content_columns;
             }
             total += columns;
         }
@@ -2093,7 +2136,7 @@ static bool winxterm_screen_reflow_sources(WinxtermScreen *screen,
         for (size_t line_index = start; line_index <= end; ++line_index) {
             int columns = sources[line_index].columns;
             if (line_index == end) {
-                columns = winxterm_screen_trimmed_columns(sources[line_index].cells, sources[line_index].columns);
+                columns = sources[line_index].content_columns;
             }
             if (line_index == cursor_source) {
                 int column = cursor_column;
@@ -2144,6 +2187,42 @@ static bool winxterm_screen_reflow_sources(WinxtermScreen *screen,
     return true;
 }
 
+static void winxterm_screen_map_reflow_anchor(const WinxtermScreenReflowSource *sources,
+                                              size_t source_count,
+                                              size_t source_index,
+                                              int source_column,
+                                              int new_columns,
+                                              size_t *new_line,
+                                              int *new_column)
+{
+    size_t output_line = 0u;
+    for (size_t start = 0u; start < source_count;) {
+        size_t end = start;
+        while (end + 1u < source_count && sources[end].soft_wrapped) ++end;
+        int total = 0;
+        int anchor_offset = -1;
+        for (size_t i = start; i <= end; ++i) {
+            int columns = i == end ? sources[i].content_columns : sources[i].columns;
+            if (i == source_index) {
+                int column = source_column < 0 ? 0 : source_column;
+                if (column > columns) column = columns;
+                anchor_offset = total + column;
+            }
+            total += columns;
+        }
+        size_t emitted = total > 0 ? (size_t)((total + new_columns - 1) / new_columns) : 1u;
+        if (anchor_offset >= 0) {
+            *new_line = output_line + (size_t)(anchor_offset / new_columns);
+            *new_column = anchor_offset % new_columns;
+            return;
+        }
+        output_line += emitted;
+        start = end + 1u;
+    }
+    *new_line = 0u;
+    *new_column = 0;
+}
+
 static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
                                                    int old_columns,
                                                    int old_rows,
@@ -2165,12 +2244,15 @@ static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
         sources[i].cells = screen->scrollback_lines[i].cells;
         sources[i].columns = screen->scrollback_lines[i].columns;
         sources[i].soft_wrapped = screen->scrollback_lines[i].soft_wrapped;
+        sources[i].content_columns = screen->scrollback_lines[i].content_columns;
     }
     for (int row = 0; row < old_rows; ++row) {
         size_t index = screen->scrollback_count + (size_t)row;
         sources[index].cells = &old_primary[(size_t)row * (size_t)old_columns];
         sources[index].columns = old_columns;
         sources[index].soft_wrapped = old_primary_meta != 0 ? old_primary_meta[row].soft_wrapped : false;
+        sources[index].content_columns = old_primary_meta != 0 ? old_primary_meta[row].content_columns :
+            winxterm_screen_row_content_columns(sources[index].cells, old_columns);
     }
 
     WinxtermScreenLine *new_lines = 0;
@@ -2179,6 +2261,8 @@ static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
     size_t cursor_line = 0u;
     int cursor_col = 0;
     size_t cursor_source = screen->scrollback_count + (size_t)screen->cursor_row;
+    size_t saved_cursor_source = screen->scrollback_count +
+        (size_t)(screen->saved_primary_cursor.row < 0 ? 0 : screen->saved_primary_cursor.row);
     if (!winxterm_screen_reflow_sources(screen,
                                         sources,
                                         source_count,
@@ -2196,6 +2280,15 @@ static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
         free(new_lines);
         return;
     }
+    size_t saved_cursor_line = 0u;
+    int saved_cursor_col = 0;
+    winxterm_screen_map_reflow_anchor(sources,
+                                      source_count,
+                                      saved_cursor_source,
+                                      screen->saved_primary_cursor.column,
+                                      screen->columns,
+                                      &saved_cursor_line,
+                                      &saved_cursor_col);
     free(sources);
 
     winxterm_screen_dispose_scrollback(screen);
@@ -2213,6 +2306,7 @@ static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
         }
         if (screen->primary_line_meta != 0) {
             screen->primary_line_meta[row].soft_wrapped = line->soft_wrapped;
+            screen->primary_line_meta[row].content_columns = line->content_columns;
         }
     }
     for (size_t i = scrollback_count; i < new_count; ++i) {
@@ -2234,6 +2328,14 @@ static void winxterm_screen_reflow_primary_history(WinxtermScreen *screen,
             screen->rows - 1 : (int)visible_cursor_row;
     }
     screen->cursor_col = cursor_col;
+    if (saved_cursor_line < scrollback_count) {
+        screen->saved_primary_cursor.row = 0;
+    } else {
+        size_t saved_visible_row = saved_cursor_line - scrollback_count;
+        screen->saved_primary_cursor.row = saved_visible_row >= (size_t)screen->rows ?
+            screen->rows - 1 : (int)saved_visible_row;
+    }
+    screen->saved_primary_cursor.column = saved_cursor_col;
     winxterm_screen_clamp_cursor(screen);
 }
 
@@ -2553,6 +2655,7 @@ bool winxterm_screen_get_primary_view_row(const WinxtermScreen *screen,
         row->cells = line->cells;
         row->columns = line->columns;
         row->soft_wrapped = line->soft_wrapped;
+        row->content_columns = line->content_columns;
         return row->cells != 0 && row->columns > 0;
     }
     size_t visible_row = global_row - screen->scrollback_count;
@@ -2563,6 +2666,9 @@ bool winxterm_screen_get_primary_view_row(const WinxtermScreen *screen,
     row->columns = screen->columns;
     row->soft_wrapped = screen->primary_line_meta != 0 ?
         screen->primary_line_meta[visible_row].soft_wrapped : false;
+    row->content_columns = screen->primary_line_meta != 0 ?
+        screen->primary_line_meta[visible_row].content_columns :
+        winxterm_screen_row_content_columns(row->cells, row->columns);
     return true;
 }
 
@@ -2597,8 +2703,7 @@ static int winxterm_screen_primary_row_content_columns(const WinxtermScreen *scr
     if (!winxterm_screen_get_primary_view_row(screen, row_index, &row)) {
         return 0;
     }
-    return row_index == group_end ? winxterm_screen_trimmed_columns(row.cells, row.columns) :
-                                    row.columns;
+    return row_index == group_end ? row.content_columns : row.columns;
 }
 
 static int winxterm_screen_primary_anchor_column(const WinxtermScreenRowView *row,
@@ -2716,7 +2821,15 @@ bool winxterm_screen_get_alternate_view_row(const WinxtermScreen *screen,
     row->columns = screen->columns;
     row->soft_wrapped = screen->alternate_line_meta != 0 ?
         screen->alternate_line_meta[row_index].soft_wrapped : false;
+    row->content_columns = screen->alternate_line_meta != 0 ?
+        screen->alternate_line_meta[row_index].content_columns :
+        winxterm_screen_row_content_columns(row->cells, row->columns);
     return true;
+}
+
+uint64_t winxterm_screen_visual_line_advances(const WinxtermScreen *screen)
+{
+    return screen != 0 ? screen->visual_line_advances : 0u;
 }
 
 void winxterm_screen_clear_scrollback(WinxtermScreen *screen)

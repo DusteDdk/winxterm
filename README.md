@@ -45,9 +45,6 @@ Windows home directory in `.winxterm/history.sqlite3`.
 - `./build-windows-binaries-on-linux.sh` cross-compiles `winxterm.exe` and
   `dstshell.exe` with clang-cl against an xwin-provided Microsoft CRT/SDK
   sysroot.
-- `./wine-x11.sh` boots a headless X desktop (Xvfb at 1920x1080x24 plus i3)
-  and runs the built binaries under wine for tests, interactive runs, and
-  screenshots. See `CLAUDE.md` for the full workflow.
 - wine is a test harness only, never a target platform: the source must not
   special-case wine or work around wine bugs. `CLAUDE.md` documents the
   policy.

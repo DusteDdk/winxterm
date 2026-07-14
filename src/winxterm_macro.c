@@ -496,6 +496,17 @@ static bool winxterm_macro_parse_command_text(WinxtermMacro *macro,
                                                     error_count);
         free(copy);
         return ok;
+    } else if (strncmp(trimmed, "celldump", 8u) == 0 &&
+               (trimmed[8] == ' ' || trimmed[8] == '\t')) {
+        bool ok = winxterm_macro_parse_path_command(macro,
+                                                    WINXTERM_MACRO_COMMAND_CELL_DUMP,
+                                                    trimmed,
+                                                    "celldump",
+                                                    line_number,
+                                                    error,
+                                                    error_count);
+        free(copy);
+        return ok;
     } else if (strncmp(trimmed, "histdump", 8u) == 0 &&
                (trimmed[8] == ' ' || trimmed[8] == '\t')) {
         bool ok = winxterm_macro_parse_path_command(macro,
@@ -1071,6 +1082,13 @@ DWORD winxterm_macro_step(WinxtermMacro *macro, const WinxtermMacroCallbacks *ca
             if (callbacks == 0 || callbacks->write_screendump == 0 ||
                 !callbacks->write_screendump(callbacks->context, command->text)) {
                 winxterm_macro_log_command_failure(callbacks, L"macro screendump failed");
+            }
+            ++macro->command_index;
+            continue;
+        case WINXTERM_MACRO_COMMAND_CELL_DUMP:
+            if (callbacks == 0 || callbacks->write_celldump == 0 ||
+                !callbacks->write_celldump(callbacks->context, command->text)) {
+                winxterm_macro_log_command_failure(callbacks, L"macro celldump failed");
             }
             ++macro->command_index;
             continue;

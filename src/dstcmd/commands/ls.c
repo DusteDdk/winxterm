@@ -209,12 +209,6 @@ static bool winxterm_dstcmd_ls_uses_wide_format(const WinxtermDstcmdLsOptions *o
     return options != 0 && !options->long_format && !options->sort_time;
 }
 
-static int winxterm_dstcmd_ls_terminal_columns(WinxtermDstcmdShell *shell)
-{
-    int columns = winxterm_dstcmd_shell_terminal_columns(shell);
-    return columns > 0 ? columns : 80;
-}
-
 static bool winxterm_dstcmd_ls_append_wide_entries(WinxtermDstcmdOutputBuilder *builder,
                                                    WinxtermDstcmdShell *shell,
                                                    const WinxtermDstcmdLsEntry *entries,
@@ -224,41 +218,15 @@ static bool winxterm_dstcmd_ls_append_wide_entries(WinxtermDstcmdOutputBuilder *
         return true;
     }
 
-    size_t max_name_width = 0u;
-    for (size_t i = 0u; i < count; ++i) {
-        size_t name_width = entries[i].name != 0 ? wcslen(entries[i].name) : 0u;
-        if (name_width > max_name_width) {
-            max_name_width = name_width;
-        }
-    }
-
-    size_t column_width = max_name_width + 2u;
-    int terminal_columns = winxterm_dstcmd_ls_terminal_columns(shell);
-    size_t columns = column_width != 0u ? (size_t)terminal_columns / column_width : 1u;
-    if (columns == 0u) {
-        columns = 1u;
-    }
-    if (columns > count) {
-        columns = count;
-    }
+    (void)shell;
 
     for (size_t i = 0u; i < count; ++i) {
         const wchar_t *name = entries[i].name != 0 ? entries[i].name : L"";
-        size_t column = i % columns;
-        bool last_column = column + 1u == columns || i + 1u == count;
         if (!winxterm_dstcmd_output_builder_append_wide(builder, name)) {
             return false;
         }
-        if (last_column) {
-            if (!winxterm_dstcmd_output_builder_append_wide(builder, L"\r\n")) {
-                return false;
-            }
-        } else {
-            size_t name_width = wcslen(name);
-            size_t padding = column_width > name_width ? column_width - name_width : 2u;
-            if (!winxterm_dstcmd_output_builder_append_repeat(builder, L' ', padding)) {
-                return false;
-            }
+        if (!winxterm_dstcmd_output_builder_append_wide(builder, L"\r\n")) {
+            return false;
         }
     }
     return true;

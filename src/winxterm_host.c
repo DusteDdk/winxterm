@@ -668,6 +668,8 @@ static bool winxterm_host_prepare_startup(HPCON pseudo_console,
 static bool winxterm_host_prepare_stdio_startup(HANDLE stdin_handle,
                                                 HANDLE stdout_handle,
                                                 HANDLE stderr_handle,
+                                                const HANDLE *extra_handles,
+                                                size_t extra_handle_count,
                                                 STARTUPINFOEXW *startup,
                                                 LPPROC_THREAD_ATTRIBUTE_LIST *attribute_list)
 {
@@ -678,10 +680,16 @@ static bool winxterm_host_prepare_stdio_startup(HANDLE stdin_handle,
     startup->StartupInfo.hStdInput = stdin_handle;
     startup->StartupInfo.hStdOutput = stdout_handle;
     startup->StartupInfo.hStdError = stderr_handle;
-    HANDLE handles[3];
+    HANDLE handles[8];
     size_t handle_count = 0u;
-    HANDLE candidates[3] = {stdin_handle, stdout_handle, stderr_handle};
-    for (size_t i = 0u; i < 3u; ++i) {
+    HANDLE candidates[8] = {stdin_handle, stdout_handle, stderr_handle};
+    if (extra_handle_count > 5u) {
+        return false;
+    }
+    for (size_t i = 0u; i < extra_handle_count; ++i) {
+        candidates[3u + i] = extra_handles[i];
+    }
+    for (size_t i = 0u; i < 3u + extra_handle_count; ++i) {
         bool duplicate = false;
         for (size_t j = 0u; j < handle_count; ++j) {
             if (handles[j] == candidates[i]) duplicate = true;
@@ -1934,6 +1942,7 @@ static uint32_t winxterm_host_spawn_pipeline_plan(WinxtermHostContext *host,
         STARTUPINFOEXW startup;
         if (command_line == 0 ||
             !winxterm_host_prepare_stdio_startup(stage_input, stage_output, output_write,
+                                                 0, 0u,
                                                  &startup, &attributes)) {
             if (status == ERROR_NOT_ENOUGH_MEMORY) status = GetLastError();
             goto stage_cleanup;
@@ -2291,6 +2300,10 @@ static void winxterm_host_apply_pending_resize(WinxtermHostContext *host)
     int columns = 0;
     int rows = 0;
     if (winxterm_bridge_peek_pending_resize(bridge, &columns, &rows)) {
+        if (host->pseudo_console == 0) {
+            (void)winxterm_bridge_ack_pending_resize(bridge, columns, rows);
+            return;
+        }
         COORD size;
         size.X = (SHORT)(columns > 0 ? columns : 1);
         size.Y = (SHORT)(rows > 0 ? rows : 1);
@@ -2619,6 +2632,12 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
     HANDLE input_read = 0;
     HANDLE output_read = 0;
     HANDLE output_write = 0;
+    wchar_t host_transport[16];
+    DWORD host_transport_length = GetEnvironmentVariableW(L"WINXTERM_HOST_TRANSPORT",
+                                                           host_transport,
+                                                           16u);
+    bool raw_stdio = host_transport_length == 5u &&
+                     _wcsicmp(host_transport, L"stdio") == 0;
     if (!winxterm_host_create_pipes(&input_read, &host.input_write, &output_read, &output_write)) {
         DWORD error = GetLastError();
         winxterm_log_writef(bridge->log, "ConPTY pipe creation failed, error=%lu", (unsigned long)error);
@@ -2629,22 +2648,28 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
     }
     host.output_read = output_read;
 
-    COORD size;
-    size.X = (SHORT)(bridge->screen.columns > 0 ? bridge->screen.columns : WINXTERM_TERMINAL_COLUMNS);
-    size.Y = (SHORT)(bridge->screen.rows > 0 ? bridge->screen.rows : WINXTERM_TERMINAL_ROWS);
-    HRESULT hr = CreatePseudoConsole(size, input_read, output_write, 0, &host.pseudo_console);
-    winxterm_host_close_handle(&input_read);
-    winxterm_host_close_handle(&output_write);
-    if (FAILED(hr)) {
-        winxterm_log_writef(bridge->log, "CreatePseudoConsole failed, hr=0x%08lx", (unsigned long)hr);
-        winxterm_host_cleanup_context(&host);
-        (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, (uint32_t)hr);
-        winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
-        return 1;
+    if (!raw_stdio) {
+        COORD size;
+        size.X = (SHORT)(bridge->screen.columns > 0 ?
+            bridge->screen.columns : WINXTERM_TERMINAL_COLUMNS);
+        size.Y = (SHORT)(bridge->screen.rows > 0 ?
+            bridge->screen.rows : WINXTERM_TERMINAL_ROWS);
+        HRESULT hr = CreatePseudoConsole(size, input_read, output_write, 0, &host.pseudo_console);
+        winxterm_host_close_handle(&input_read);
+        winxterm_host_close_handle(&output_write);
+        if (FAILED(hr)) {
+            winxterm_log_writef(bridge->log, "CreatePseudoConsole failed, hr=0x%08lx", (unsigned long)hr);
+            winxterm_host_cleanup_context(&host);
+            (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, (uint32_t)hr);
+            winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
+            return 1;
+        }
     }
 
     wchar_t *command_line = winxterm_host_build_command_line(argv, argc);
     if (command_line == 0) {
+        winxterm_host_close_handle(&input_read);
+        winxterm_host_close_handle(&output_write);
         winxterm_host_cleanup_context(&host);
         (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, ERROR_NOT_ENOUGH_MEMORY);
         winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
@@ -2701,6 +2726,8 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                                                            job_environment_count);
     if (environment == 0) {
         free(command_line);
+        winxterm_host_close_handle(&input_read);
+        winxterm_host_close_handle(&output_write);
         winxterm_host_close_handle(&job_request_write);
         winxterm_host_close_handle(&job_reply_read);
         winxterm_host_cleanup_context(&host);
@@ -2711,15 +2738,26 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
 
     STARTUPINFOEXW startup;
     LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = 0;
-    if (!winxterm_host_prepare_startup(host.pseudo_console,
-                                      inherited_handles,
-                                      inherited_handle_count,
-                                      &startup,
-                                      &attribute_list)) {
+    bool startup_prepared = raw_stdio ?
+        winxterm_host_prepare_stdio_startup(input_read,
+                                            output_write,
+                                            output_write,
+                                            inherited_handles,
+                                            inherited_handle_count,
+                                            &startup,
+                                            &attribute_list) :
+        winxterm_host_prepare_startup(host.pseudo_console,
+                                     inherited_handles,
+                                     inherited_handle_count,
+                                     &startup,
+                                     &attribute_list);
+    if (!startup_prepared) {
         DWORD error = GetLastError();
-        winxterm_log_writef(bridge->log, "ConPTY startup attribute setup failed, error=%lu", (unsigned long)error);
+        winxterm_log_writef(bridge->log, "host startup attribute setup failed, error=%lu", (unsigned long)error);
         free(command_line);
         free(environment);
+        winxterm_host_close_handle(&input_read);
+        winxterm_host_close_handle(&output_write);
         winxterm_host_close_handle(&job_request_write);
         winxterm_host_close_handle(&job_reply_read);
         winxterm_host_cleanup_context(&host);
@@ -2733,14 +2771,16 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                                   command_line,
                                   0,
                                   0,
-                                  inherited_handle_count != 0u,
+                                  raw_stdio || inherited_handle_count != 0u,
                                   EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                                      CREATE_SUSPENDED,
+                                      CREATE_SUSPENDED | (raw_stdio ? CREATE_NO_WINDOW : 0u),
                                   environment,
                                   current_directory != 0 && current_directory[0] != L'\0' ? current_directory : 0,
                                   &startup.StartupInfo,
                                   &host.process);
     winxterm_host_restore_standard_handles(standard_handles);
+    winxterm_host_close_handle(&input_read);
+    winxterm_host_close_handle(&output_write);
     winxterm_host_close_handle(&job_request_write);
     winxterm_host_close_handle(&job_reply_read);
     free(command_line);

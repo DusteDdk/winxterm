@@ -21,6 +21,7 @@ typedef enum WinxtermMacroCommandKind {
     WINXTERM_MACRO_COMMAND_WAIT,
     WINXTERM_MACRO_COMMAND_SCREENSHOT,
     WINXTERM_MACRO_COMMAND_SCREEN_DUMP,
+    WINXTERM_MACRO_COMMAND_CELL_DUMP,
     WINXTERM_MACRO_COMMAND_HIST_DUMP,
     WINXTERM_MACRO_COMMAND_WAIT_REDRAW,
     WINXTERM_MACRO_COMMAND_WAIT_HOST,
@@ -48,6 +49,7 @@ typedef struct WinxtermMacroCallbacks {
     bool (*key_up)(void *context, WPARAM virtual_key, WinxtermInputModifiers modifiers);
     bool (*write_screenshot)(void *context, const wchar_t *path);
     bool (*write_screendump)(void *context, const wchar_t *path);
+    bool (*write_celldump)(void *context, const wchar_t *path);
     bool (*write_histdump)(void *context, const wchar_t *path);
     bool (*wait_redraw)(void *context, bool process, bool *ready);
     bool (*wait_host)(void *context, bool *ready);

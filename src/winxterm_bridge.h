@@ -245,10 +245,6 @@ bool winxterm_bridge_wait_for_unpainted_budget(WinxtermBridge *bridge, HANDLE sh
 bool winxterm_bridge_wait_for_output_room(WinxtermBridge *bridge,
                                           size_t byte_count,
                                           HANDLE shutdown_event);
-bool winxterm_bridge_enqueue_output_with_unpainted_lines(WinxtermBridge *bridge,
-                                                         const uint8_t *bytes,
-                                                         size_t byte_count,
-                                                         unsigned int unpainted_lines);
 bool winxterm_bridge_enqueue_output_wait(WinxtermBridge *bridge,
                                          const uint8_t *bytes,
                                          size_t byte_count,

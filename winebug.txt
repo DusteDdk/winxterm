@@ -1,0 +1,78 @@
+_ Verdict: an actual wine bug. Not a winxterm/dstshell bug, and nothing non-vanilla about how they operate.
+
+  Is it a winxterm/dstshell bug? No. dstshell does the canonical modern-Windows dance, and does it defensively: it queries the console size via GetConsoleScreenBufferInfo (gets a truthful 80_24), explicitly requests
+  ENABLE_VIRTUAL_TERMINAL_PROCESSING via SetConsoleMode and checks the return value, and only then emits standard SGR color sequences. The final test above shows why it's blameless: wine answers "OK" to the mode request and
+  even reads the flag back as enabled _ then ignores it in its layout engine. The app is being lied to by the console; there is no API-level way for it to detect that. winxterm's host side is equally standard (its ConPTY
+  setup is textbook, including clearing std handles so the attribute attaches _ they even left a comment about that), and it faithfully renders what conhost hands it, including wine's mid-sequence splits, which is where
+  your literal [0m comes from.
+
+  Is it an actual wine bug? Yes, and now precisely characterized: wine 11.13's conhost, in pseudo-console mode, accepts ENABLE_VIRTUAL_TERMINAL_PROCESSING but its client-write path still lays text into the 80-column buffer
+  counting every raw byte as a printable column _ escape sequences included. When that phantom column count crosses the width, ENABLE_WRAP_AT_EOL_OUTPUT fires and it injects a hard wrap into the re-emitted stream, sometimes
+  splitting an SGR sequence in half (hence orphaned [0m text). Real Windows conhost treats escapes as zero-width here. Two adjacent wine gaps compound it: the client's default output mode under ConPTY lacks VT (0x3 instead
+  of Windows' VT-on default _ harmless for dstshell since it sets the flag itself), and ResizePseudoConsole is a "fake success" stub, so window resizes never reach the hosted shell.
+
+  Is winxterm+dstshell "less than vanilla"? No _ just rare under wine. VT-first truecolor output over ConPTY is exactly the Windows Terminal-era idiom; dstshell is in the same category as PowerShell 7, clink, oh-my-posh,
+  cargo/git colored output. What's unusual is not how it operates but where: almost nothing exercises wine's ConPTY hosting path. Ordinary wine foo.exe CLI runs attach to wine's unix-tty console handling or no console at
+  all; you only reach the buggy pseudo-console layout engine when a terminal-emulator-like Windows host runs under wine _ which is exactly what winxterm is. So this bug has had very few opportunities to be noticed upstream.
+
+  And that's also the complete answer to why ls looks fine: it isn't that builtins take a different path _ everything flows through the same ConPTY. ls output is plain ASCII, so "bytes = visible columns" and wine's broken
+  accounting accidentally produces correct results below column 80. The prompt is the one line that's ~74 invisible bytes wrapped around ~21 visible characters, so it trips the phantom column 80 every single time _ and each
+  timed/keystroke prompt refresh then restores the cursor to a position computed for the unwrapped layout, which is why the damaged prompt block replicates down your screen.
+
+  If you want, I can draft a winehq bug report with the minimal ptyhost/ptychild repro (it's self-contained, ~100 lines total, and demonstrates the accepted-but-ignored mode flag plus the exact byte-boundary behavior) _
+  that's the path to actually fixing this in the harness.
+
+_ Saut_ed for 3m 12s
+
+_ But why does ls manage longer lines than the prompt, and why the [0m in the prompt output ?                                                                                                                                  
+
+_ Both questions have the same one-sentence answer at their core: under wine, every line gets a budget of 80 bytes, not 80 columns _ and the two symptoms are just that budget landing on different bytes.
+
+  Why ls gets longer lines
+
+  ls spends zero bytes of the budget on escape codes. Its output is plain ASCII, so byte count and visible column count are the same number _ wine's broken accounting and correct accounting agree perfectly. On top of that,
+  dstshell's ls formats its column layout to the width it queried (80), so its lines are ~65 visible characters _ 65 bytes: comfortably inside the budget. It doesn't "manage longer lines" by taking a different path _ it
+  simply doesn't waste the budget.
+
+  The prompt spends roughly three quarters of the budget on invisible bytes. Your line [10:29:33] dusted C:/ is 21 visible characters but ~76 bytes, because each color change costs 15_17 unseen bytes:
+
+  ┌─────────────────────────────────────────_───────_────────────────────────────┐
+  │              stream piece               │ bytes │ cumulative "column" (wine) │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ \r + \x1b[J (redraw lead-in after ls)   │ 3     │ 3                          │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ yellow SGR + [10:29:33] + reset + space │ 32    │ 35                         │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ green SGR + dusted + reset + space      │ 26    │ 61                         │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ cwd-color SGR                           │ 15    │ 76                         │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ C:/                                     │ 3     │ 79                         │
+  ├─────────────────────────────────────────┼───────┼────────────────────────────┤
+  │ trailing reset \x1b [ 0 m               │ 4     │ 80 _ wrap _ 83             │
+  └─────────────────────────────────────────┴───────┴────────────────────────────┘
+
+  So wine believes the cursor is at column 79 when only [10:29:33] dusted C:/ (21 chars) is visible _ and the wrap fires four bytes later. With your short C:/ cwd, those four bytes happen to be the trailing color reset
+  itself. With a long cwd like Z:/home/ubuntu/project, column 80 lands inside the path instead _ that's the Z:/h-style mid-word break. One bug, different landing spot.
+
+  Why the literal [0m
+
+  This is the fun part. Wine's conhost isn't "passing colors through" _ it stores every escape byte as a printable glyph in its screen buffer, then re-renders that buffer down the pipe to winxterm. Adjacent glyph runs like
+  ESC [ 3 8 ; 2 ; _ m come back out as consecutive bytes, winxterm's parser re-assembles them into a valid sequence, and the colors work _ by accident. Every intact escape sequence survives this glyph-laundering round trip.
+
+  Except the one the wrap splits. In your line, the reset straddles the boundary exactly:
+
+  - the \x1b byte fills buffer cell 80 _ the last cell of the row,
+  - wine's injected wrap puts [, 0, m at the start of the next row,
+  - so what winxterm receives is _C:/ \x1b \r\n [0m.
+
+  An ESC followed by a carriage return is an aborted escape sequence _ winxterm discards it silently. The orphaned [0m on the next row is no longer part of any sequence, so it renders as ordinary text. That's your stray
+  line. Then the $ continues normally after the prompt's own \r\n.
+
+  So: same corruption both times. The 80-byte boundary falling inside the path gives you a wrapped path; falling inside an escape sequence gives you visible sequence-fragments like [0m. And plain-text output can never show
+  either symptom, because for it the phantom byte-column and the real column are the same thing _ which is precisely why the bug looks like it's picking on the prompt.
+
+  (Side note: pinning down your [0m case let me refine the wrap rule from the earlier captures _ every byte including ESC counts as one cell, with standard deferred end-of-line wrap at 80. All four captured test lines and
+  both of your symptoms fit that rule byte-for-byte.)
+
+
