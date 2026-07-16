@@ -190,6 +190,25 @@ static void winxterm_host_complete_foreground_request(WinxtermHostContext *host,
     }
 }
 
+static bool winxterm_host_auto_remove_finished_foreground(WinxtermHostContext *host,
+                                                           uint64_t job_id)
+{
+    if (host == 0 || job_id == 0u) return false;
+    EnterCriticalSection(&host->runtimes.lock);
+    WinxtermHostManagedChild *child = winxterm_host_find_child_locked(host, job_id);
+    bool ready = child != 0 && child->auto_remove_on_exit &&
+                 !child->foreground_request_registration_pending &&
+                 child->pending_foreground_request_id == 0u;
+    LeaveCriticalSection(&host->runtimes.lock);
+    if (!ready || !winxterm_job_manager_remove_finished_reparent(
+                      &host->bridge->job_manager, job_id)) return false;
+    winxterm_log_writef(host->bridge->log,
+                        "removed completed foreground job=%llu",
+                        (unsigned long long)job_id);
+    winxterm_host_send_resync_event(host);
+    return true;
+}
+
 bool winxterm_host_defer_foreground_request(WinxtermHostContext *host,
                                             WinxtermHostClient *client,
                                             uint64_t job_id,
@@ -201,6 +220,7 @@ bool winxterm_host_defer_foreground_request(WinxtermHostContext *host,
     if (spawned != 0) {
         spawned->pending_foreground_request_id = request_id;
         spawned->pending_foreground_client = client;
+        spawned->foreground_request_registration_pending = false;
     }
     LeaveCriticalSection(&host->runtimes.lock);
     if (spawned == 0) return false;
@@ -210,6 +230,7 @@ bool winxterm_host_defer_foreground_request(WinxtermHostContext *host,
         winxterm_host_complete_foreground_request(host, job_id, ERROR_SUCCESS,
                                                   finished.has_exit_code,
                                                   finished.exit_code);
+        (void)winxterm_host_auto_remove_finished_foreground(host, job_id);
     }
     return true;
 }
@@ -1694,9 +1715,15 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
     LeaveCriticalSection(&child->session.output_lock);
     if (final_process != 0 && GetExitCodeProcess(final_process, &exit_code) &&
         exit_code != STILL_ACTIVE) {
+        WinxtermManagedJobSnapshot exiting_snapshot;
+        bool was_foreground =
+            winxterm_job_manager_snapshot_one(&child->host->bridge->job_manager,
+                                              child->id, &exiting_snapshot) &&
+            exiting_snapshot.foreground;
         EnterCriticalSection(&child->host->runtimes.lock);
         bool merge_foreground = child->host->active_session_id == child->id &&
                                 child->destination_id == 0u;
+        child->auto_remove_on_exit = was_foreground;
         LeaveCriticalSection(&child->host->runtimes.lock);
         (void)winxterm_job_manager_exit(&child->host->bridge->job_manager,
                                        child->id, exit_code);
@@ -1725,6 +1752,7 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
     }
     winxterm_host_complete_foreground_request(child->host, child->id,
                                               ERROR_SUCCESS, true, exit_code);
+    (void)winxterm_host_auto_remove_finished_foreground(child->host, child->id);
     winxterm_host_managed_child_close_runtime(child);
     return exit_code;
 }
@@ -1981,6 +2009,7 @@ stage_cleanup:
                                          background ? WINXTERM_JOB_BACKGROUND :
                                                       WINXTERM_JOB_FOREGROUND);
     if (child->id == 0u) { status = ERROR_NOT_ENOUGH_MEMORY; goto cleanup; }
+    child->foreground_request_registration_pending = !background;
     registered = true;
     PROCESS_INFORMATION *final_stage = &child->stage_processes[child->stage_count - 1u];
     (void)winxterm_job_manager_set_process(&host->bridge->job_manager, child->id,
@@ -2113,6 +2142,7 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
                                          background ? WINXTERM_JOB_BACKGROUND :
                                                       WINXTERM_JOB_FOREGROUND);
     if (child->id == 0u) goto cleanup;
+    child->foreground_request_registration_pending = !background;
     registered = true;
     if (nested_client) {
         child->client = (WinxtermHostClient *)calloc(1u, sizeof(*child->client));
@@ -2903,6 +2933,7 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                 }
             }
         }
+        winxterm_host_prune_removed_children(&host);
         bool headless = winxterm_bridge_is_headless(bridge);
         if (headless && host.root_is_shell && !host.child_exited &&
             !host.root_headless_shutdown_requested) {

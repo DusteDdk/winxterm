@@ -7,6 +7,10 @@ waitms 750
 waitredraw -w
 celldump Z:/tmp/winxterm-shim-finite.txt
 histdump Z:/tmp/winxterm-shim-finite.log
+enterstring job ls
+waitms 500
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-joblist.txt
 enterstring cmd.exe /q
 waitms 750
 enterstring echo SHIM_INTERACTIVE

@@ -34,7 +34,8 @@ typedef enum WinxtermFrameCause {
     WINXTERM_FRAME_CAUSE_CONTENT = 0x01u,
     WINXTERM_FRAME_CAUSE_RESIZE = 0x02u,
     WINXTERM_FRAME_CAUSE_PRESENTATION = 0x04u,
-    WINXTERM_FRAME_CAUSE_ROW_PRESENTATION = 0x08u
+    WINXTERM_FRAME_CAUSE_ROW_PRESENTATION = 0x08u,
+    WINXTERM_FRAME_CAUSE_CHROME = 0x10u
 } WinxtermFrameCause;
 
 typedef enum WinxtermHostState {
@@ -163,6 +164,8 @@ typedef struct WinxtermBridge {
     bool show_render_stats_in_title;
     unsigned int unpainted_line_limit;
     unsigned int unpainted_lines;
+    uint64_t accepted_visual_lines;
+    uint64_t painted_visual_lines;
     uint8_t *input_buffer;
     uint8_t *output_buffer;
     uint8_t *output_commit_scratch;
@@ -293,9 +296,9 @@ bool winxterm_bridge_take_job_view(WinxtermBridge *bridge, uint64_t *job_id,
 bool winxterm_bridge_request_job_ui(WinxtermBridge *bridge);
 bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
                                    size_t max_bytes,
-                                   bool *content_changed,
+                                   bool *screen_changed,
                                    bool *more_pending,
-                                   bool *presentation_changed);
+                                   bool *chrome_changed);
 size_t winxterm_bridge_read_input(WinxtermBridge *bridge, uint8_t *buffer, size_t buffer_capacity);
 size_t winxterm_bridge_read_session_input(WinxtermBridge *bridge, uint64_t session_id,
                                           uint8_t *buffer, size_t buffer_capacity);
@@ -323,6 +326,8 @@ void winxterm_bridge_add_unpainted_lines(WinxtermBridge *bridge, unsigned int li
 void winxterm_bridge_add_unpainted_lines_locked(WinxtermBridge *bridge, unsigned int line_count);
 void winxterm_bridge_mark_painted(WinxtermBridge *bridge);
 void winxterm_bridge_mark_painted_locked(WinxtermBridge *bridge);
+void winxterm_bridge_mark_painted_through(WinxtermBridge *bridge,
+                                          uint64_t covered_visual_lines);
 void winxterm_bridge_note_frame(WinxtermBridge *bridge);
 void winxterm_bridge_set_host_starting(WinxtermBridge *bridge);
 void winxterm_bridge_set_host_child(WinxtermBridge *bridge, DWORD process_id,

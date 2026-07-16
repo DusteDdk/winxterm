@@ -60,6 +60,8 @@ bool winxterm_job_manager_fail(WinxtermJobManager *manager, uint64_t id, uint32_
 uint64_t winxterm_job_manager_foreground_id(WinxtermJobManager *manager);
 bool winxterm_job_manager_remove(WinxtermJobManager *manager,
                                 uint64_t requester_id, uint64_t target_id);
+bool winxterm_job_manager_remove_finished_reparent(WinxtermJobManager *manager,
+                                                   uint64_t target_id);
 size_t winxterm_job_manager_clean(WinxtermJobManager *manager, uint64_t requester_id);
 bool winxterm_job_manager_snapshot(WinxtermJobManager *manager,
                                   uint64_t requester_id,

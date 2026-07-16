@@ -18,7 +18,9 @@ The executable is a GUI subsystem application. Command-line maintenance paths, s
 
 `src/main.c` owns process startup. It parses command-line options, dispatches `--smoke` and `--glyphbench`, initializes the disabled debug-log handle, initializes threaded runtime, and performs shutdown cleanup. It also handles console-vs-dialog help output.
 
-`src/winxterm_app.c` owns the native Win32 window and frame scheduler. It registers the window class, tracks resize/minimize/maximize/restore events, applies integer display scaling, propagates terminal cell-size changes through the bridge, toggles fullscreen with Alt+Enter, encodes keyboard messages, and renders dirty screen rows directly into one persistent DIB on the window thread. `WM_PAINT` only copies that DIB into the client area. When the persisted scrollbar setting is on, the app also hosts the native vertical scrollbar and translates `WM_VSCROLL` gestures into viewport scrolling.
+`src/winxterm_app.c` owns the native Win32 window and the presentation pipeline. It registers the window class, tracks resize/minimize/maximize/restore events, applies integer display scaling, propagates terminal cell-size changes through the bridge, toggles fullscreen with Alt+Enter, encodes keyboard messages, and renders dirty screen rows directly into one persistent DIB on the window thread. Incoming output notifications first drive bounded parsing and screen-model mutation; only afterward does the app map accumulated damage into the current viewport and decide whether presentation work exists. Scheduled deadlines carry no pixel or screen snapshot, so a frame always reads the newest accepted model. `WM_PAINT` only copies the DIB into the client area. When the persisted scrollbar setting is on, the app also hosts the native vertical scrollbar and translates `WM_VSCROLL` gestures into viewport scrolling.
+
+`src/winxterm_frame_scheduler.*` owns presentation timing independently of parsing and damage. It measures only work turns in which parsed output changed the current viewport. Fewer than 16 such turns in the trailing second use a 16 ms trailing-edge debounce, more than 16 use a non-postponing 16 ms cadence, and exactly 16 retains the current mode to avoid threshold oscillation. Local UI changes use the selected mode without affecting the parsed-output rate. A deadline firing performs another bounded output commit before testing the deadline again, which lets newly accepted state postpone a debounced frame while sustained output keeps its established cadence.
 
 `src/winxterm_render.c` owns reusable damage-bitset operations, pixel clearing and in-place scrolling, AVX2 row-mask glyph drawing, and the fixed-cell cached TTF fallback blitter for codepoints outside the built-in bitmap atlas. There is no runtime renderer selection or color-keyed glyph cache.
 
@@ -46,7 +48,7 @@ The host creates concurrent multi-stage pipelines from typed plans, including pr
 
 `src/winxterm_input.c` owns keyboard input encoding. It converts printable characters, Alt printable prefixes, cursor/navigation keys, function keys, and modifier variants into terminal byte sequences for the host input queue.
 
-`src/winxterm_bridge.c` owns shared state between the window thread and producer/client thread: the screen lock, fixed circular output queue, reusable commit scratch, serialized parser commits, unpainted-line backpressure, elastic host input queue, pending resize state and coalescing counters, direct-child host state, headless/terminate requests, terminal title, bell notification state, window update posting, and pipeline diagnostics.
+`src/winxterm_bridge.c` owns shared state between the window thread and producer/client thread: the screen lock, fixed circular output queue, reusable commit scratch, serialized parser commits, paint-coverage backpressure, elastic host input queue, pending resize state and coalescing counters, direct-child host state, headless/terminate requests, terminal title, bell notification state, window update posting, and pipeline diagnostics. Producer `WriteFile` fragmentation is preserved: each enqueue only updates the byte queue and coalesces a work notification; it never constructs a future frame. Title and bell changes are classified as window chrome and are applied without dirtying the terminal DIB.
 
 `src/winxterm_log.c` owns opt-in debug-log path creation and timestamped log writes. Runtime logs are disabled by default; `set debuglog on` creates `%USERPROFILE%\.winxterm\logs\winxterm-debug-{PID}.txt`.
 
@@ -82,9 +84,11 @@ flowchart LR
     textDecoder --> ansiParser[ANSI CSI OSC Parser]
     ansiParser --> terminalOps[Terminal Operations]
     terminalOps --> screenModel
+    screenModel --> viewportDamage[Current Viewport Damage]
+    viewportDamage --> frameDeadline[Adaptive Frame Deadline]
     resizeEvent[Window Resize] --> bridge
     bridge --> conptyResize[ResizePseudoConsole]
-    screenModel --> dirtyRows[Dirty Row Rasterizer]
+    frameDeadline --> dirtyRows[Dirty Row Rasterizer]
     dirtyRows --> dib[Persistent DIB Section]
     dib --> gdiPaint[Clipped GDI Paint]
     gdiPaint --> clientArea[Terminal Area]
@@ -94,7 +98,9 @@ flowchart LR
 
 The application keeps window/message handling separate from terminal state and producer-side output. `WinxtermApp` owns the native `HWND`, one persistent top-down 32-bit DIB section, reusable row damage, one fallback-glyph cache, and fullscreen restore state. Pixels are mutated and presented only by the window thread.
 
-Terminal operations accumulate exact dirty rows. The window thread renders only contiguous dirty runs directly from locked screen row views, or scrolls existing pixels in place for an eligible full-screen upward scroll. It invalidates the corresponding scaled bands. `WM_PAINT` only copies the persistent DIB with `BitBlt` or clipped `StretchBlt`; expose paints never parse or rasterize terminal state. Surface generations release producer backpressure only after newly rendered pixels are presented.
+Terminal operations accumulate cell-content and structural row damage. Cursor motion is model state rather than row damage: immediately before a frame, the app compares the final accepted cursor with the last presented cursor and damages only the old and new rows if they differ. This collapses any number of intermediate cursor positions within a scheduling window. Selection and overlay state are handled similarly at presentation time.
+
+The window thread renders only contiguous dirty runs directly from locked screen row views, or scrolls existing pixels in place for an eligible full-screen upward scroll. It invalidates the corresponding scaled bands. `WM_PAINT` only copies the persistent DIB with `BitBlt` or clipped `StretchBlt`; expose paints never parse or rasterize terminal state. Each DIB records the accepted visual-line watermark it covers. A paint releases backpressure only through that watermark, so painting an older generation cannot acknowledge newer accepted output. Parsed advances that are proven to be outside the current viewport are acknowledged without creating a DIB; if an older visual update is still awaiting paint, the ordered watermark remains held until that generation is presented.
 
 Pipeline diagnostics record totals plus logarithmic p50/p95/p99 latency distributions for queue copy, parser/apply, screen-lock waits, row rasterization, in-place scroll, invalidation-to-paint, and GDI presentation. Counters also track committed batches, queue high-water, dirty rows, full repaints, scroll blits, frames, and invalidated pixels. The Diagnostics menu writes a snapshot to the opt-in debug log; instrumentation occurs at stage boundaries rather than in the glyph loop.
 
@@ -102,7 +108,7 @@ Pipeline diagnostics record totals plus logarithmic p50/p95/p99 latency distribu
 
 The production renderer is always the fixed-font row-mask path with cached Unicode fallback. `--glyphbench` measures that path only; the former renderer and worker-count options are rejected.
 
-`--unpaintedlines` sets the accepted-but-unpainted producer line budget. Hosted ConPTY output blocks before parser/screen acceptance when this budget is reached, preserving terminal correctness while allowing the child to block naturally through ConPTY pipes. The demo intentionally bypasses this wait so it can stress the rendering path with output faster than painting.
+`--unpaintedlines` sets the accepted-but-not-yet-covered producer line budget. Hosted ConPTY output blocks before parser/screen acceptance when this budget is reached, preserving terminal correctness while allowing the child to block naturally through ConPTY pipes. Coverage means either that the corresponding latest-state DIB was painted or that viewport classification proved the work invisible. The demo intentionally bypasses this wait so it can stress the rendering path with output faster than painting.
 
 `-x <integer>` sets the startup display scale from 1 through 100, defaulting to 1. `dstshell` also supports `set scale N` at runtime by emitting the public winxterm OSC control protocol. Runtime scale requests are posted through the bridge to the window thread, preserve a scrolled viewport anchor where possible, resize the window in normal windowed mode, and recompute capacity in maximized or fullscreen mode.
 

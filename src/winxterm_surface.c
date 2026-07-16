@@ -80,6 +80,7 @@ bool winxterm_surface_resize(WinxtermSurface *surface, HDC reference_dc,
     }
     replacement.generation = surface->generation;
     replacement.painted_generation = surface->painted_generation;
+    replacement.covered_visual_lines = surface->covered_visual_lines;
     WinxtermSurface old = *surface;
     *surface = replacement;
     winxterm_surface_dispose(&old);

@@ -47,6 +47,8 @@ typedef struct WinxtermHostManagedChild {
     bool attachment_tee;
     bool output_eof;
     bool redirected_output_eof;
+    bool foreground_request_registration_pending;
+    bool auto_remove_on_exit;
 } WinxtermHostManagedChild;
 
 typedef struct WinxtermManagedRuntimeRegistry {

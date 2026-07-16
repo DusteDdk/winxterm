@@ -23,7 +23,8 @@ cmake --build "$BUILD_DIR" --target winxterm dstshell --parallel "${JOBS:-8}"
 [[ -f "$EXE" ]] || fail "missing $EXE"
 rm -f /tmp/winxterm-shim-finite.txt /tmp/winxterm-shim-finite.log \
       /tmp/winxterm-shim-interactive.txt /tmp/winxterm-shim-interactive.log \
-      /tmp/winxterm-shim-root-cmd.txt /tmp/winxterm-shim-root-cmd.log
+      /tmp/winxterm-shim-root-cmd.txt /tmp/winxterm-shim-root-cmd.log \
+      /tmp/winxterm-shim-joblist.txt
 rm -f /tmp/winxterm-shim-host.log
 
 started_display=0
@@ -78,6 +79,7 @@ for output in \
     /tmp/winxterm-shim-finite.log \
     /tmp/winxterm-shim-interactive.txt \
     /tmp/winxterm-shim-interactive.log \
+    /tmp/winxterm-shim-joblist.txt \
     /tmp/winxterm-shim-root-cmd.txt \
     /tmp/winxterm-shim-root-cmd.log; do
     [[ -f "$output" ]] || fail "missing $output"
@@ -87,6 +89,9 @@ grep -aEq '^SHIM_STDOUT[[:space:]]*$' /tmp/winxterm-shim-finite.txt ||
     fail 'finite external stdout did not remain in the visible shell session'
 grep -aFq 'SHIM_STDOUT' /tmp/winxterm-shim-finite.log ||
     fail 'finite external stdout was not merged into shell history'
+if grep -aFq '(exited)' /tmp/winxterm-shim-joblist.txt; then
+    fail 'completed foreground external job remained in the job list'
+fi
 grep -aFq 'SHIM_INTERACTIVE' /tmp/winxterm-shim-interactive.txt ||
     fail 'interactive external command output did not remain visible'
 grep -aFq 'SHIM_INTERACTIVE' /tmp/winxterm-shim-interactive.log ||

@@ -2,6 +2,7 @@
 #define WINXTERM_APP_H
 
 #include "winxterm_bridge.h"
+#include "winxterm_frame_scheduler.h"
 #include "winxterm_log.h"
 #include "winxterm_render.h"
 #include "winxterm_surface.h"
@@ -44,16 +45,18 @@ typedef struct WinxtermApp {
     unsigned int display_scale;
     WinxtermMacro *macro;
     WinxtermRenderDamage render_damage;
+    WinxtermFrameScheduler frame_scheduler;
     bool rendered_cursor_valid;
     int rendered_cursor_row;
+    int rendered_cursor_col;
     bool rendered_selection_valid;
     WinxtermScreenSelectionRange rendered_selection;
-    unsigned int deferred_frame_causes;
+    bool visual_update_pending;
     UINT_PTR frame_timer_id;
     UINT_PTR macro_timer_id;
+    uint64_t macro_redraw_idle_since_ns;
     UINT_PTR click_event_timer_id;
     UINT_PTR copy_overlay_timer_id;
-    DWORD last_frame_tick;
     uint64_t invalidation_start_ns;
     bool pending_resize;
     WPARAM pending_resize_kind;

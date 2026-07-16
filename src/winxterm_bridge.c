@@ -12,8 +12,8 @@
 
 typedef struct WinxtermBridgeOutputCommit {
     WinxtermBridge *bridge;
-    bool content_changed;
-    bool presentation_changed;
+    bool screen_changed;
+    bool chrome_changed;
 } WinxtermBridgeOutputCommit;
 
 static bool winxterm_bridge_field_equals(const char *field,
@@ -242,12 +242,12 @@ static bool winxterm_bridge_terminal_sink(void *context, const WinxtermTerminalO
     }
     if (op->type == WINXTERM_TERMINAL_OP_TITLE) {
         winxterm_bridge_set_title_utf8(bridge, op->data.title.text, op->data.title.length);
-        commit->presentation_changed = true;
+        commit->chrome_changed = true;
         return true;
     }
     if (op->type == WINXTERM_TERMINAL_OP_BELL) {
         if (winxterm_bridge_note_bell(bridge)) {
-            commit->presentation_changed = true;
+            commit->chrome_changed = true;
         }
         return true;
     }
@@ -335,7 +335,7 @@ static bool winxterm_bridge_terminal_sink(void *context, const WinxtermTerminalO
     }
     bool ok = winxterm_screen_apply_op(&bridge->screen, op);
     if (ok) {
-        commit->content_changed = true;
+        commit->screen_changed = true;
     }
     return ok;
 }
@@ -1202,18 +1202,18 @@ bool winxterm_bridge_enqueue_output_wait(WinxtermBridge *bridge,
 
 bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
                                    size_t max_bytes,
-                                   bool *content_changed,
+                                   bool *screen_changed,
                                    bool *more_pending,
-                                   bool *presentation_changed)
+                                   bool *chrome_changed)
 {
-    if (content_changed != 0) {
-        *content_changed = false;
+    if (screen_changed != 0) {
+        *screen_changed = false;
     }
     if (more_pending != 0) {
         *more_pending = false;
     }
-    if (presentation_changed != 0) {
-        *presentation_changed = false;
+    if (chrome_changed != 0) {
+        *chrome_changed = false;
     }
     if (bridge == 0) {
         return false;
@@ -1303,11 +1303,11 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
     bool still_pending = !bridge->output_paused && bridge->output_count != 0u;
     LeaveCriticalSection(&bridge->input_lock);
 
-    if (content_changed != 0) {
-        *content_changed = commit.content_changed;
+    if (screen_changed != 0) {
+        *screen_changed = commit.screen_changed;
     }
-    if (presentation_changed != 0) {
-        *presentation_changed = commit.presentation_changed;
+    if (chrome_changed != 0) {
+        *chrome_changed = commit.chrome_changed;
     }
     if (more_pending != 0) {
         *more_pending = still_pending;
@@ -1396,7 +1396,7 @@ bool winxterm_bridge_note_bell(WinxtermBridge *bridge)
     }
     bridge->bell_pending = true;
     LeaveCriticalSection(&bridge->input_lock);
-    winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_CHROME);
     return true;
 }
 
@@ -1424,7 +1424,7 @@ void winxterm_bridge_set_bell_enabled(WinxtermBridge *bridge, bool enabled)
         bridge->bell_pending = false;
     }
     LeaveCriticalSection(&bridge->input_lock);
-    winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_PRESENTATION);
+    winxterm_bridge_request_frame(bridge, WINXTERM_FRAME_CAUSE_CHROME);
 }
 
 bool winxterm_bridge_bell_enabled(WinxtermBridge *bridge)
@@ -1620,6 +1620,11 @@ void winxterm_bridge_add_unpainted_lines_locked(WinxtermBridge *bridge, unsigned
         return;
     }
 
+    if (UINT64_MAX - bridge->accepted_visual_lines < (uint64_t)line_count) {
+        bridge->accepted_visual_lines = UINT64_MAX;
+    } else {
+        bridge->accepted_visual_lines += (uint64_t)line_count;
+    }
     if (UINT_MAX - bridge->unpainted_lines < line_count) {
         bridge->unpainted_lines = UINT_MAX;
     } else {
@@ -1648,10 +1653,33 @@ void winxterm_bridge_mark_painted_locked(WinxtermBridge *bridge)
         return;
     }
 
+    bridge->painted_visual_lines = bridge->accepted_visual_lines;
     bridge->unpainted_lines = 0;
     if (bridge->unpainted_below_limit_event != 0 && !bridge->output_paused) {
         SetEvent(bridge->unpainted_below_limit_event);
     }
+}
+
+void winxterm_bridge_mark_painted_through(WinxtermBridge *bridge,
+                                          uint64_t covered_visual_lines)
+{
+    if (bridge == 0) return;
+    EnterCriticalSection(&bridge->screen_lock);
+    if (covered_visual_lines > bridge->accepted_visual_lines) {
+        covered_visual_lines = bridge->accepted_visual_lines;
+    }
+    if (covered_visual_lines > bridge->painted_visual_lines) {
+        bridge->painted_visual_lines = covered_visual_lines;
+    }
+    uint64_t outstanding = bridge->accepted_visual_lines - bridge->painted_visual_lines;
+    bridge->unpainted_lines = outstanding > UINT_MAX ? UINT_MAX : (unsigned int)outstanding;
+    if (bridge->unpainted_below_limit_event != 0 && !bridge->output_paused &&
+        bridge->unpainted_lines < bridge->unpainted_line_limit) {
+        SetEvent(bridge->unpainted_below_limit_event);
+    } else if (bridge->unpainted_below_limit_event != 0) {
+        ResetEvent(bridge->unpainted_below_limit_event);
+    }
+    LeaveCriticalSection(&bridge->screen_lock);
 }
 
 void winxterm_bridge_note_frame(WinxtermBridge *bridge)
@@ -1792,6 +1820,7 @@ void winxterm_bridge_request_headless(WinxtermBridge *bridge)
     LeaveCriticalSection(&bridge->input_lock);
 
     EnterCriticalSection(&bridge->screen_lock);
+    bridge->painted_visual_lines = bridge->accepted_visual_lines;
     bridge->unpainted_lines = 0u;
     if (bridge->unpainted_below_limit_event != 0) {
         SetEvent(bridge->unpainted_below_limit_event);

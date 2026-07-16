@@ -17,6 +17,7 @@ add_executable(winxterm WIN32
     src/winxterm_bridge.c
     src/winxterm_client.c
     src/winxterm_clipboard.c
+    src/winxterm_frame_scheduler.c
     src/winxterm_glyph_fallback.cpp
     src/winxterm_host.c
     src/winxterm_input.c

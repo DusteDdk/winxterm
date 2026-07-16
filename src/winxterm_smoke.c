@@ -5,6 +5,7 @@
 #include "winxterm_bridge.h"
 #include "winxterm_client.h"
 #include "winxterm_clipboard.h"
+#include "winxterm_frame_scheduler.h"
 #include "winxterm_input.h"
 #include "winxterm_job_channel.h"
 #include "winxterm_job_journal.h"
@@ -493,6 +494,31 @@ static void winxterm_smoke_test_job_control_contracts(WinxtermSmokeState *state)
                               winxterm_job_manager_remove(&manager, root, child),
                           "an ancestor should remove exited leaf jobs in dependency order");
     winxterm_job_manager_dispose(&manager);
+
+    WinxtermJobManager auto_remove_manager;
+    bool auto_remove_ok = winxterm_job_manager_init(&auto_remove_manager);
+    uint64_t auto_root = auto_remove_ok ?
+        winxterm_job_manager_add(&auto_remove_manager, 0u, WINXTERM_JOB_FOREGROUND) : 0u;
+    uint64_t auto_child = auto_root != 0u ?
+        winxterm_job_manager_add(&auto_remove_manager, auto_root,
+                                 WINXTERM_JOB_FOREGROUND) : 0u;
+    uint64_t auto_descendant = auto_child != 0u ?
+        winxterm_job_manager_add(&auto_remove_manager, auto_child,
+                                 WINXTERM_JOB_BACKGROUND) : 0u;
+    WinxtermManagedJobSnapshot auto_snapshot;
+    auto_remove_ok = auto_descendant != 0u &&
+        winxterm_job_manager_exit(&auto_remove_manager, auto_child, 7u) &&
+        winxterm_job_manager_remove_finished_reparent(&auto_remove_manager, auto_child) &&
+        !winxterm_job_manager_snapshot_one(&auto_remove_manager, auto_child,
+                                           &auto_snapshot) &&
+        winxterm_job_manager_snapshot_one(&auto_remove_manager, auto_descendant,
+                                          &auto_snapshot) &&
+        auto_snapshot.owner_id == auto_root &&
+        winxterm_job_manager_authorized(&auto_remove_manager, auto_root,
+                                        auto_descendant);
+    winxterm_smoke_expect(state, auto_remove_ok,
+                          "removing a completed foreground job should reparent its descendants");
+    winxterm_job_manager_dispose(&auto_remove_manager);
 
     WinxtermJobManager large_manager;
     bool large_ok = winxterm_job_manager_init(&large_manager);
@@ -1783,6 +1809,12 @@ static void winxterm_smoke_test_bridge_hardening(WinxtermSmokeState *state)
     winxterm_smoke_expect(state,
                           bridge.unpainted_lines == 1u,
                           "resumed applied output should consume visual-line budget");
+    uint64_t covered_visual_lines = bridge.accepted_visual_lines;
+    winxterm_bridge_add_unpainted_lines(&bridge, 1u);
+    winxterm_bridge_mark_painted_through(&bridge, covered_visual_lines);
+    winxterm_smoke_expect(state,
+                          bridge.unpainted_lines == 1u,
+                          "paint coverage should not release lines accepted after that surface");
     winxterm_bridge_mark_painted(&bridge);
 
     uint8_t soft_wrap_output[WINXTERM_TERMINAL_COLUMNS + 1u];
@@ -3428,6 +3460,67 @@ static void winxterm_smoke_test_renderers(WinxtermSmokeState *state)
     free(reference);
 }
 
+static void winxterm_smoke_test_frame_scheduler(WinxtermSmokeState *state)
+{
+    WinxtermFrameScheduler scheduler;
+    winxterm_frame_scheduler_init(&scheduler);
+    uint64_t now = 1000000000ull;
+    winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    winxterm_smoke_expect(state,
+                          scheduler.deadline_armed &&
+                              scheduler.mode == WINXTERM_FRAME_PACING_DEBOUNCED &&
+                              scheduler.deadline_ns == now + WINXTERM_FRAME_INTERVAL_NS,
+                          "a first visible update should arm a trailing deadline");
+
+    now += 4000000ull;
+    winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    winxterm_smoke_expect(state,
+                          scheduler.deadline_ns == now + WINXTERM_FRAME_INTERVAL_NS &&
+                              !winxterm_frame_scheduler_due(&scheduler, now + 15000000ull),
+                          "low-rate visible updates should rearm the trailing deadline");
+
+    for (unsigned int i = 2u; i < WINXTERM_VISIBLE_RATE_SAMPLE_CAPACITY; ++i) {
+        now += 1000000ull;
+        winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    }
+    winxterm_smoke_expect(state,
+                          scheduler.mode == WINXTERM_FRAME_PACING_SUSTAINED &&
+                              scheduler.deadline_armed,
+                          "the seventeenth visible update in one second should enter sustained mode");
+    uint64_t sustained_deadline = scheduler.deadline_ns;
+    now += 1000000ull;
+    winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    winxterm_smoke_expect(state,
+                          scheduler.deadline_ns == sustained_deadline,
+                          "sustained updates should not postpone an armed cadence deadline");
+
+    uint64_t sampled_updates = scheduler.visible_updates;
+    winxterm_frame_scheduler_schedule(&scheduler, now + 1000000ull);
+    winxterm_smoke_expect(state,
+                          scheduler.visible_updates == sampled_updates &&
+                              scheduler.deadline_ns == sustained_deadline,
+                          "local visual scheduling should not affect the parsed-update rate");
+
+    now = 2005000001ull;
+    winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    winxterm_smoke_expect(state,
+                          scheduler.mode == WINXTERM_FRAME_PACING_SUSTAINED &&
+                              winxterm_frame_scheduler_recent_visible_updates(&scheduler, now) == 16u,
+                          "exactly sixteen visible updates should retain sustained mode");
+
+    now = 3000000000ull;
+    winxterm_frame_scheduler_note_visible_update(&scheduler, now);
+    winxterm_smoke_expect(state,
+                          scheduler.mode == WINXTERM_FRAME_PACING_DEBOUNCED &&
+                              scheduler.deadline_ns == now + WINXTERM_FRAME_INTERVAL_NS,
+                          "an expired visible-update window should return to debounce mode");
+    winxterm_frame_scheduler_note_presented(&scheduler, now + WINXTERM_FRAME_INTERVAL_NS);
+    winxterm_smoke_expect(state,
+                          !scheduler.deadline_armed &&
+                              scheduler.last_present_ns == now + WINXTERM_FRAME_INTERVAL_NS,
+                          "presentation should consume the active deadline");
+}
+
 static void winxterm_smoke_test_surface(WinxtermSmokeState *state)
 {
     WinxtermSurface surface;
@@ -3525,6 +3618,7 @@ int winxterm_smoke_run(void)
     winxterm_smoke_test_macro_capture_commands(&state);
     winxterm_smoke_test_daily_ux_helpers(&state);
     winxterm_smoke_test_renderers(&state);
+    winxterm_smoke_test_frame_scheduler(&state);
     winxterm_smoke_test_surface(&state);
 
     return state.failures == 0 ? 0 : 1;

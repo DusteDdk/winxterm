@@ -342,6 +342,35 @@ bool winxterm_job_manager_remove(WinxtermJobManager *manager, uint64_t requester
     return removed;
 }
 
+bool winxterm_job_manager_remove_finished_reparent(WinxtermJobManager *manager,
+                                                   uint64_t target_id)
+{
+    WinxtermJobManagerImpl *impl = winxterm_job_manager_impl(manager);
+    if (impl == 0 || target_id == 0u) return false;
+    EnterCriticalSection(&impl->lock);
+    bool removed = false;
+    for (size_t i = 0u; i < impl->job_count; ++i) {
+        WinxtermManagedJob *target = impl->jobs + i;
+        if (target->value.id != target_id ||
+            (target->value.state != WINXTERM_JOB_EXITED &&
+             target->value.state != WINXTERM_JOB_FAILED)) continue;
+        uint64_t owner_id = target->value.owner_id;
+        for (size_t child = 0u; child < impl->job_count; ++child) {
+            if (impl->jobs[child].value.owner_id == target_id) {
+                impl->jobs[child].value.owner_id = owner_id;
+            }
+        }
+        winxterm_job_manager_remove_stack_locked(impl, target_id);
+        memmove(impl->jobs + i, impl->jobs + i + 1u,
+                (impl->job_count - i - 1u) * sizeof(*impl->jobs));
+        --impl->job_count;
+        removed = true;
+        break;
+    }
+    LeaveCriticalSection(&impl->lock);
+    return removed;
+}
+
 size_t winxterm_job_manager_clean(WinxtermJobManager *manager, uint64_t requester_id)
 {
     WinxtermJobManagerImpl *impl = winxterm_job_manager_impl(manager);

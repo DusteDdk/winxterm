@@ -35,7 +35,6 @@ static const UINT_PTR WINXTERM_MACRO_TIMER_ID = 4u;
 static const UINT_PTR WINXTERM_CLICK_EVENT_TIMER_ID = 5u;
 static const UINT_PTR WINXTERM_COPY_OVERLAY_TIMER_ID = 6u;
 static const UINT WINXTERM_DEFAULT_CURSOR_BLINK_MS = 500u;
-static const UINT WINXTERM_FRAME_THROTTLE_MS = 16u;
 static const uint64_t WINXTERM_PARSE_TURN_BUDGET_NS = 4u * 1000u * 1000u;
 static const size_t WINXTERM_PARSE_SLICE_BYTES = 32u * 1024u;
 static const UINT WINXTERM_COPY_OVERLAY_FRAME_MS = 33u;
@@ -105,7 +104,9 @@ enum {
 static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK winxterm_close_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes);
-static void winxterm_app_set_frame_timer(WinxtermApp *app, UINT delay_ms);
+static void winxterm_app_arm_frame_timer(WinxtermApp *app);
+static void winxterm_app_process_work(WinxtermApp *app, unsigned int causes);
+static void winxterm_app_maybe_present(WinxtermApp *app, bool force);
 static void winxterm_app_handle_macro_update(WinxtermApp *app);
 static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam);
 static void winxterm_app_dump_screen_to_file(WinxtermApp *app);
@@ -436,6 +437,7 @@ static void winxterm_app_note_rendered_cursor(WinxtermApp *app,
         if (app != 0) {
             app->rendered_cursor_valid = false;
             app->rendered_cursor_row = 0;
+            app->rendered_cursor_col = 0;
         }
         return;
     }
@@ -443,10 +445,12 @@ static void winxterm_app_note_rendered_cursor(WinxtermApp *app,
     if (local_row >= (size_t)snapshot->rows) {
         app->rendered_cursor_valid = false;
         app->rendered_cursor_row = 0;
+        app->rendered_cursor_col = 0;
         return;
     }
     app->rendered_cursor_valid = true;
     app->rendered_cursor_row = (int)local_row;
+    app->rendered_cursor_col = snapshot->cursor_col;
 }
 
 static void winxterm_app_include_render_row_range(int *top, int *bottom, int row_start, int row_end)
@@ -1004,11 +1008,22 @@ static void winxterm_app_mark_selection_rows(
                                      (int)(last - visible_first));
 }
 
-static void winxterm_app_render_main_area(WinxtermApp *app)
+static bool winxterm_app_selection_equal(const WinxtermScreenSelectionRange *a,
+                                         const WinxtermScreenSelectionRange *b)
+{
+    if (a == 0 || b == 0 || a->enabled != b->enabled) return false;
+    if (!a->enabled) return true;
+    return a->alternate == b->alternate &&
+           a->rectangular == b->rectangular &&
+           a->start_row == b->start_row && a->end_row == b->end_row &&
+           a->start_column == b->start_column && a->end_column == b->end_column;
+}
+
+static bool winxterm_app_render_main_area(WinxtermApp *app)
 {
     if (app == 0 || app->bridge == 0 || app->surface.pixels == 0 || app->surface.width <= 0 ||
         app->surface.height <= 0) {
-        return;
+        return false;
     }
     WinxtermScreenRenderState snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
@@ -1036,23 +1051,35 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
                                                         &view);
     if (!state_ready) {
         LeaveCriticalSection(&app->bridge->screen_lock);
-        return;
-    }
-    if (app->rendered_cursor_valid) {
-        winxterm_render_damage_mark_row(&app->render_damage, app->rendered_cursor_row);
+        return false;
     }
     int current_cursor_row = 0;
-    if (winxterm_app_snapshot_cursor_local_row(&snapshot, &current_cursor_row)) {
+    bool current_cursor_valid =
+        winxterm_app_snapshot_cursor_local_row(&snapshot, &current_cursor_row);
+    bool cursor_changed = app->rendered_cursor_valid != current_cursor_valid;
+    if (!cursor_changed && current_cursor_valid) {
+        cursor_changed = app->rendered_cursor_row != current_cursor_row ||
+                         app->rendered_cursor_col != snapshot.cursor_col;
+    }
+    if (cursor_changed && app->rendered_cursor_valid) {
+        int stale_row = app->rendered_cursor_row;
+        if (app->render_damage.scroll_valid) {
+            stale_row -= app->render_damage.scroll_rows;
+        }
+        winxterm_render_damage_mark_row(&app->render_damage, stale_row);
+    }
+    if (cursor_changed && current_cursor_valid) {
         winxterm_render_damage_mark_row(&app->render_damage, current_cursor_row);
     }
-    if (app->rendered_selection_valid) {
+    bool selection_changed = !app->rendered_selection_valid ||
+        !winxterm_app_selection_equal(&app->rendered_selection, &snapshot.selection);
+    if (selection_changed && app->rendered_selection_valid) {
         winxterm_app_mark_selection_rows(&app->render_damage, &snapshot,
                                          &app->rendered_selection);
     }
-    winxterm_app_mark_selection_rows(&app->render_damage, &snapshot,
-                                     &snapshot.selection);
-    if (app->hover_valid) {
-        winxterm_render_damage_mark_row(&app->render_damage, app->hover_view_row);
+    if (selection_changed) {
+        winxterm_app_mark_selection_rows(&app->render_damage, &snapshot,
+                                         &snapshot.selection);
     }
     if (app->copy_overlay_active && app->copy_overlay_range.enabled) {
         size_t first = snapshot.first_row;
@@ -1080,6 +1107,10 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
                                              (int)(preview_first - first),
                                              (int)(preview_last - first));
         }
+    }
+    if (!winxterm_render_damage_any(&app->render_damage)) {
+        LeaveCriticalSection(&app->bridge->screen_lock);
+        return false;
     }
     int dirty_row_count = 0;
     for (int row = 0; row < snapshot.rows; ++row) {
@@ -1114,6 +1145,7 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
     winxterm_app_draw_click_preview(app, &snapshot);
     winxterm_app_draw_hover_outline(app);
     app->rendered_background_rgb = snapshot.clear_rgb;
+    app->surface.covered_visual_lines = app->bridge->accepted_visual_lines;
     uint64_t raster_end_ns = winxterm_bridge_timestamp_ns();
     LeaveCriticalSection(&app->bridge->screen_lock);
     if (raster_end_ns >= raster_start_ns) {
@@ -1170,23 +1202,8 @@ static void winxterm_app_render_main_area(WinxtermApp *app)
     }
     winxterm_render_damage_clear(&app->render_damage);
     winxterm_bridge_note_frame(app->bridge);
-    if (!winxterm_bridge_bell_enabled(app->bridge) && app->ux.bell.active) {
-        app->ux.bell.active = false;
-        if (app->hwnd != 0 && app->bell_timer_id != 0u) {
-            KillTimer(app->hwnd, app->bell_timer_id);
-            app->bell_timer_id = 0u;
-        }
-    }
-    if (winxterm_bridge_take_bell(app->bridge)) {
-        winxterm_ux_start_bell(&app->ux, GetTickCount());
-        if (app->bell_timer_id == 0u && app->hwnd != 0) {
-            app->bell_timer_id = SetTimer(app->hwnd,
-                                          WINXTERM_BELL_TIMER_ID,
-                                          WINXTERM_UX_BELL_TIMER_MS,
-                                          0);
-        }
-    }
-    winxterm_app_update_title(app);
+    if (app->bridge->show_render_stats_in_title) winxterm_app_update_title(app);
+    return true;
 }
 
 static void winxterm_app_log_client_size(WinxtermApp *app, const char *event_name)
@@ -1271,6 +1288,7 @@ bool winxterm_app_init(WinxtermApp *app,
     (void)winxterm_settings_load(&settings);
     app->scrollbar_enabled = settings.scrollbar;
     winxterm_ux_init(&app->ux);
+    winxterm_frame_scheduler_init(&app->frame_scheduler);
     app->cursor_blink_ms = GetCaretBlinkTime();
     if (app->cursor_blink_ms == 0u || app->cursor_blink_ms == INFINITE) {
         app->cursor_blink_ms = WINXTERM_DEFAULT_CURSOR_BLINK_MS;
@@ -1553,8 +1571,9 @@ static bool winxterm_app_commit_pending_resize(WinxtermApp *app)
             app->last_resize_failure_log_tick = now;
         }
         app->pending_resize = true;
-        app->deferred_frame_causes |= WINXTERM_FRAME_CAUSE_RESIZE;
-        winxterm_app_set_frame_timer(app, WINXTERM_FRAME_THROTTLE_MS);
+        winxterm_frame_scheduler_schedule(&app->frame_scheduler,
+                                          winxterm_bridge_timestamp_ns());
+        winxterm_app_arm_frame_timer(app);
         return false;
     }
     app->last_resize_failure_log_tick = 0u;
@@ -1663,6 +1682,7 @@ static bool winxterm_app_queue_input(WinxtermApp *app, const uint8_t *bytes, siz
         winxterm_log_writef(app->log, "input queue full, dropped %zu bytes", byte_count);
         return false;
     }
+    app->macro_redraw_idle_since_ns = 0u;
     winxterm_app_reset_cursor_blink(app);
     if (line_submit) {
         winxterm_ux_scroll_to_bottom(&app->ux);
@@ -1939,10 +1959,11 @@ static bool winxterm_app_paste_clipboard(WinxtermApp *app)
     return ok;
 }
 
-static void winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
+static bool winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
                                                     WinxtermRenderDamage *damage)
 {
-    if (app == 0 || app->bridge == 0 || damage == 0) return;
+    if (app == 0 || app->bridge == 0 || damage == 0) return false;
+    bool visible_changed = false;
     WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
     size_t visible_words = visible.rows > 0 ? ((size_t)visible.rows + 63u) / 64u : 0u;
     if (visible.rows != app->render_damage.row_count ||
@@ -1955,12 +1976,13 @@ static void winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
             ((size_t)damage_rows + 63u) / 64u : 0u;
         bool retry_storage = required_words != damage->word_count;
         winxterm_render_damage_mark_all(&app->render_damage);
+        visible_changed = visible.rows > 0;
         winxterm_render_damage_clear(damage);
         if (retry_storage && winxterm_render_damage_resize(damage, damage_rows)) {
             /* The full repaint has already been transferred to app damage. */
             winxterm_render_damage_clear(damage);
         }
-        return;
+        return visible_changed;
     }
     bool scroll_eligible = damage->scroll_valid && damage->scroll_rows > 0 &&
         damage->scroll_rows < visible.rows && !app->bridge->screen.alternate_active &&
@@ -1970,8 +1992,10 @@ static void winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
     if (damage->scroll_valid) {
         if (scroll_eligible) {
             winxterm_render_damage_record_scroll(&app->render_damage, damage->scroll_rows);
+            visible_changed = true;
         } else if (app->bridge->screen.alternate_active || app->ux.viewport.follow_output) {
             winxterm_render_damage_mark_all(&app->render_damage);
+            visible_changed = visible.rows > 0;
         }
     }
     size_t first = winxterm_ux_primary_first_row_for_rows(&app->ux,
@@ -1982,14 +2006,17 @@ static void winxterm_app_merge_screen_damage_locked(WinxtermApp *app,
         if (!winxterm_render_damage_row(damage, row)) continue;
         if (app->bridge->screen.alternate_active) {
             winxterm_render_damage_mark_row(&app->render_damage, row);
+            visible_changed = true;
         } else {
             size_t global = app->bridge->screen.scrollback_count + (size_t)row;
             if (global >= first && global < last) {
                 winxterm_render_damage_mark_row(&app->render_damage, (int)(global - first));
+                visible_changed = true;
             }
         }
     }
     winxterm_render_damage_clear(damage);
+    return visible_changed;
 }
 
 static bool winxterm_app_output_waiting_to_commit(WinxtermApp *app)
@@ -2005,36 +2032,90 @@ static bool winxterm_app_output_waiting_to_commit(WinxtermApp *app)
     return pending;
 }
 
-static bool winxterm_app_commit_visible_changes(WinxtermApp *app, unsigned int causes)
+static bool winxterm_app_cursor_differs_from_presented_locked(WinxtermApp *app)
 {
-    if (app == 0 || app->bridge == 0) {
-        return false;
-    }
+    if (app == 0 || app->bridge == 0 || app->surface.width <= 0 ||
+        app->surface.height <= 0) return false;
+    WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
+    WinxtermScreenRenderView view;
+    memset(&view, 0, sizeof(view));
+    view.primary_first_row =
+        winxterm_ux_primary_first_row_for_rows(&app->ux, &app->bridge->screen, visible.rows);
+    view.selection = winxterm_ux_render_selection(&app->ux, &app->bridge->screen);
+    WinxtermScreenRenderState state;
+    if (!winxterm_screen_render_state_init(&state, &app->bridge->screen,
+                                           app->surface.width, app->surface.height,
+                                           app->cursor_visible, &view)) return false;
+    int row = 0;
+    bool valid = winxterm_app_snapshot_cursor_local_row(&state, &row);
+    if (valid != app->rendered_cursor_valid) return true;
+    return valid && (row != app->rendered_cursor_row ||
+                     state.cursor_col != app->rendered_cursor_col);
+}
 
-    bool redraw = (causes & (WINXTERM_FRAME_CAUSE_PRESENTATION |
-                             WINXTERM_FRAME_CAUSE_ROW_PRESENTATION)) != 0u;
+static bool winxterm_app_visual_state_differs_locked(WinxtermApp *app)
+{
+    if (winxterm_app_cursor_differs_from_presented_locked(app)) return true;
+    WinxtermScreenSelectionRange selection =
+        winxterm_ux_render_selection(&app->ux, &app->bridge->screen);
+    if (!app->rendered_selection_valid ||
+        !winxterm_app_selection_equal(&app->rendered_selection, &selection)) return true;
+    return app->copy_overlay_active ||
+           app->click_preview_kind != WINXTERM_CLICK_PREVIEW_NONE;
+}
+
+static void winxterm_app_apply_chrome_updates(WinxtermApp *app, bool changed)
+{
+    if (app == 0 || app->bridge == 0 || !changed) return;
+    if (!winxterm_bridge_bell_enabled(app->bridge) && app->ux.bell.active) {
+        app->ux.bell.active = false;
+        if (app->hwnd != 0 && app->bell_timer_id != 0u) {
+            KillTimer(app->hwnd, app->bell_timer_id);
+            app->bell_timer_id = 0u;
+        }
+    }
+    if (winxterm_bridge_take_bell(app->bridge)) {
+        winxterm_ux_start_bell(&app->ux, GetTickCount());
+        if (app->bell_timer_id == 0u && app->hwnd != 0) {
+            app->bell_timer_id = SetTimer(app->hwnd, WINXTERM_BELL_TIMER_ID,
+                                          WINXTERM_UX_BELL_TIMER_MS, 0);
+        }
+    }
+    winxterm_app_update_title(app);
+}
+
+static void winxterm_app_process_work(WinxtermApp *app, unsigned int causes)
+{
+    if (app == 0 || app->bridge == 0) return;
+    bool visual_work_already_pending = app->visual_update_pending ||
+        winxterm_render_damage_any(&app->render_damage) || app->pending_resize ||
+        app->surface.painted_generation != app->surface.generation;
+    bool visible_changed = false;
     if ((causes & WINXTERM_FRAME_CAUSE_PRESENTATION) != 0u) {
         winxterm_render_damage_mark_all(&app->render_damage);
+        visible_changed = true;
     }
     if ((causes & WINXTERM_FRAME_CAUSE_RESIZE) != 0u || app->pending_resize) {
-        redraw = winxterm_app_commit_pending_resize(app) || redraw;
+        visible_changed = winxterm_app_commit_pending_resize(app) || visible_changed;
     }
-
     bool output_more_pending = false;
-    bool presentation_changed = false;
+    bool chrome_changed = (causes & WINXTERM_FRAME_CAUSE_CHROME) != 0u;
+    bool screen_changed = false;
     size_t parse_turn_bytes = 0u;
     uint64_t parse_turn_start_ns = winxterm_bridge_timestamp_ns();
     do {
-        bool slice_presentation = false;
+        bool slice_screen = false;
+        bool slice_chrome = false;
         if (!winxterm_bridge_commit_output(app->bridge,
                                            WINXTERM_PARSE_SLICE_BYTES,
-                                           0,
+                                           &slice_screen,
                                            &output_more_pending,
-                                           &slice_presentation)) {
+                                           &slice_chrome)) {
             winxterm_log_writef(app->log, "output commit failed");
             break;
         }
-        presentation_changed = presentation_changed || slice_presentation;
+        screen_changed = screen_changed || slice_screen;
+        chrome_changed = chrome_changed || slice_chrome;
         parse_turn_bytes += WINXTERM_PARSE_SLICE_BYTES;
         uint64_t now_ns = winxterm_bridge_timestamp_ns();
         if (!output_more_pending ||
@@ -2044,34 +2125,43 @@ static bool winxterm_app_commit_visible_changes(WinxtermApp *app, unsigned int c
             break;
         }
     } while (true);
-    if (presentation_changed) {
-        redraw = true;
-        winxterm_render_damage_mark_all(&app->render_damage);
-    }
+    bool parsed_visible_changed = false;
     EnterCriticalSection(&app->bridge->screen_lock);
     WinxtermCellSize visible = winxterm_app_visible_cells_locked(app);
     winxterm_ux_note_screen_changed_for_rows(&app->ux, &app->bridge->screen, visible.rows);
     if (winxterm_render_damage_any(&app->bridge->screen.damage)) {
-        winxterm_app_merge_screen_damage_locked(app, &app->bridge->screen.damage);
-        redraw = redraw || winxterm_render_damage_any(&app->render_damage);
+        bool damage_visible =
+            winxterm_app_merge_screen_damage_locked(app, &app->bridge->screen.damage);
+        parsed_visible_changed = screen_changed && damage_visible;
+        visible_changed = damage_visible || visible_changed;
+    }
+    if (screen_changed && winxterm_app_cursor_differs_from_presented_locked(app)) {
+        parsed_visible_changed = true;
+        visible_changed = true;
+    }
+    if (!visual_work_already_pending && !visible_changed &&
+        !winxterm_render_damage_any(&app->render_damage)) {
+        /* Parsed line advances outside the current viewport require no DIB.
+           They are nevertheless covered work for producer backpressure. */
+        winxterm_bridge_mark_painted_locked(app->bridge);
     }
     LeaveCriticalSection(&app->bridge->screen_lock);
-
+    winxterm_app_apply_chrome_updates(app, chrome_changed);
+    winxterm_app_update_scrollbar(app);
+    if (visible_changed) {
+        app->visual_update_pending = true;
+        uint64_t now_ns = winxterm_bridge_timestamp_ns();
+        if (parsed_visible_changed) {
+            winxterm_frame_scheduler_note_visible_update(&app->frame_scheduler, now_ns);
+        } else {
+            winxterm_frame_scheduler_schedule(&app->frame_scheduler, now_ns);
+        }
+        winxterm_app_arm_frame_timer(app);
+    }
     bool pending = output_more_pending || winxterm_app_output_waiting_to_commit(app);
     if (pending) {
         winxterm_bridge_request_frame(app->bridge, WINXTERM_FRAME_CAUSE_CONTENT);
-        bool interactive = (causes & (WINXTERM_FRAME_CAUSE_PRESENTATION |
-                                      WINXTERM_FRAME_CAUSE_ROW_PRESENTATION |
-                                      WINXTERM_FRAME_CAUSE_RESIZE)) != 0u;
-        DWORD now = GetTickCount();
-        DWORD elapsed = app->last_frame_tick != 0u ? now - app->last_frame_tick :
-            WINXTERM_FRAME_THROTTLE_MS;
-        if (!interactive && elapsed < WINXTERM_FRAME_THROTTLE_MS) {
-            winxterm_app_set_frame_timer(app, WINXTERM_FRAME_THROTTLE_MS - elapsed);
-            return false;
-        }
     }
-    return redraw || winxterm_render_damage_any(&app->render_damage);
 }
 
 static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes)
@@ -2079,39 +2169,67 @@ static void winxterm_app_request_frame(WinxtermApp *app, unsigned int causes)
     if (app == 0 || app->hwnd == 0) {
         return;
     }
-    winxterm_bridge_request_frame(app->bridge, causes);
+    bool visible_changed = winxterm_render_damage_any(&app->render_damage);
+    if ((causes & WINXTERM_FRAME_CAUSE_PRESENTATION) != 0u) {
+        winxterm_render_damage_mark_all(&app->render_damage);
+        visible_changed = true;
+    } else {
+        EnterCriticalSection(&app->bridge->screen_lock);
+        visible_changed = winxterm_app_visual_state_differs_locked(app) || visible_changed;
+        LeaveCriticalSection(&app->bridge->screen_lock);
+    }
+    if (!visible_changed && !app->pending_resize) return;
+    app->visual_update_pending = true;
+    winxterm_frame_scheduler_schedule(&app->frame_scheduler,
+                                      winxterm_bridge_timestamp_ns());
+    winxterm_app_arm_frame_timer(app);
 }
 
-static void winxterm_app_set_frame_timer(WinxtermApp *app, UINT delay_ms)
+static void winxterm_app_arm_frame_timer(WinxtermApp *app)
 {
-    if (app == 0 || app->hwnd == 0) {
-        return;
+    if (app == 0 || app->hwnd == 0 || !app->frame_scheduler.deadline_armed) return;
+    uint64_t delay_ns = winxterm_frame_scheduler_delay_ns(
+        &app->frame_scheduler, winxterm_bridge_timestamp_ns());
+    uint64_t delay_ms64 = (delay_ns + 999999ull) / 1000000ull;
+    if (delay_ms64 == 0u) delay_ms64 = 1u;
+    if (delay_ms64 > UINT_MAX) delay_ms64 = UINT_MAX;
+    app->frame_timer_id = SetTimer(app->hwnd, WINXTERM_FRAME_TIMER_ID,
+                                   (UINT)delay_ms64, 0);
+    if (app->frame_timer_id == 0u) {
+        winxterm_log_writef(app->log, "frame deadline timer unavailable");
     }
-    if (delay_ms == 0u) {
-        delay_ms = 1u;
-    }
-    app->frame_timer_id = SetTimer(app->hwnd, WINXTERM_FRAME_TIMER_ID, delay_ms, 0);
 }
 
-static void winxterm_app_handle_frame_due(WinxtermApp *app, HWND hwnd, unsigned int causes)
+static void winxterm_app_maybe_present(WinxtermApp *app, bool force)
 {
-    if (app == 0 || hwnd == 0) {
+    if (app == 0 || app->hwnd == 0) return;
+    uint64_t now_ns = winxterm_bridge_timestamp_ns();
+    if (!force && !winxterm_frame_scheduler_due(&app->frame_scheduler, now_ns)) {
+        winxterm_app_arm_frame_timer(app);
         return;
     }
-    app->deferred_frame_causes |= causes;
     if (app->frame_timer_id != 0u) {
-        KillTimer(hwnd, app->frame_timer_id);
+        KillTimer(app->hwnd, app->frame_timer_id);
         app->frame_timer_id = 0u;
     }
-    causes = app->deferred_frame_causes;
-    app->deferred_frame_causes = WINXTERM_FRAME_CAUSE_NONE;
-    bool redraw = winxterm_app_commit_visible_changes(app, causes);
     winxterm_app_update_scrollbar(app);
-    if (!redraw) {
+    bool wants_frame = app->visual_update_pending ||
+                       winxterm_render_damage_any(&app->render_damage);
+    if (!wants_frame) {
+        winxterm_frame_scheduler_cancel(&app->frame_scheduler);
         return;
     }
-    winxterm_app_render_main_area(app);
-    app->last_frame_tick = GetTickCount();
+    if (winxterm_app_render_main_area(app)) {
+        app->visual_update_pending = false;
+        winxterm_frame_scheduler_note_presented(&app->frame_scheduler,
+                                                winxterm_bridge_timestamp_ns());
+    } else if (!winxterm_render_damage_any(&app->render_damage)) {
+        app->visual_update_pending = false;
+        winxterm_frame_scheduler_cancel(&app->frame_scheduler);
+    } else {
+        winxterm_frame_scheduler_schedule(&app->frame_scheduler, now_ns);
+        winxterm_app_arm_frame_timer(app);
+    }
 }
 
 static WinxtermAppSessionUx *winxterm_app_session_ux(WinxtermApp *app,
@@ -2148,11 +2266,11 @@ static void winxterm_app_prune_session_ux(WinxtermApp *app, uint64_t keep_sessio
     }
 }
 
-static void winxterm_app_sync_active_session_ux(WinxtermApp *app)
+static bool winxterm_app_sync_active_session_ux(WinxtermApp *app)
 {
-    if (app == 0 || app->bridge == 0) return;
+    if (app == 0 || app->bridge == 0) return false;
     uint64_t session_id = winxterm_bridge_active_session(app->bridge);
-    if (session_id == 0u || session_id == app->ux_session_id) return;
+    if (session_id == 0u || session_id == app->ux_session_id) return false;
 
     if (app->ux_session_id != 0u) {
         WinxtermAppSessionUx *old = winxterm_app_session_ux(
@@ -2174,6 +2292,7 @@ static void winxterm_app_sync_active_session_ux(WinxtermApp *app)
     app->hover_valid = false;
     app->copy_overlay_active = false;
     app->click_preview_kind = WINXTERM_CLICK_PREVIEW_NONE;
+    return true;
 }
 
 static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
@@ -2197,9 +2316,11 @@ static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
         return;
     }
 
-    winxterm_app_sync_active_session_ux(app);
+    bool session_changed = winxterm_app_sync_active_session_ux(app);
     unsigned int causes = winxterm_bridge_take_frame_request(app->bridge);
-    winxterm_app_handle_frame_due(app, hwnd, causes);
+    if (session_changed) causes |= WINXTERM_FRAME_CAUSE_PRESENTATION;
+    winxterm_app_process_work(app, causes);
+    winxterm_app_maybe_present(app, session_changed);
 }
 
 static void winxterm_app_scroll_lines(WinxtermApp *app, int lines_up)
@@ -3306,6 +3427,18 @@ static void winxterm_app_handle_command(WinxtermApp *app, WPARAM wparam)
                 (unsigned long long)diagnostics.full_repaints,
                 (unsigned long long)diagnostics.scroll_blits,
                 (unsigned long long)diagnostics.invalidated_pixels);
+            winxterm_log_writef(
+                app->log,
+                "frame scheduler: mode=%s visible_updates=%llu recent=%zu "
+                "deadline_rearms=%llu mode_transitions=%llu deadline_fires=%llu",
+                app->frame_scheduler.mode == WINXTERM_FRAME_PACING_SUSTAINED ?
+                    "sustained" : "debounced",
+                (unsigned long long)app->frame_scheduler.visible_updates,
+                winxterm_frame_scheduler_recent_visible_updates(
+                    &app->frame_scheduler, winxterm_bridge_timestamp_ns()),
+                (unsigned long long)app->frame_scheduler.deadline_rearms,
+                (unsigned long long)app->frame_scheduler.mode_transitions,
+                (unsigned long long)app->frame_scheduler.deadline_fires);
             winxterm_log_writef(
                 app->log,
                 "pipeline p50/p95/p99 ns: queue=%llu/%llu/%llu "
@@ -4548,7 +4681,7 @@ static bool winxterm_app_macro_write_histdump(void *context, const wchar_t *path
     return ok;
 }
 
-static bool winxterm_app_macro_redraw_ready(const WinxtermApp *app)
+static bool winxterm_app_macro_redraw_ready(WinxtermApp *app)
 {
     if (app == 0 || app->bridge == 0) {
         return false;
@@ -4557,7 +4690,8 @@ static bool winxterm_app_macro_redraw_ready(const WinxtermApp *app)
     bool pending = app->pending_resize ||
                    winxterm_render_damage_any(&app->render_damage) ||
                    app->frame_timer_id != 0u ||
-                   app->deferred_frame_causes != WINXTERM_FRAME_CAUSE_NONE;
+                   app->visual_update_pending ||
+                   app->frame_scheduler.deadline_armed;
     EnterCriticalSection(&app->bridge->input_lock);
     pending = pending ||
               app->bridge->input_count != 0u ||
@@ -4567,7 +4701,18 @@ static bool winxterm_app_macro_redraw_ready(const WinxtermApp *app)
               app->bridge->render_update_pending ||
               app->bridge->pending_frame_causes != WINXTERM_FRAME_CAUSE_NONE;
     LeaveCriticalSection(&app->bridge->input_lock);
-    return !pending;
+    if (pending) {
+        app->macro_redraw_idle_since_ns = 0u;
+        return false;
+    }
+
+    uint64_t now_ns = winxterm_bridge_timestamp_ns();
+    if (app->macro_redraw_idle_since_ns == 0u) {
+        app->macro_redraw_idle_since_ns = now_ns;
+        return false;
+    }
+    return now_ns >= app->macro_redraw_idle_since_ns &&
+           now_ns - app->macro_redraw_idle_since_ns >= WINXTERM_FRAME_INTERVAL_NS;
 }
 
 static bool winxterm_app_macro_render_barrier(void *context)
@@ -4581,16 +4726,15 @@ static bool winxterm_app_macro_render_barrier(void *context)
         EnterCriticalSection(&app->bridge->input_lock);
         pending = pending || app->bridge->output_count != 0u || app->bridge->pending_resize;
         LeaveCriticalSection(&app->bridge->input_lock);
-        app->last_frame_tick = 0u;
-        winxterm_app_handle_frame_due(app,
-                                      app->hwnd,
-                                      WINXTERM_FRAME_CAUSE_CONTENT |
-                                          WINXTERM_FRAME_CAUSE_RESIZE |
-                                          WINXTERM_FRAME_CAUSE_PRESENTATION);
+        winxterm_app_process_work(app,
+                                  WINXTERM_FRAME_CAUSE_CONTENT |
+                                      WINXTERM_FRAME_CAUSE_RESIZE |
+                                      WINXTERM_FRAME_CAUSE_PRESENTATION);
         if (!pending) {
             break;
         }
     }
+    winxterm_app_maybe_present(app, true);
     UpdateWindow(app->hwnd);
     return true;
 }
@@ -4925,7 +5069,8 @@ static void winxterm_app_paint(WinxtermApp *app)
         }
         app->invalidation_start_ns = 0u;
         app->surface.painted_generation = app->surface.generation;
-        winxterm_bridge_mark_painted(app->bridge);
+        winxterm_bridge_mark_painted_through(app->bridge,
+                                             app->surface.covered_visual_lines);
     } else if (!presented_generation &&
                app->surface.painted_generation != app->surface.generation) {
         InvalidateRect(app->hwnd, 0, FALSE);
@@ -5107,8 +5252,8 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
     case WM_EXITSIZEMOVE:
         winxterm_app_snap_window_to_cells(app);
         if (app->pending_resize) {
-            app->last_frame_tick = 0u;
-            winxterm_app_handle_frame_due(app, hwnd, WINXTERM_FRAME_CAUSE_RESIZE);
+            winxterm_app_process_work(app, WINXTERM_FRAME_CAUSE_RESIZE);
+            winxterm_app_maybe_present(app, true);
         }
         return 0;
 
@@ -5155,7 +5300,12 @@ static LRESULT CALLBACK winxterm_window_proc(HWND hwnd, UINT message, WPARAM wpa
             return 0;
         }
         if (wparam == app->frame_timer_id) {
-            winxterm_app_handle_frame_due(app, hwnd, WINXTERM_FRAME_CAUSE_NONE);
+            KillTimer(hwnd, app->frame_timer_id);
+            app->frame_timer_id = 0u;
+            winxterm_frame_scheduler_note_deadline_fire(&app->frame_scheduler);
+            unsigned int causes = winxterm_bridge_take_frame_request(app->bridge);
+            winxterm_app_process_work(app, causes | WINXTERM_FRAME_CAUSE_CONTENT);
+            winxterm_app_maybe_present(app, false);
             return 0;
         }
         if (wparam == app->macro_timer_id) {

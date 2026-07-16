@@ -617,7 +617,6 @@ static void winxterm_screen_scroll_region_down(WinxtermScreen *screen, int count
 
 static bool winxterm_screen_linefeed(WinxtermScreen *screen)
 {
-    int old_row = screen->cursor_row;
     screen->pending_wrap = false;
     if (screen->visual_line_advances != UINT64_MAX) {
         ++screen->visual_line_advances;
@@ -630,15 +629,12 @@ static bool winxterm_screen_linefeed(WinxtermScreen *screen)
     ++screen->cursor_row;
     screen->cursor_col = 0;
     winxterm_screen_clamp_cursor(screen);
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
     return true;
 }
 
 static bool winxterm_screen_index(WinxtermScreen *screen)
 {
     int column = screen->cursor_col;
-    int old_row = screen->cursor_row;
     screen->pending_wrap = false;
     if (screen->cursor_row == screen->scroll_bottom) {
         bool ok = winxterm_screen_scroll_region_up(screen, 1);
@@ -648,15 +644,12 @@ static bool winxterm_screen_index(WinxtermScreen *screen)
     ++screen->cursor_row;
     winxterm_screen_clamp_cursor(screen);
     screen->cursor_col = column;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
     return true;
 }
 
 static void winxterm_screen_reverse_index(WinxtermScreen *screen)
 {
     int column = screen->cursor_col;
-    int old_row = screen->cursor_row;
     screen->pending_wrap = false;
     if (screen->cursor_row == screen->scroll_top) {
         winxterm_screen_scroll_region_down(screen, 1);
@@ -666,8 +659,6 @@ static void winxterm_screen_reverse_index(WinxtermScreen *screen)
     --screen->cursor_row;
     winxterm_screen_clamp_cursor(screen);
     screen->cursor_col = column;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_set_cell_width(WinxtermScreen *screen,
@@ -786,7 +777,6 @@ static bool winxterm_screen_print(WinxtermScreen *screen, uint32_t codepoint)
 
 static void winxterm_screen_move_relative(WinxtermScreen *screen, int row_delta, int col_delta)
 {
-    int old_row = screen->cursor_row;
     screen->cursor_row += row_delta;
     screen->cursor_col += col_delta;
     if (screen->origin_mode) {
@@ -802,13 +792,10 @@ static void winxterm_screen_move_relative(WinxtermScreen *screen, int row_delta,
         winxterm_screen_clamp_cursor(screen);
     }
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_cursor_next_line(WinxtermScreen *screen, int count)
 {
-    int old_row = screen->cursor_row;
     if (count <= 0) {
         count = 1;
     }
@@ -819,13 +806,10 @@ static void winxterm_screen_cursor_next_line(WinxtermScreen *screen, int count)
     }
     winxterm_screen_clamp_cursor(screen);
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_cursor_previous_line(WinxtermScreen *screen, int count)
 {
-    int old_row = screen->cursor_row;
     if (count <= 0) {
         count = 1;
     }
@@ -836,26 +820,20 @@ static void winxterm_screen_cursor_previous_line(WinxtermScreen *screen, int cou
     }
     winxterm_screen_clamp_cursor(screen);
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_cursor_horizontal_absolute(WinxtermScreen *screen, int column)
 {
-    int old_row = screen->cursor_row;
     screen->cursor_col = column > 0 ? column - 1 : 0;
     if (screen->origin_mode && winxterm_screen_has_horizontal_margins(screen)) {
         screen->cursor_col += screen->left_margin;
     }
     winxterm_screen_clamp_cursor_to_margins(screen);
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_cursor_vertical_absolute(WinxtermScreen *screen, int row)
 {
-    int old_row = screen->cursor_row;
     screen->cursor_row = row > 0 ? row - 1 : 0;
     if (screen->origin_mode) {
         screen->cursor_row += screen->scroll_top;
@@ -865,13 +843,10 @@ static void winxterm_screen_cursor_vertical_absolute(WinxtermScreen *screen, int
     }
     winxterm_screen_clamp_cursor(screen);
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_set_cursor_position(WinxtermScreen *screen, int row, int column)
 {
-    int old_row = screen->cursor_row;
     int target_row = row > 0 ? row - 1 : 0;
     int target_col = column > 0 ? column - 1 : 0;
     if (screen->origin_mode) {
@@ -891,8 +866,6 @@ static void winxterm_screen_set_cursor_position(WinxtermScreen *screen, int row,
         winxterm_screen_clamp_cursor(screen);
     }
     screen->pending_wrap = false;
-    winxterm_screen_mark_dirty_row(screen, old_row);
-    winxterm_screen_mark_dirty_row(screen, screen->cursor_row);
 }
 
 static void winxterm_screen_erase_line_range(WinxtermScreen *screen,

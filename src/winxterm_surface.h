@@ -15,6 +15,7 @@ typedef struct WinxtermSurface {
     int stride_pixels;
     uint64_t generation;
     uint64_t painted_generation;
+    uint64_t covered_visual_lines;
     bool gdi_access_pending;
 } WinxtermSurface;
 
