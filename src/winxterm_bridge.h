@@ -173,7 +173,7 @@ typedef struct WinxtermBridge {
     size_t input_head;
     size_t input_tail;
     size_t input_count;
-    uint64_t input_session_id;
+    uint64_t input_job_id;
     size_t output_capacity;
     size_t output_head;
     size_t output_count;
@@ -278,12 +278,12 @@ bool winxterm_bridge_request_macro_text(WinxtermBridge *bridge,
 bool winxterm_bridge_take_macro_request(WinxtermBridge *bridge, WinxtermMacroRequest *request);
 bool winxterm_bridge_queue_input(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
 bool winxterm_bridge_queue_reply(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
-bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
-                                          uint64_t session_id,
-                                          const uint8_t *pending_bytes,
-                                          size_t pending_count,
-                                          uint8_t **previous_bytes,
-                                          size_t *previous_count);
+bool winxterm_bridge_switch_input_job(WinxtermBridge *bridge,
+                                     uint64_t job_id,
+                                     const uint8_t *pending_bytes,
+                                     size_t pending_count,
+                                     uint8_t **previous_bytes,
+                                     size_t *previous_count);
 bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge, const uint8_t *bytes, size_t byte_count);
 bool winxterm_bridge_request_job_action(WinxtermBridge *bridge,
                                        WinxtermBridgeJobAction action, uint64_t job_id);
@@ -300,12 +300,12 @@ bool winxterm_bridge_commit_output(WinxtermBridge *bridge,
                                    bool *more_pending,
                                    bool *chrome_changed);
 size_t winxterm_bridge_read_input(WinxtermBridge *bridge, uint8_t *buffer, size_t buffer_capacity);
-size_t winxterm_bridge_read_session_input(WinxtermBridge *bridge, uint64_t session_id,
-                                          uint8_t *buffer, size_t buffer_capacity);
+size_t winxterm_bridge_read_job_input(WinxtermBridge *bridge, uint64_t job_id,
+                                     uint8_t *buffer, size_t buffer_capacity);
 void winxterm_bridge_clear_input(WinxtermBridge *bridge);
 void winxterm_bridge_set_title_utf8(WinxtermBridge *bridge, const char *title, size_t title_length);
-void winxterm_bridge_set_active_session(WinxtermBridge *bridge, uint64_t session_id);
-uint64_t winxterm_bridge_active_session(WinxtermBridge *bridge);
+void winxterm_bridge_set_foreground_job(WinxtermBridge *bridge, uint64_t job_id);
+uint64_t winxterm_bridge_foreground_job(WinxtermBridge *bridge);
 bool winxterm_bridge_note_bell(WinxtermBridge *bridge);
 bool winxterm_bridge_take_bell(WinxtermBridge *bridge);
 void winxterm_bridge_set_bell_enabled(WinxtermBridge *bridge, bool enabled);

@@ -5,8 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-bool winxterm_terminal_session_init(WinxtermTerminalSession *session,
-                                    int columns, int rows, bool initialize_screen)
+bool winxterm_terminal_session_init(WinxtermTerminalSession *session)
 {
     if (session == 0) return false;
     memset(session, 0, sizeof(*session));
@@ -16,14 +15,6 @@ bool winxterm_terminal_session_init(WinxtermTerminalSession *session,
         winxterm_terminal_session_dispose(session);
         return false;
     }
-    winxterm_utf8_decoder_init(&session->decoder);
-    if (initialize_screen) {
-        if (!winxterm_screen_init(&session->screen, columns, rows)) {
-            winxterm_terminal_session_dispose(session);
-            return false;
-        }
-        session->screen_stored = true;
-    }
     return true;
 }
 
@@ -31,7 +22,6 @@ void winxterm_terminal_session_dispose(WinxtermTerminalSession *session)
 {
     if (session == 0) return;
     winxterm_job_journal_dispose(&session->journal);
-    if (session->screen_stored) winxterm_screen_dispose(&session->screen);
     free(session->transcript);
     free(session->pending_input);
     if (session->output_lock_initialized) DeleteCriticalSection(&session->output_lock);

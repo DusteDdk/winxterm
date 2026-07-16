@@ -2,23 +2,19 @@
 #define WINXTERM_TERMINAL_SESSION_H
 
 #include "winxterm_job_journal.h"
-#include "winxterm_screen.h"
-#include "winxterm_text.h"
 
 #include <stdbool.h>
 #include <windows.h>
 
-#define WINXTERM_TERMINAL_SESSION_TITLE_CAPACITY 256u
 #define WINXTERM_TERMINAL_SESSION_TRANSCRIPT_CAPACITY (64u * 1024u * 1024u)
 
+/* A managed job owns retained I/O, not terminal presentation state.  The
+   bridge owns the one screen, decoder, title, and scrollback shared by each
+   job while it is in the foreground. */
 typedef struct WinxtermTerminalSession {
     CRITICAL_SECTION output_lock;
     bool output_lock_initialized;
     WinxtermJobJournal journal;
-    WinxtermScreen screen;
-    WinxtermUtf8Decoder decoder;
-    bool screen_stored;
-    char title[WINXTERM_TERMINAL_SESSION_TITLE_CAPACITY];
     uint8_t *transcript;
     size_t transcript_capacity;
     size_t transcript_head;
@@ -29,8 +25,7 @@ typedef struct WinxtermTerminalSession {
     size_t pending_input_count;
 } WinxtermTerminalSession;
 
-bool winxterm_terminal_session_init(WinxtermTerminalSession *session,
-                                    int columns, int rows, bool initialize_screen);
+bool winxterm_terminal_session_init(WinxtermTerminalSession *session);
 void winxterm_terminal_session_dispose(WinxtermTerminalSession *session);
 bool winxterm_terminal_session_record(WinxtermTerminalSession *session,
                                       const uint8_t *bytes, size_t byte_count);

@@ -972,8 +972,8 @@ bool winxterm_bridge_queue_reply(WinxtermBridge *bridge, const uint8_t *bytes, s
     return winxterm_bridge_queue_input(bridge, bytes, byte_count);
 }
 
-bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
-                                          uint64_t session_id,
+bool winxterm_bridge_switch_input_job(WinxtermBridge *bridge,
+                                          uint64_t job_id,
                                           const uint8_t *pending_bytes,
                                           size_t pending_count,
                                           uint8_t **previous_bytes,
@@ -986,8 +986,8 @@ bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
         pending_count > WINXTERM_BRIDGE_INPUT_MAX_CAPACITY) return false;
 
     EnterCriticalSection(&bridge->input_lock);
-    if (bridge->input_session_id == 0u && pending_count == 0u) {
-        bridge->input_session_id = session_id;
+    if (bridge->input_job_id == 0u && pending_count == 0u) {
+        bridge->input_job_id = job_id;
         LeaveCriticalSection(&bridge->input_lock);
         return true;
     }
@@ -1010,7 +1010,7 @@ bool winxterm_bridge_switch_input_session(WinxtermBridge *bridge,
             bridge->input_tail = (bridge->input_tail + 1u) % bridge->input_capacity;
             ++bridge->input_count;
         }
-        bridge->input_session_id = session_id;
+        bridge->input_job_id = job_id;
         *previous_bytes = saved;
         *previous_count = saved_count;
         saved = 0;
@@ -1127,16 +1127,16 @@ bool winxterm_bridge_enqueue_output(WinxtermBridge *bridge,
     return ok;
 }
 
-void winxterm_bridge_set_active_session(WinxtermBridge *bridge, uint64_t session_id)
+void winxterm_bridge_set_foreground_job(WinxtermBridge *bridge, uint64_t job_id)
 {
     if (bridge == 0) return;
-    winxterm_job_coordinator_set_active_session(&bridge->job_coordinator, session_id);
+    winxterm_job_coordinator_set_foreground_job(&bridge->job_coordinator, job_id);
 }
 
-uint64_t winxterm_bridge_active_session(WinxtermBridge *bridge)
+uint64_t winxterm_bridge_foreground_job(WinxtermBridge *bridge)
 {
     return bridge != 0 ?
-        winxterm_job_coordinator_active_session(&bridge->job_coordinator) : 0u;
+        winxterm_job_coordinator_foreground_job(&bridge->job_coordinator) : 0u;
 }
 
 bool winxterm_bridge_request_job_action(WinxtermBridge *bridge,
@@ -1335,13 +1335,13 @@ size_t winxterm_bridge_read_input(WinxtermBridge *bridge, uint8_t *buffer, size_
     return copied;
 }
 
-size_t winxterm_bridge_read_session_input(WinxtermBridge *bridge, uint64_t session_id,
-                                          uint8_t *buffer, size_t buffer_capacity)
+size_t winxterm_bridge_read_job_input(WinxtermBridge *bridge, uint64_t job_id,
+                                     uint8_t *buffer, size_t buffer_capacity)
 {
-    if (bridge == 0 || session_id == 0u || buffer == 0 || buffer_capacity == 0u) return 0u;
+    if (bridge == 0 || job_id == 0u || buffer == 0 || buffer_capacity == 0u) return 0u;
     size_t copied = 0u;
     EnterCriticalSection(&bridge->input_lock);
-    if (bridge->input_session_id == session_id) {
+    if (bridge->input_job_id == job_id) {
         while (copied < buffer_capacity && bridge->input_count != 0u) {
             buffer[copied++] = bridge->input_buffer[bridge->input_head];
             bridge->input_head = (bridge->input_head + 1u) % bridge->input_capacity;

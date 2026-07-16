@@ -16,6 +16,8 @@
 
 static const DWORD WINXTERM_HOST_TERMINATE_WAIT_MS = 1000u;
 static const DWORD WINXTERM_HOST_EXIT_DRAIN_MS = 100u;
+static const DWORD WINXTERM_HOST_FOREGROUND_FENCE_QUIET_MS = 10u;
+static const DWORD WINXTERM_HOST_FOREGROUND_FENCE_TIMEOUT_MS = 50u;
 enum {
     WINXTERM_HOST_OUTPUT_READ_CHUNK_BYTES = 4096u,
     WINXTERM_HOST_OUTPUT_BATCH_MAX_BYTES = 64u * 1024u
@@ -47,7 +49,9 @@ struct WinxtermHostContext {
     bool force_terminated;
     uint64_t root_job_id;
     WinxtermManagedRuntimeRegistry runtimes;
-    uint64_t active_session_id;
+    CRITICAL_SECTION root_output_lock;
+    bool root_output_lock_initialized;
+    uint64_t foreground_job_id;
     WinxtermTerminalSession root_session;
     bool root_is_shell;
     bool root_headless_shutdown_requested;
@@ -68,10 +72,8 @@ bool winxterm_host_dispatch_request_ui(WinxtermHostContext *host)
     return host != 0 && winxterm_bridge_request_job_ui(host->bridge);
 }
 
-static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t target_id);
-static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
-                                            uint64_t target_id,
-                                            bool request_frame);
+static bool winxterm_host_switch_foreground_job(WinxtermHostContext *host,
+                                                uint64_t target_id);
 static WinxtermHostManagedChild *winxterm_host_find_child_locked(WinxtermHostContext *host,
                                                                  uint64_t id);
 static void winxterm_host_prune_removed_children(WinxtermHostContext *host);
@@ -79,10 +81,13 @@ static void winxterm_host_emit_file_summary(WinxtermHostContext *host,
                                             uint64_t bytes, ULONGLONG start_ms);
 static HANDLE winxterm_host_managed_child_final_process(WinxtermHostManagedChild *child);
 static bool winxterm_host_managed_child_all_exited(WinxtermHostManagedChild *child);
+static bool winxterm_host_read_available_output(WinxtermHostContext *host,
+                                                bool *read_any);
 
 typedef struct WinxtermHostEventAuthorization {
     WinxtermHostContext *host;
     uint64_t job_id;
+    uint64_t owner_id;
 } WinxtermHostEventAuthorization;
 
 static bool winxterm_host_event_authorized(uint64_t requester_id, void *context)
@@ -90,8 +95,38 @@ static bool winxterm_host_event_authorized(uint64_t requester_id, void *context)
     WinxtermHostEventAuthorization *authorization =
         (WinxtermHostEventAuthorization *)context;
     return authorization != 0 &&
-        winxterm_job_manager_authorized(&authorization->host->bridge->job_manager,
-                                        requester_id, authorization->job_id);
+        (winxterm_job_manager_authorized(&authorization->host->bridge->job_manager,
+                                         requester_id, authorization->job_id) ||
+         (authorization->owner_id != 0u &&
+          winxterm_job_manager_authorized(&authorization->host->bridge->job_manager,
+                                          requester_id, authorization->owner_id)));
+}
+
+static void winxterm_host_send_event_snapshot(WinxtermHostContext *host,
+                                              WinxtermJobEventKind kind,
+                                              const WinxtermManagedJobSnapshot *job)
+{
+    if (host == 0 || job == 0) return;
+    uint8_t payload[128];
+    size_t length = 0u;
+    bool ok = winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
+                                         WINXTERM_JOB_TLV_EVENT_KIND, (uint32_t)kind) &&
+              winxterm_job_tlv_append_u64(payload, sizeof(payload), &length,
+                                         WINXTERM_JOB_TLV_JOB_ID, job->id) &&
+              winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
+                                         WINXTERM_JOB_TLV_STATE, (uint32_t)job->state) &&
+              winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
+                                         WINXTERM_JOB_TLV_EXIT_CODE,
+                                         job->has_exit_code ? job->exit_code : 0u);
+    WinxtermJobFrameHeader header = {WINXTERM_JOB_PROTOCOL_VERSION, WINXTERM_JOB_MESSAGE_EVENT,
+                                    0u, 0u, (uint32_t)length};
+    if (ok) {
+        WinxtermHostEventAuthorization authorization = {host, job->id, job->owner_id};
+        winxterm_job_coordinator_broadcast(&host->bridge->job_coordinator,
+                                           &header, payload,
+                                           winxterm_host_event_authorized,
+                                           &authorization);
+    }
 }
 
 static void winxterm_host_send_event(WinxtermHostContext *host, WinxtermJobEventKind kind,
@@ -100,26 +135,7 @@ static void winxterm_host_send_event(WinxtermHostContext *host, WinxtermJobEvent
     if (host == 0) return;
     WinxtermManagedJobSnapshot job;
     if (!winxterm_job_manager_snapshot_one(&host->bridge->job_manager, job_id, &job)) return;
-    uint8_t payload[128];
-    size_t length = 0u;
-    bool ok = winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
-                                         WINXTERM_JOB_TLV_EVENT_KIND, (uint32_t)kind) &&
-              winxterm_job_tlv_append_u64(payload, sizeof(payload), &length,
-                                         WINXTERM_JOB_TLV_JOB_ID, job.id) &&
-              winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
-                                         WINXTERM_JOB_TLV_STATE, (uint32_t)job.state) &&
-              winxterm_job_tlv_append_u32(payload, sizeof(payload), &length,
-                                         WINXTERM_JOB_TLV_EXIT_CODE,
-                                         job.has_exit_code ? job.exit_code : 0u);
-    WinxtermJobFrameHeader header = {WINXTERM_JOB_PROTOCOL_VERSION, WINXTERM_JOB_MESSAGE_EVENT,
-                                    0u, 0u, (uint32_t)length};
-    if (ok) {
-        WinxtermHostEventAuthorization authorization = {host, job_id};
-        winxterm_job_coordinator_broadcast(&host->bridge->job_coordinator,
-                                           &header, payload,
-                                           winxterm_host_event_authorized,
-                                           &authorization);
-    }
+    winxterm_host_send_event_snapshot(host, kind, &job);
 }
 
 static void winxterm_host_send_resync_event(WinxtermHostContext *host)
@@ -190,25 +206,6 @@ static void winxterm_host_complete_foreground_request(WinxtermHostContext *host,
     }
 }
 
-static bool winxterm_host_auto_remove_finished_foreground(WinxtermHostContext *host,
-                                                           uint64_t job_id)
-{
-    if (host == 0 || job_id == 0u) return false;
-    EnterCriticalSection(&host->runtimes.lock);
-    WinxtermHostManagedChild *child = winxterm_host_find_child_locked(host, job_id);
-    bool ready = child != 0 && child->auto_remove_on_exit &&
-                 !child->foreground_request_registration_pending &&
-                 child->pending_foreground_request_id == 0u;
-    LeaveCriticalSection(&host->runtimes.lock);
-    if (!ready || !winxterm_job_manager_remove_finished_reparent(
-                      &host->bridge->job_manager, job_id)) return false;
-    winxterm_log_writef(host->bridge->log,
-                        "removed completed foreground job=%llu",
-                        (unsigned long long)job_id);
-    winxterm_host_send_resync_event(host);
-    return true;
-}
-
 bool winxterm_host_defer_foreground_request(WinxtermHostContext *host,
                                             WinxtermHostClient *client,
                                             uint64_t job_id,
@@ -217,20 +214,22 @@ bool winxterm_host_defer_foreground_request(WinxtermHostContext *host,
     if (host == 0 || client == 0 || job_id == 0u || request_id == 0u) return false;
     EnterCriticalSection(&host->runtimes.lock);
     WinxtermHostManagedChild *spawned = winxterm_host_find_child_locked(host, job_id);
+    bool completed = false;
+    bool has_exit_code = false;
+    uint32_t exit_code = 0u;
     if (spawned != 0) {
         spawned->pending_foreground_request_id = request_id;
         spawned->pending_foreground_client = client;
         spawned->foreground_request_registration_pending = false;
+        completed = spawned->process_completed;
+        has_exit_code = spawned->completion_has_exit_code;
+        exit_code = spawned->completion_exit_code;
     }
     LeaveCriticalSection(&host->runtimes.lock);
     if (spawned == 0) return false;
-    WinxtermManagedJobSnapshot finished;
-    if (winxterm_job_manager_snapshot_one(&host->bridge->job_manager, job_id, &finished) &&
-        (finished.state == WINXTERM_JOB_EXITED || finished.state == WINXTERM_JOB_FAILED)) {
+    if (completed) {
         winxterm_host_complete_foreground_request(host, job_id, ERROR_SUCCESS,
-                                                  finished.has_exit_code,
-                                                  finished.exit_code);
-        (void)winxterm_host_auto_remove_finished_foreground(host, job_id);
+                                                  has_exit_code, exit_code);
     }
     return true;
 }
@@ -954,7 +953,7 @@ static bool winxterm_host_route_output(WinxtermHostContext *host, uint64_t id,
                                       const uint8_t *bytes, size_t length)
 {
     EnterCriticalSection(&host->runtimes.lock);
-    bool active = host->active_session_id == id && !winxterm_bridge_is_headless(host->bridge);
+    bool active = host->foreground_job_id == id && !winxterm_bridge_is_headless(host->bridge);
     WinxtermHostManagedChild *runtime = id != host->root_job_id ?
         winxterm_host_find_child_locked(host, id) : 0;
     bool connected = runtime != 0 && runtime->destination_id != 0u;
@@ -1024,25 +1023,24 @@ static bool winxterm_host_drain_journal_locked(WinxtermHostContext *host, uint64
     }
 }
 
-static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
-                                            uint64_t target_id,
-                                            bool request_frame)
+static bool winxterm_host_switch_foreground_job(WinxtermHostContext *host,
+                                                uint64_t target_id)
 {
     if (host == 0) return false;
     EnterCriticalSection(&host->runtimes.lock);
-    if (target_id == host->active_session_id) {
+    if (target_id == host->foreground_job_id) {
         LeaveCriticalSection(&host->runtimes.lock);
         return true;
     }
-    WinxtermHostManagedChild *old_child = host->active_session_id != host->root_job_id ?
-        winxterm_host_find_child_locked(host, host->active_session_id) : 0;
+    WinxtermHostManagedChild *old_child = host->foreground_job_id != host->root_job_id ?
+        winxterm_host_find_child_locked(host, host->foreground_job_id) : 0;
     WinxtermHostManagedChild *target_child = target_id != host->root_job_id ?
         winxterm_host_find_child_locked(host, target_id) : 0;
     if (target_id != 0u && target_id != host->root_job_id && target_child == 0) {
         LeaveCriticalSection(&host->runtimes.lock);
         return false;
     }
-    WinxtermTerminalSession *old_session = host->active_session_id == host->root_job_id ?
+    WinxtermTerminalSession *old_session = host->foreground_job_id == host->root_job_id ?
         &host->root_session : old_child != 0 ? &old_child->session : 0;
     WinxtermTerminalSession *target_session = target_id == host->root_job_id ?
         &host->root_session : target_child != 0 ? &target_child->session : 0;
@@ -1064,10 +1062,10 @@ static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
     }
     uint8_t *previous_input = 0;
     size_t previous_input_count = 0u;
-    if (!winxterm_bridge_switch_input_session(host->bridge, target_id,
-                                              target_input, target_input_count,
-                                              &previous_input,
-                                              &previous_input_count)) {
+    if (!winxterm_bridge_switch_input_job(host->bridge, target_id,
+                                         target_input, target_input_count,
+                                         &previous_input,
+                                         &previous_input_count)) {
         LeaveCriticalSection(&host->runtimes.lock);
         return false;
     }
@@ -1087,42 +1085,8 @@ static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
         target_session->pending_input_count = 0u;
         LeaveCriticalSection(&target_session->output_lock);
     }
-    if (target_id != 0u) {
-        EnterCriticalSection(&host->bridge->screen_lock);
-        if (host->active_session_id == host->root_job_id) {
-            host->root_session.screen = host->bridge->screen;
-            host->root_session.decoder = host->bridge->output_decoder;
-            memcpy(host->root_session.title, host->bridge->terminal_title,
-                   sizeof(host->root_session.title));
-            host->root_session.screen_stored = true;
-        } else if (old_child != 0) {
-            old_child->session.screen = host->bridge->screen;
-            old_child->session.decoder = host->bridge->output_decoder;
-            memcpy(old_child->session.title, host->bridge->terminal_title,
-                   sizeof(old_child->session.title));
-            old_child->session.screen_stored = true;
-        }
-        if (target_id == host->root_job_id) {
-            host->bridge->screen = host->root_session.screen;
-            host->bridge->output_decoder = host->root_session.decoder;
-            memcpy(host->bridge->terminal_title, host->root_session.title,
-                   sizeof(host->bridge->terminal_title));
-            memset(&host->root_session.screen, 0, sizeof(host->root_session.screen));
-            memset(&host->root_session.decoder, 0, sizeof(host->root_session.decoder));
-            host->root_session.screen_stored = false;
-        } else {
-            host->bridge->screen = target_child->session.screen;
-            host->bridge->output_decoder = target_child->session.decoder;
-            memcpy(host->bridge->terminal_title, target_child->session.title,
-                   sizeof(host->bridge->terminal_title));
-            memset(&target_child->session.screen, 0, sizeof(target_child->session.screen));
-            memset(&target_child->session.decoder, 0, sizeof(target_child->session.decoder));
-            target_child->session.screen_stored = false;
-        }
-        LeaveCriticalSection(&host->bridge->screen_lock);
-    }
-    host->active_session_id = target_id;
-    winxterm_bridge_set_active_session(host->bridge, target_id);
+    host->foreground_job_id = target_id;
+    winxterm_bridge_set_foreground_job(host->bridge, target_id);
     bool ok = true;
     if (target_id == host->root_job_id) {
         ok = winxterm_host_drain_journal_locked(host, target_id, &host->root_session.journal,
@@ -1132,75 +1096,10 @@ static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
                                                 &target_child->session.output_lock);
     }
     LeaveCriticalSection(&host->runtimes.lock);
-    if (ok && request_frame) {
-        winxterm_bridge_request_frame(host->bridge, WINXTERM_FRAME_CAUSE_CONTENT |
-                                                    WINXTERM_FRAME_CAUSE_PRESENTATION);
-    }
     if (ok && target_id != 0u) {
         winxterm_host_send_event(host, WINXTERM_JOB_EVENT_FOREGROUND_CHANGED, target_id);
     }
     return ok;
-}
-
-static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t target_id)
-{
-    return winxterm_host_switch_session_ex(host, target_id, true);
-}
-
-static bool winxterm_host_merge_completed_foreground_output(
-    WinxtermHostManagedChild *child, uint64_t target_id)
-{
-    if (child == 0 || child->host == 0 || target_id == 0u || target_id == child->id) {
-        return false;
-    }
-    WinxtermHostContext *host = child->host;
-    uint64_t offset = 0u;
-    uint64_t end = 0u;
-    EnterCriticalSection(&child->session.output_lock);
-    offset = child->session.transcript_base_offset;
-    end = child->session.transcript_produced_offset;
-    bool truncated = offset != 0u;
-    LeaveCriticalSection(&child->session.output_lock);
-    if (!winxterm_host_switch_session_ex(host, target_id, false)) return false;
-
-    EnterCriticalSection(&host->runtimes.lock);
-    WinxtermHostManagedChild *target_child = target_id != host->root_job_id ?
-        winxterm_host_find_child_locked(host, target_id) : 0;
-    WinxtermTerminalSession *target_session = target_id == host->root_job_id ?
-        &host->root_session : target_child != 0 ? &target_child->session : 0;
-    LeaveCriticalSection(&host->runtimes.lock);
-    if (target_session == 0) return false;
-
-    uint8_t bytes[WINXTERM_HOST_OUTPUT_READ_CHUNK_BYTES];
-    uint64_t merged = 0u;
-    bool ok = true;
-    while (ok && offset < end) {
-        size_t length = 0u;
-        uint64_t next = offset;
-        bool more = false;
-        ok = winxterm_terminal_session_copy_transcript_page(
-            &child->session, offset, end, bytes, sizeof(bytes),
-            &length, &next, &more);
-        if (!ok || length == 0u || next <= offset) break;
-        ok = winxterm_terminal_session_record(target_session, bytes, length) &&
-             winxterm_host_route_output(host, target_id,
-                                        &target_session->journal,
-                                        &target_session->output_lock,
-                                        bytes, length);
-        if (ok) {
-            merged += length;
-            offset = next;
-        }
-    }
-    winxterm_log_writef(host->bridge->log,
-                        "managed foreground output merged job=%llu owner=%llu bytes=%llu truncated=%s",
-                        (unsigned long long)child->id,
-                        (unsigned long long)target_id,
-                        (unsigned long long)merged,
-                        truncated ? "yes" : "no");
-    winxterm_bridge_request_frame(host->bridge, WINXTERM_FRAME_CAUSE_CONTENT |
-                                                WINXTERM_FRAME_CAUSE_PRESENTATION);
-    return ok && offset == end;
 }
 
 static void winxterm_host_managed_child_close_runtime(WinxtermHostManagedChild *child)
@@ -1281,7 +1180,7 @@ static void winxterm_host_record_root_exit(WinxtermHostContext *host)
     (void)winxterm_job_manager_exit(&host->bridge->job_manager, host->root_job_id,
                                     (uint32_t)host->exit_code);
     uint64_t restored = winxterm_job_manager_foreground_id(&host->bridge->job_manager);
-    (void)winxterm_host_switch_session(host, restored);
+    (void)winxterm_host_switch_foreground_job(host, restored);
     winxterm_bridge_set_host_state(host->bridge, WINXTERM_HOST_STATE_CHILD_EXITED);
 }
 
@@ -1440,14 +1339,62 @@ uint32_t winxterm_host_cancel_request(WinxtermHostClient *client, uint64_t reque
     return status;
 }
 
+/* Job-control requests and PTY output use independent pipes.  The requesting
+   shell has already written its submitted command line before it sends the
+   request, but the output monitor may not have observed those bytes yet.  A
+   short quiet-period fence keeps that final shell output ahead of the next
+   foreground owner's retained or live output. */
+static bool winxterm_host_fence_foreground_output(WinxtermHostContext *host,
+                                                   uint64_t requester_id)
+{
+    if (host == 0 || requester_id == 0u) return false;
+    DWORD fence_start = GetTickCount();
+    DWORD stable_since = fence_start;
+    uint64_t previous_offset = UINT64_MAX;
+    while (GetTickCount() - fence_start <
+           WINXTERM_HOST_FOREGROUND_FENCE_TIMEOUT_MS) {
+        bool read_any = false;
+        if (requester_id == host->root_job_id &&
+            !winxterm_host_read_available_output(host, &read_any)) return false;
+        uint64_t offset = 0u;
+        EnterCriticalSection(&host->runtimes.lock);
+        WinxtermTerminalSession *requester_session =
+            requester_id == host->root_job_id ? &host->root_session : 0;
+        if (requester_session == 0) {
+            WinxtermHostManagedChild *requester =
+                winxterm_host_find_child_locked(host, requester_id);
+            requester_session = requester != 0 ? &requester->session : 0;
+        }
+        if (requester_session != 0) {
+            EnterCriticalSection(&requester_session->output_lock);
+            offset = requester_session->transcript_produced_offset;
+            LeaveCriticalSection(&requester_session->output_lock);
+        }
+        LeaveCriticalSection(&host->runtimes.lock);
+        DWORD now = GetTickCount();
+        if (read_any || offset != previous_offset) {
+            previous_offset = offset;
+            stable_since = now;
+        } else if (now - stable_since >=
+                   WINXTERM_HOST_FOREGROUND_FENCE_QUIET_MS) {
+            return true;
+        }
+        Sleep(1u);
+    }
+    return true;
+}
+
 uint32_t winxterm_host_lifecycle_request(WinxtermHostContext *host,
                                         WinxtermHostClient *client,
                                         uint16_t message_type,
                                         uint64_t target_id,
-                                        uint32_t *removed_count)
+                                        uint64_t request_id,
+                                        uint32_t *removed_count,
+                                        bool *deferred_reply)
 {
     if (removed_count != 0) *removed_count = 0u;
-    if (host == 0 || client == 0) return ERROR_INVALID_PARAMETER;
+    if (deferred_reply != 0) *deferred_reply = false;
+    if (host == 0 || client == 0 || deferred_reply == 0) return ERROR_INVALID_PARAMETER;
     if (message_type == WINXTERM_JOB_MESSAGE_CLEAN) {
         size_t removed = winxterm_job_manager_clean(&host->bridge->job_manager,
                                                     client->requester_id);
@@ -1466,12 +1413,34 @@ uint32_t winxterm_host_lifecycle_request(WinxtermHostContext *host,
     if (message_type == WINXTERM_JOB_MESSAGE_FOREGROUND) {
         uint64_t old_foreground =
             winxterm_job_manager_foreground_id(&host->bridge->job_manager);
-        changed = winxterm_job_manager_foreground(&host->bridge->job_manager, target_id) &&
-                  winxterm_host_switch_session(host, target_id);
+        if (old_foreground != client->requester_id || target_id == old_foreground ||
+            target_id == host->root_job_id || request_id == 0u) {
+            return ERROR_INVALID_STATE;
+        }
+        EnterCriticalSection(&host->runtimes.lock);
+        WinxtermHostManagedChild *target = winxterm_host_find_child_locked(host, target_id);
+        bool prepared = target != 0 &&
+            !target->foreground_request_registration_pending &&
+            target->pending_foreground_request_id == 0u;
+        if (prepared) target->foreground_request_registration_pending = true;
+        LeaveCriticalSection(&host->runtimes.lock);
+        if (!prepared) return ERROR_INVALID_STATE;
+        changed = winxterm_host_fence_foreground_output(
+                      host, client->requester_id) &&
+                  winxterm_job_manager_foreground(&host->bridge->job_manager, target_id) &&
+                  winxterm_host_switch_foreground_job(host, target_id) &&
+                  winxterm_host_defer_foreground_request(host, client, target_id,
+                                                         request_id);
         if (!changed && old_foreground != 0u) {
+            EnterCriticalSection(&host->runtimes.lock);
+            target = winxterm_host_find_child_locked(host, target_id);
+            if (target != 0) target->foreground_request_registration_pending = false;
+            LeaveCriticalSection(&host->runtimes.lock);
             (void)winxterm_job_manager_foreground(&host->bridge->job_manager,
                                                   old_foreground);
-            (void)winxterm_host_switch_session(host, old_foreground);
+            (void)winxterm_host_switch_foreground_job(host, old_foreground);
+        } else if (changed) {
+            *deferred_reply = true;
         }
     } else if (message_type == WINXTERM_JOB_MESSAGE_BACKGROUND) {
         changed = winxterm_job_manager_background(&host->bridge->job_manager, target_id);
@@ -1480,7 +1449,7 @@ uint32_t winxterm_host_lifecycle_request(WinxtermHostContext *host,
                                                       ERROR_SUCCESS, false, 0u);
             uint64_t restored =
                 winxterm_job_manager_foreground_id(&host->bridge->job_manager);
-            changed = winxterm_host_switch_session(host, restored);
+            changed = winxterm_host_switch_foreground_job(host, restored);
         }
     } else if (message_type == WINXTERM_JOB_MESSAGE_REMOVE) {
         changed = winxterm_job_manager_remove(&host->bridge->job_manager,
@@ -1606,11 +1575,11 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
             }
         }
         EnterCriticalSection(&child->host->runtimes.lock);
-        bool active = child->host->active_session_id == child->id;
+        bool active = child->host->foreground_job_id == child->id;
         bool connected = child->destination_id != 0u;
         if (active) {
             uint8_t input[512];
-            size_t input_count = winxterm_bridge_read_session_input(
+            size_t input_count = winxterm_bridge_read_job_input(
                 child->host->bridge, child->id, input, sizeof(input));
             if (input_count != 0u) {
                 uint8_t shim_input[sizeof(input) * 2u];
@@ -1628,13 +1597,6 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
                 (void)WriteFile(child->input_write, write_input,
                                 (DWORD)write_count, &written, 0);
             }
-            int columns = 0, rows = 0;
-            if (winxterm_bridge_peek_pending_resize(child->host->bridge, &columns, &rows)) {
-                COORD size = {(SHORT)(columns > 0 ? columns : 1), (SHORT)(rows > 0 ? rows : 1)};
-                if (SUCCEEDED(winxterm_pty_resize(&child->pty, size))) {
-                    (void)winxterm_bridge_ack_pending_resize(child->host->bridge, columns, rows);
-                }
-            }
         }
         LeaveCriticalSection(&child->host->runtimes.lock);
         EnterCriticalSection(&child->session.output_lock);
@@ -1645,7 +1607,11 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
         if (full) {
             (void)winxterm_job_manager_set_output(&child->host->bridge->job_manager,
                                                   child->id, WINXTERM_JOB_OUTPUT_LIMIT, true);
-            if (process_exited && available == 0u && redirected_available == 0u &&
+            /* A terminated producer can leave unread pipe bytes behind a full
+               retained journal.  There is no consumer that can create room at
+               shutdown, so do not strand the monitor (and its runtime record)
+               forever waiting for an impossible drain. */
+            if (process_exited &&
                 GetTickCount() - exit_drain_tick >= WINXTERM_HOST_EXIT_DRAIN_MS) break;
             Sleep(10u);
             continue;
@@ -1716,22 +1682,22 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
     if (final_process != 0 && GetExitCodeProcess(final_process, &exit_code) &&
         exit_code != STILL_ACTIVE) {
         WinxtermManagedJobSnapshot exiting_snapshot;
-        bool was_foreground =
-            winxterm_job_manager_snapshot_one(&child->host->bridge->job_manager,
-                                              child->id, &exiting_snapshot) &&
-            exiting_snapshot.foreground;
-        EnterCriticalSection(&child->host->runtimes.lock);
-        bool merge_foreground = child->host->active_session_id == child->id &&
-                                child->destination_id == 0u;
-        child->auto_remove_on_exit = was_foreground;
-        LeaveCriticalSection(&child->host->runtimes.lock);
-        (void)winxterm_job_manager_exit(&child->host->bridge->job_manager,
-                                       child->id, exit_code);
-        winxterm_host_send_event(child->host, WINXTERM_JOB_EVENT_EXITED, child->id);
+        bool removed_foreground = false;
+        bool recorded = winxterm_job_manager_complete(
+            &child->host->bridge->job_manager, child->id, exit_code,
+            &exiting_snapshot, &removed_foreground);
+        if (recorded) {
+            winxterm_host_send_event_snapshot(child->host,
+                                              WINXTERM_JOB_EVENT_EXITED,
+                                              &exiting_snapshot);
+        }
         uint64_t restored = winxterm_job_manager_foreground_id(&child->host->bridge->job_manager);
-        if (!merge_foreground ||
-            !winxterm_host_merge_completed_foreground_output(child, restored)) {
-            (void)winxterm_host_switch_session(child->host, restored);
+        if (removed_foreground) {
+            (void)winxterm_host_switch_foreground_job(child->host, restored);
+            winxterm_log_writef(child->host->bridge->log,
+                                "removed completed foreground job=%llu",
+                                (unsigned long long)child->id);
+            winxterm_host_send_resync_event(child->host);
         }
         if (redirected) {
             winxterm_host_emit_file_summary(child->host, child->redirected_bytes,
@@ -1750,9 +1716,13 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
                             (unsigned long)exit_code,
                             (unsigned long long)output_bytes);
     }
+    EnterCriticalSection(&child->host->runtimes.lock);
+    child->process_completed = true;
+    child->completion_has_exit_code = true;
+    child->completion_exit_code = exit_code;
+    LeaveCriticalSection(&child->host->runtimes.lock);
     winxterm_host_complete_foreground_request(child->host, child->id,
                                               ERROR_SUCCESS, true, exit_code);
-    (void)winxterm_host_auto_remove_finished_foreground(child->host, child->id);
     winxterm_host_managed_child_close_runtime(child);
     return exit_code;
 }
@@ -1812,6 +1782,12 @@ static void winxterm_host_prune_removed_children(WinxtermHostContext *host)
         WinxtermManagedJobSnapshot snapshot;
         if (!winxterm_job_manager_snapshot_one(&host->bridge->job_manager, (*link)->id, &snapshot)) {
             WinxtermHostManagedChild *child = *link;
+            if (child->foreground_request_registration_pending ||
+                (child->thread != 0 &&
+                 WaitForSingleObject(child->thread, 0u) != WAIT_OBJECT_0)) {
+                link = &child->next;
+                continue;
+            }
             *link = child->next;
             child->next = removed;
             removed = child;
@@ -1873,10 +1849,7 @@ static uint32_t winxterm_host_spawn_pipeline_plan(WinxtermHostContext *host,
     edges = child->stage_count > 1u ?
         (WinxtermHostPipelineEdge *)calloc(child->stage_count - 1u, sizeof(*edges)) : 0;
     if (child->stage_processes == 0 || (child->stage_count > 1u && edges == 0) ||
-        !winxterm_terminal_session_init(
-            &child->session,
-            host->bridge->screen.columns > 0 ? host->bridge->screen.columns : 80,
-            host->bridge->screen.rows > 0 ? host->bridge->screen.rows : 24, true)) goto cleanup;
+        !winxterm_terminal_session_init(&child->session)) goto cleanup;
     cwd = winxterm_host_utf8_to_wide(plan->cwd);
     if (cwd == 0) { status = ERROR_NO_UNICODE_TRANSLATION; goto cleanup; }
     if (plan->environment_count != 0u) {
@@ -2022,7 +1995,9 @@ stage_cleanup:
     child->next = host->runtimes.head;
     host->runtimes.head = child;
     LeaveCriticalSection(&host->runtimes.lock);
-    if (!background && !winxterm_host_switch_session(host, child->id)) {
+    if (!background &&
+        (!winxterm_host_fence_foreground_output(host, requester_id) ||
+         !winxterm_host_switch_foreground_job(host, child->id))) {
         status = ERROR_INVALID_STATE;
         (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
         (void)TerminateJobObject(child->process_job, status);
@@ -2047,7 +2022,7 @@ stage_cleanup:
 registered_failure:
     (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
     if (child->process_job != 0) (void)TerminateJobObject(child->process_job, status);
-    (void)winxterm_host_switch_session(
+    (void)winxterm_host_switch_foreground_job(
         host, winxterm_job_manager_foreground_id(&host->bridge->job_manager));
     child = 0;
 cleanup:
@@ -2114,11 +2089,7 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
     bool registered = false;
     if (child == 0) goto cleanup;
     child->host = host;
-    if (!winxterm_terminal_session_init(
-            &child->session,
-            host->bridge->screen.columns > 0 ? host->bridge->screen.columns : 80,
-            host->bridge->screen.rows > 0 ? host->bridge->screen.rows : 24,
-            true)) goto cleanup;
+    if (!winxterm_terminal_session_init(&child->session)) goto cleanup;
 
     arguments = (wchar_t **)calloc(plan.stages[0].argument_count, sizeof(*arguments));
     if (arguments == 0) goto cleanup;
@@ -2189,6 +2160,7 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
                             (unsigned long)hr);
         goto cleanup;
     }
+    child->pty_created = true;
     STARTUPINFOEXW startup;
     BOOL inherit_handles = FALSE;
     DWORD backend_creation_flags = 0u;
@@ -2268,7 +2240,9 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
             goto registered_failure;
         }
     }
-    if (!background && !winxterm_host_switch_session(host, child->id)) {
+    if (!background &&
+        (!winxterm_host_fence_foreground_output(host, requester_id) ||
+         !winxterm_host_switch_foreground_job(host, child->id))) {
         status = ERROR_INVALID_STATE;
         (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
         goto registered_failure;
@@ -2277,7 +2251,7 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
     if (child->thread == 0 || ResumeThread(child->process.hThread) == (DWORD)-1) {
         status = GetLastError();
         (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
-        (void)winxterm_host_switch_session(host,
+        (void)winxterm_host_switch_foreground_job(host,
             winxterm_job_manager_foreground_id(&host->bridge->job_manager));
         /* It remains registered and will be cleaned with the host. */
         goto registered_failure;
@@ -2292,7 +2266,7 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
 registered_failure:
     (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
     if (child->process_job != 0) (void)TerminateJobObject(child->process_job, status);
-    (void)winxterm_host_switch_session(
+    (void)winxterm_host_switch_foreground_job(
         host, winxterm_job_manager_foreground_id(&host->bridge->job_manager));
     child = 0;
 cleanup:
@@ -2304,7 +2278,7 @@ cleanup:
     free(environment_block);
     if (registered && child != 0) {
         (void)winxterm_job_manager_fail(&host->bridge->job_manager, child->id, status);
-        (void)winxterm_host_switch_session(
+        (void)winxterm_host_switch_foreground_job(
             host, winxterm_job_manager_foreground_id(&host->bridge->job_manager));
     }
     if (child != 0) winxterm_host_managed_child_dispose(child, true);
@@ -2360,13 +2334,37 @@ static void winxterm_host_apply_pending_resize(WinxtermHostContext *host)
         size.X = (SHORT)(columns > 0 ? columns : 1);
         size.Y = (SHORT)(rows > 0 ? rows : 1);
         HRESULT result = winxterm_pty_resize(&host->pty, size);
-        if (FAILED(result)) {
-            if (winxterm_host_should_log_resize_failure(host, columns, rows, result)) {
-                winxterm_log_writef(bridge->log,
-                                    "PTY resize failed, size=%dx%d hr=0x%08lx",
-                                    columns,
-                                    rows,
-                                    (unsigned long)result);
+        bool resized = SUCCEEDED(result);
+        HRESULT failure_result = FAILED(result) ? result : S_OK;
+        uint64_t failure_job_id = 0u;
+        EnterCriticalSection(&host->runtimes.lock);
+        for (WinxtermHostManagedChild *child = host->runtimes.head;
+             child != 0; child = child->next) {
+            if (!child->pty_created || child->process_completed) continue;
+            HRESULT child_result = winxterm_pty_resize(&child->pty, size);
+            if (FAILED(child_result)) {
+                resized = false;
+                if (SUCCEEDED(failure_result)) {
+                    failure_result = child_result;
+                    failure_job_id = child->id;
+                }
+            }
+        }
+        LeaveCriticalSection(&host->runtimes.lock);
+        if (!resized) {
+            if (winxterm_host_should_log_resize_failure(host, columns, rows,
+                                                        failure_result)) {
+                if (failure_job_id != 0u) {
+                    winxterm_log_writef(
+                        bridge->log,
+                        "managed PTY resize failed, job=%llu size=%dx%d hr=0x%08lx",
+                        (unsigned long long)failure_job_id, columns, rows,
+                        (unsigned long)failure_result);
+                } else {
+                    winxterm_log_writef(bridge->log,
+                                        "root PTY resize failed, size=%dx%d hr=0x%08lx",
+                                        columns, rows, (unsigned long)failure_result);
+                }
             }
         } else {
             host->last_resize_failure_columns = 0;
@@ -2378,13 +2376,13 @@ static void winxterm_host_apply_pending_resize(WinxtermHostContext *host)
     }
 }
 
-static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t session_id,
+static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t job_id,
                                               HANDLE input_write,
                                               bool translate_stdio_enter)
 {
     uint8_t input[512];
-    size_t input_count = winxterm_bridge_read_session_input(
-        bridge, session_id, input, sizeof(input));
+    size_t input_count = winxterm_bridge_read_job_input(
+        bridge, job_id, input, sizeof(input));
     if (input_count == 0u) {
         return true;
     }
@@ -2407,7 +2405,8 @@ static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t s
     return written == (DWORD)write_count;
 }
 
-static bool winxterm_host_read_available_output(WinxtermHostContext *host, bool *read_any)
+static bool winxterm_host_read_available_output_unlocked(WinxtermHostContext *host,
+                                                          bool *read_any)
 {
     uint8_t stack_output[WINXTERM_HOST_OUTPUT_READ_CHUNK_BYTES];
     uint8_t *output = stack_output;
@@ -2517,6 +2516,16 @@ static bool winxterm_host_read_available_output(WinxtermHostContext *host, bool 
     return read_ok && feed_ok;
 }
 
+static bool winxterm_host_read_available_output(WinxtermHostContext *host,
+                                                bool *read_any)
+{
+    if (host == 0 || !host->root_output_lock_initialized) return false;
+    EnterCriticalSection(&host->root_output_lock);
+    bool ok = winxterm_host_read_available_output_unlocked(host, read_any);
+    LeaveCriticalSection(&host->root_output_lock);
+    return ok;
+}
+
 static void winxterm_host_drain_available_output(WinxtermHostContext *host, DWORD drain_ms)
 {
     DWORD start = GetTickCount();
@@ -2608,6 +2617,10 @@ static void winxterm_host_cleanup_context(WinxtermHostContext *host)
     winxterm_host_close_handle(&host->output_read);
     winxterm_pty_dispose(&host->pty);
     winxterm_terminal_session_dispose(&host->root_session);
+    if (host->root_output_lock_initialized) {
+        DeleteCriticalSection(&host->root_output_lock);
+        host->root_output_lock_initialized = false;
+    }
     winxterm_managed_runtime_registry_dispose(&host->runtimes);
 }
 
@@ -2632,6 +2645,8 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
     WinxtermHostContext host;
     memset(&host, 0, sizeof(host));
     winxterm_managed_runtime_registry_init(&host.runtimes);
+    InitializeCriticalSection(&host.root_output_lock);
+    host.root_output_lock_initialized = true;
     host.bridge = bridge;
     host.shutdown_event = shutdown_event;
     host.exit_code = 1;
@@ -2660,13 +2675,13 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         return 1;
     }
     host.root_job_id = root_job_id;
-    host.active_session_id = root_job_id;
-    winxterm_bridge_set_active_session(bridge, root_job_id);
+    host.foreground_job_id = root_job_id;
+    winxterm_bridge_set_foreground_job(bridge, root_job_id);
     uint8_t *startup_input = 0;
     size_t startup_input_count = 0u;
-    if (!winxterm_bridge_switch_input_session(bridge, root_job_id, 0, 0u,
-                                              &startup_input,
-                                              &startup_input_count)) {
+    if (!winxterm_bridge_switch_input_job(bridge, root_job_id, 0, 0u,
+                                         &startup_input,
+                                         &startup_input_count)) {
         winxterm_host_cleanup_context(&host);
         (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id,
                                         ERROR_NOT_ENOUGH_MEMORY);
@@ -2674,7 +2689,7 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         return 1;
     }
     free(startup_input);
-    if (!winxterm_terminal_session_init(&host.root_session, 0, 0, false)) {
+    if (!winxterm_terminal_session_init(&host.root_session)) {
         winxterm_host_cleanup_context(&host);
         (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id,
                                         ERROR_NOT_ENOUGH_MEMORY);
@@ -2906,7 +2921,7 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         while (winxterm_bridge_take_job_action(bridge, &job_action, &action_job_id)) {
             if (job_action == WINXTERM_BRIDGE_JOB_ACTION_FOREGROUND &&
                 winxterm_job_manager_foreground(&bridge->job_manager, action_job_id)) {
-                (void)winxterm_host_switch_session(&host, action_job_id);
+                (void)winxterm_host_switch_foreground_job(&host, action_job_id);
             } else if (job_action == WINXTERM_BRIDGE_JOB_ACTION_VIEW) {
                 uint8_t *view_bytes = 0;
                 size_t view_count = 0u;
@@ -2921,7 +2936,7 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                        winxterm_job_manager_background(&bridge->job_manager, action_job_id)) {
                 winxterm_host_complete_foreground_request(&host, action_job_id,
                                                           ERROR_SUCCESS, false, 0u);
-                (void)winxterm_host_switch_session(&host,
+                (void)winxterm_host_switch_foreground_job(&host,
                     winxterm_job_manager_foreground_id(&bridge->job_manager));
             } else if (job_action == WINXTERM_BRIDGE_JOB_ACTION_CLOSE ||
                        job_action == WINXTERM_BRIDGE_JOB_ACTION_FORCE_EXIT) {
@@ -2946,9 +2961,11 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
             }
         }
         EnterCriticalSection(&host.runtimes.lock);
-        bool root_active = host.active_session_id == root_job_id;
-        if (!headless && root_active) {
+        bool root_active = host.foreground_job_id == root_job_id;
+        if (!headless) {
             winxterm_host_apply_pending_resize(&host);
+        }
+        if (!headless && root_active) {
             if (!winxterm_host_write_pending_input(bridge, root_job_id,
                                                    host.input_write,
                                                    host.pty_backend == WINXTERM_PTY_BACKEND_SHIM &&

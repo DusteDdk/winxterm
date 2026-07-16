@@ -26,7 +26,6 @@ typedef enum WinxtermClickPreviewKind {
 } WinxtermClickPreviewKind;
 
 typedef struct WinxtermMacro WinxtermMacro;
-typedef struct WinxtermAppSessionUx WinxtermAppSessionUx;
 
 typedef struct WinxtermApp {
     HINSTANCE instance;
@@ -40,8 +39,6 @@ typedef struct WinxtermApp {
     WinxtermBridge *bridge;
     HANDLE shutdown_event;
     WinxtermUxState ux;
-    uint64_t ux_session_id;
-    WinxtermAppSessionUx *session_ux;
     unsigned int display_scale;
     WinxtermMacro *macro;
     WinxtermRenderDamage render_damage;

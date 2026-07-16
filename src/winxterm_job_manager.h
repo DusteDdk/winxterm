@@ -56,6 +56,12 @@ bool winxterm_job_manager_background(WinxtermJobManager *manager, uint64_t id);
 bool winxterm_job_manager_stopping(WinxtermJobManager *manager, uint64_t id);
 bool winxterm_job_manager_cancel_stopping(WinxtermJobManager *manager, uint64_t id);
 bool winxterm_job_manager_exit(WinxtermJobManager *manager, uint64_t id, uint32_t exit_code);
+/* Completes a managed process in one registry transaction.  Background jobs
+   remain as exited history; the active foreground job is reparented out of
+   the registry before the restored foreground becomes observable. */
+bool winxterm_job_manager_complete(
+    WinxtermJobManager *manager, uint64_t id, uint32_t exit_code,
+    WinxtermManagedJobSnapshot *finished_snapshot, bool *removed_foreground);
 bool winxterm_job_manager_fail(WinxtermJobManager *manager, uint64_t id, uint32_t error_code);
 uint64_t winxterm_job_manager_foreground_id(WinxtermJobManager *manager);
 bool winxterm_job_manager_remove(WinxtermJobManager *manager,

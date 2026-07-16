@@ -94,5 +94,10 @@ bool winxterm_dstcmd_job_client_kill(WinxtermDstcmdJobClient *client, uint64_t j
 bool winxterm_dstcmd_job_client_simple(WinxtermDstcmdJobClient *client,
                                       uint16_t message_type, uint64_t target_id,
                                       uint32_t flags, uint32_t *status);
+bool winxterm_dstcmd_job_client_foreground(WinxtermDstcmdJobClient *client,
+                                          uint64_t target_id,
+                                          uint32_t *exit_code,
+                                          bool *has_exit_code,
+                                          uint32_t *status);
 
 #endif

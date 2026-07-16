@@ -431,6 +431,52 @@ bool winxterm_dstcmd_job_client_simple(WinxtermDstcmdJobClient *client,
     return ok;
 }
 
+bool winxterm_dstcmd_job_client_foreground(WinxtermDstcmdJobClient *client,
+                                          uint64_t target_id,
+                                          uint32_t *exit_code,
+                                          bool *has_exit_code,
+                                          uint32_t *status)
+{
+    if (exit_code != 0) *exit_code = 0u;
+    if (has_exit_code != 0) *has_exit_code = false;
+    if (status != 0) *status = ERROR_INVALID_DATA;
+    if (!winxterm_dstcmd_job_client_available(client) || target_id == 0u ||
+        exit_code == 0 || has_exit_code == 0 || status == 0) return false;
+    uint8_t payload[16];
+    size_t length = 0u;
+    if (!winxterm_job_tlv_append_u64(payload, sizeof(payload), &length,
+                                     WINXTERM_JOB_TLV_JOB_ID, target_id)) return false;
+    WinxtermJobFrame reply;
+    if (!winxterm_dstcmd_job_request(client, WINXTERM_JOB_MESSAGE_FOREGROUND,
+                                     0u, payload, (uint32_t)length,
+                                     INFINITE, &reply)) return false;
+    bool ok = reply.header.type == WINXTERM_JOB_MESSAGE_REPLY;
+    bool saw_status = false, saw_id = false, saw_exit = false;
+    uint64_t reply_id = 0u;
+    WinxtermJobTlvReader reader;
+    WinxtermJobTlv tlv;
+    winxterm_job_tlv_reader_init(&reader, reply.payload, reply.header.payload_length);
+    while (ok && reader.offset < reader.length && winxterm_job_tlv_next(&reader, &tlv)) {
+        if (tlv.type == WINXTERM_JOB_TLV_STATUS && !saw_status) {
+            ok = winxterm_job_tlv_read_u32(&tlv, status);
+            saw_status = ok;
+        } else if (tlv.type == WINXTERM_JOB_TLV_JOB_ID && !saw_id) {
+            ok = winxterm_job_tlv_read_u64(&tlv, &reply_id);
+            saw_id = ok;
+        } else if (tlv.type == WINXTERM_JOB_TLV_EXIT_CODE && !saw_exit) {
+            ok = winxterm_job_tlv_read_u32(&tlv, exit_code);
+            saw_exit = ok;
+        } else {
+            ok = false;
+        }
+    }
+    ok = ok && reader.offset == reader.length && saw_status &&
+         (*status != ERROR_SUCCESS || (saw_id && reply_id == target_id));
+    *has_exit_code = saw_exit;
+    winxterm_job_frame_dispose(&reply);
+    return ok;
+}
+
 bool winxterm_dstcmd_job_client_spawn(WinxtermDstcmdJobClient *client,
                                      const WinxtermJobExecutionPlan *plan,
                                      uint64_t *job_id, uint32_t *exit_code,

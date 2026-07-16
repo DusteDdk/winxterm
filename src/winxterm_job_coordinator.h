@@ -53,7 +53,7 @@ typedef struct WinxtermJobCoordinator {
     WinxtermJobCoordinatorView *view_head;
     WinxtermJobCoordinatorView *view_tail;
     size_t view_count;
-    uint64_t active_session_id;
+    uint64_t foreground_job_id;
     WinxtermJobCoordinatorClient *clients;
 } WinxtermJobCoordinator;
 
@@ -64,9 +64,9 @@ bool winxterm_job_coordinator_enqueue(WinxtermJobCoordinator *coordinator,
                                      uint32_t action, uint64_t job_id);
 bool winxterm_job_coordinator_take(WinxtermJobCoordinator *coordinator,
                                   uint32_t *action, uint64_t *job_id);
-void winxterm_job_coordinator_set_active_session(WinxtermJobCoordinator *coordinator,
-                                                 uint64_t session_id);
-uint64_t winxterm_job_coordinator_active_session(WinxtermJobCoordinator *coordinator);
+void winxterm_job_coordinator_set_foreground_job(WinxtermJobCoordinator *coordinator,
+                                                 uint64_t job_id);
+uint64_t winxterm_job_coordinator_foreground_job(WinxtermJobCoordinator *coordinator);
 bool winxterm_job_coordinator_publish_view(WinxtermJobCoordinator *coordinator,
                                           uint64_t job_id, uint8_t *bytes,
                                           size_t byte_count);

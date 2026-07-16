@@ -20,12 +20,6 @@
 #include <wincodec.h>
 #include <windowsx.h>
 
-struct WinxtermAppSessionUx {
-    uint64_t session_id;
-    WinxtermUxState state;
-    WinxtermAppSessionUx *next;
-};
-
 static const wchar_t WINXTERM_WINDOW_CLASS_NAME[] = L"WinxtermMainWindow";
 static const wchar_t WINXTERM_WINDOW_TITLE[] = L"XTerm for Windows";
 static const UINT_PTR WINXTERM_CURSOR_TIMER_ID = 1u;
@@ -1513,11 +1507,6 @@ void winxterm_app_dispose(WinxtermApp *app)
     }
     winxterm_macro_destroy(app->macro);
     app->macro = 0;
-    while (app->session_ux != 0) {
-        WinxtermAppSessionUx *next = app->session_ux->next;
-        free(app->session_ux);
-        app->session_ux = next;
-    }
     if (app->bridge != 0) {
         winxterm_bridge_set_hwnd(app->bridge, 0);
     }
@@ -2232,69 +2221,6 @@ static void winxterm_app_maybe_present(WinxtermApp *app, bool force)
     }
 }
 
-static WinxtermAppSessionUx *winxterm_app_session_ux(WinxtermApp *app,
-                                                     uint64_t session_id,
-                                                     bool create)
-{
-    WinxtermAppSessionUx *entry = app != 0 ? app->session_ux : 0;
-    while (entry != 0 && entry->session_id != session_id) entry = entry->next;
-    if (entry != 0 || !create || app == 0 || session_id == 0u) return entry;
-    entry = (WinxtermAppSessionUx *)calloc(1u, sizeof(*entry));
-    if (entry == 0) return 0;
-    entry->session_id = session_id;
-    winxterm_ux_init(&entry->state);
-    entry->next = app->session_ux;
-    app->session_ux = entry;
-    return entry;
-}
-
-static void winxterm_app_prune_session_ux(WinxtermApp *app, uint64_t keep_session_id)
-{
-    if (app == 0 || app->bridge == 0) return;
-    WinxtermAppSessionUx **link = &app->session_ux;
-    while (*link != 0) {
-        WinxtermManagedJobSnapshot snapshot;
-        if ((*link)->session_id != keep_session_id &&
-            !winxterm_job_manager_snapshot_one(&app->bridge->job_manager,
-                                               (*link)->session_id, &snapshot)) {
-            WinxtermAppSessionUx *removed = *link;
-            *link = removed->next;
-            free(removed);
-        } else {
-            link = &(*link)->next;
-        }
-    }
-}
-
-static bool winxterm_app_sync_active_session_ux(WinxtermApp *app)
-{
-    if (app == 0 || app->bridge == 0) return false;
-    uint64_t session_id = winxterm_bridge_active_session(app->bridge);
-    if (session_id == 0u || session_id == app->ux_session_id) return false;
-
-    if (app->ux_session_id != 0u) {
-        WinxtermAppSessionUx *old = winxterm_app_session_ux(
-            app, app->ux_session_id, true);
-        if (old != 0) {
-            old->state = app->ux;
-            old->state.selection.selecting = false;
-        }
-    }
-    WinxtermAppSessionUx *target = winxterm_app_session_ux(app, session_id, true);
-    if (target != 0) app->ux = target->state;
-    else winxterm_ux_init(&app->ux);
-    app->ux_session_id = session_id;
-    winxterm_app_prune_session_ux(app, session_id);
-
-    /* Pointer gestures and transient overlays refer to the old screen's row
-       coordinates and must never leak into the newly presented session. */
-    app->left_click_pending = false;
-    app->hover_valid = false;
-    app->copy_overlay_active = false;
-    app->click_preview_kind = WINXTERM_CLICK_PREVIEW_NONE;
-    return true;
-}
-
 static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
 {
     if (app == 0 || app->bridge == 0 || hwnd == 0) {
@@ -2316,11 +2242,9 @@ static void winxterm_app_handle_render_update(WinxtermApp *app, HWND hwnd)
         return;
     }
 
-    bool session_changed = winxterm_app_sync_active_session_ux(app);
     unsigned int causes = winxterm_bridge_take_frame_request(app->bridge);
-    if (session_changed) causes |= WINXTERM_FRAME_CAUSE_PRESENTATION;
     winxterm_app_process_work(app, causes);
-    winxterm_app_maybe_present(app, session_changed);
+    winxterm_app_maybe_present(app, false);
 }
 
 static void winxterm_app_scroll_lines(WinxtermApp *app, int lines_up)

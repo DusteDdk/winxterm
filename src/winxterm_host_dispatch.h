@@ -44,6 +44,8 @@ uint32_t winxterm_host_lifecycle_request(WinxtermHostContext *host,
                                         WinxtermHostClient *client,
                                         uint16_t message_type,
                                         uint64_t target_id,
-                                        uint32_t *removed_count);
+                                        uint64_t request_id,
+                                        uint32_t *removed_count,
+                                        bool *deferred_reply);
 
 #endif

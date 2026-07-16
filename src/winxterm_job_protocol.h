@@ -15,7 +15,8 @@
 #define WINXTERM_JOB_ENV_SELF_ID L"WINXTERM_JOB_SELF_ID"
 
 #define WINXTERM_JOB_CAPABILITY_LIST 0x00000001u
-#define WINXTERM_JOB_CAPABILITY_MULTI_SESSION 0x00000002u
+/* 0x00000002 was the never-correct per-job terminal-session capability and is
+   intentionally left unassigned for protocol-version compatibility. */
 #define WINXTERM_JOB_CAPABILITY_OUTPUT_JOURNAL 0x00000004u
 #define WINXTERM_JOB_CAPABILITY_LIFECYCLE 0x00000008u
 #define WINXTERM_JOB_CAPABILITY_EVENTS 0x00000010u

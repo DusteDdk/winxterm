@@ -289,8 +289,16 @@ static int winxterm_dstcmd_job_selector(WinxtermDstcmdShell *shell)
                                              &cancelled, &elapsed, &status);
         return ok && status == ERROR_SUCCESS ? 0 : 1;
     } else {
-        bool ok = winxterm_dstcmd_job_client_simple(&shell->job_client, messages[action],
-                                                    job.id, flags[action], &status);
+        if (messages[action] == WINXTERM_JOB_MESSAGE_FOREGROUND) {
+            uint32_t exit_code = 0u;
+            bool has_exit_code = false;
+            bool ok = winxterm_dstcmd_job_client_foreground(
+                &shell->job_client, job.id, &exit_code, &has_exit_code, &status);
+            return ok && status == ERROR_SUCCESS ?
+                (has_exit_code ? (int)exit_code : 0) : 1;
+        }
+        bool ok = winxterm_dstcmd_job_client_simple(
+            &shell->job_client, messages[action], job.id, flags[action], &status);
         return ok && status == ERROR_SUCCESS ? 0 : 1;
     }
 }
@@ -565,7 +573,19 @@ int winxterm_dstcmd_cmd_job(WinxtermDstcmdShell *shell, const WinxtermDstcmdArgv
         return winxterm_dstcmd_job_request_simple(shell, WINXTERM_JOB_MESSAGE_DETACH, id);
     }
     if (argv->count == 2 && winxterm_dstcmd_job_id(argv->items[1], &id)) {
-        return winxterm_dstcmd_job_request_simple(shell, WINXTERM_JOB_MESSAGE_FOREGROUND, id);
+        uint32_t exit_code = 0u;
+        uint32_t status = ERROR_INVALID_DATA;
+        bool has_exit_code = false;
+        if (!winxterm_dstcmd_job_client_foreground(&shell->job_client, id,
+                                                   &exit_code, &has_exit_code,
+                                                   &status) ||
+            status != ERROR_SUCCESS) {
+            (void)winxterm_dstcmd_shell_write_widef(
+                shell, L"job: foreground failed (%lu)\r\n",
+                (unsigned long)status);
+            return 1;
+        }
+        return has_exit_code ? (int)exit_code : 0;
     }
     (void)winxterm_dstcmd_shell_write_wide(shell,
         L"usage: job [ls|clean|remove ID|ID|view ID|run COMMAND...|open COMMAND...|connect SOURCE DEST|disconnect SOURCE|attach ID FILE [append] [tee]|detach ID|kill [-f] ID]\r\n");

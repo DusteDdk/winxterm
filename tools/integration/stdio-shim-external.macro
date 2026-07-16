@@ -7,10 +7,30 @@ waitms 750
 waitredraw -w
 celldump Z:/tmp/winxterm-shim-finite.txt
 histdump Z:/tmp/winxterm-shim-finite.log
+enterstring cmd.exe /d /c for /L %i in (1,1,80) do @echo FG_LINE_%i
+waitms 2000
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-scrollback.txt
+histdump Z:/tmp/winxterm-shim-scrollback.log
 enterstring job ls
 waitms 500
 waitredraw -w
 celldump Z:/tmp/winxterm-shim-joblist.txt
+enterstring job run cmd.exe /d /c echo BG_A&ping -n 5 127.0.0.1&echo BG_B
+waitms 200
+enterstring job 4
+waitms 4500
+waitredraw -w
+histdump Z:/tmp/winxterm-shim-background-promote.log
+enterstring job run cmd.exe /d /c echo BG_EXIT_ONLY
+waitms 1000
+histdump Z:/tmp/winxterm-shim-background-exit.log
+enterstring job ls
+waitms 500
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-background-joblist.txt
+enterstring job clean
+waitms 500
 enterstring cmd.exe /q
 waitms 750
 enterstring echo SHIM_INTERACTIVE

@@ -49,6 +49,7 @@ DWORD WINAPI winxterm_job_dispatch_thread(void *context)
         bool detach_request = request.header.type == WINXTERM_JOB_MESSAGE_DETACH;
         bool cancel_request = request.header.type == WINXTERM_JOB_MESSAGE_CANCEL;
         bool interactive_request = request.header.type == WINXTERM_JOB_MESSAGE_INTERACTIVE;
+        bool lifecycle_deferred = false;
         bool invalid_envelope = request.header.request_id == 0u ||
             (signal_request ? (request.header.flags & ~WINXTERM_JOB_SIGNAL_FORCE) != 0u :
                               request.header.flags != 0u);
@@ -254,7 +255,12 @@ DWORD WINAPI winxterm_job_dispatch_thread(void *context)
                 status = ERROR_INVALID_DATA;
             } else {
                 status = winxterm_host_lifecycle_request(
-                    host, client, request.header.type, target_id, &response_count);
+                    host, client, request.header.type, target_id,
+                    request.header.request_id, &response_count,
+                    &lifecycle_deferred);
+                if (status == ERROR_SUCCESS && lifecycle_deferred) {
+                    defer_reply = true;
+                }
             }
         }
         bool ok = winxterm_job_tlv_append_u32(payload, WINXTERM_JOB_PROTOCOL_MAX_PAYLOAD, &payload_length,
@@ -265,7 +271,6 @@ DWORD WINAPI winxterm_job_dispatch_thread(void *context)
             capabilities |= WINXTERM_JOB_CAPABILITY_SPAWN |
                             WINXTERM_JOB_CAPABILITY_OUTPUT_JOURNAL |
                             WINXTERM_JOB_CAPABILITY_EVENTS |
-                            WINXTERM_JOB_CAPABILITY_MULTI_SESSION |
                             WINXTERM_JOB_CAPABILITY_CONNECTIONS |
                             WINXTERM_JOB_CAPABILITY_DISCONNECT |
                             WINXTERM_JOB_CAPABILITY_PIPELINES |

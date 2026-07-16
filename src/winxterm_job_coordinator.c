@@ -181,22 +181,22 @@ bool winxterm_job_coordinator_take(WinxtermJobCoordinator *coordinator,
     return command != 0;
 }
 
-void winxterm_job_coordinator_set_active_session(WinxtermJobCoordinator *coordinator,
-                                                 uint64_t session_id)
+void winxterm_job_coordinator_set_foreground_job(WinxtermJobCoordinator *coordinator,
+                                                 uint64_t job_id)
 {
     if (coordinator == 0 || !coordinator->lock_initialized) return;
     EnterCriticalSection(&coordinator->lock);
-    coordinator->active_session_id = session_id;
+    coordinator->foreground_job_id = job_id;
     LeaveCriticalSection(&coordinator->lock);
 }
 
-uint64_t winxterm_job_coordinator_active_session(WinxtermJobCoordinator *coordinator)
+uint64_t winxterm_job_coordinator_foreground_job(WinxtermJobCoordinator *coordinator)
 {
     if (coordinator == 0 || !coordinator->lock_initialized) return 0u;
     EnterCriticalSection(&coordinator->lock);
-    uint64_t session_id = coordinator->active_session_id;
+    uint64_t job_id = coordinator->foreground_job_id;
     LeaveCriticalSection(&coordinator->lock);
-    return session_id;
+    return job_id;
 }
 
 bool winxterm_job_coordinator_publish_view(WinxtermJobCoordinator *coordinator,

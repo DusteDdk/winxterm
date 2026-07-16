@@ -297,6 +297,46 @@ static bool winxterm_job_manager_finish(WinxtermJobManager *manager, uint64_t id
 bool winxterm_job_manager_exit(WinxtermJobManager *manager, uint64_t id, uint32_t exit_code)
 { return winxterm_job_manager_finish(manager, id, exit_code, WINXTERM_JOB_EXITED); }
 
+bool winxterm_job_manager_complete(
+    WinxtermJobManager *manager, uint64_t id, uint32_t exit_code,
+    WinxtermManagedJobSnapshot *finished_snapshot, bool *removed_foreground)
+{
+    WinxtermJobManagerImpl *impl = winxterm_job_manager_impl(manager);
+    if (removed_foreground != 0) *removed_foreground = false;
+    if (impl == 0 || id == 0u || finished_snapshot == 0 ||
+        removed_foreground == 0) return false;
+    EnterCriticalSection(&impl->lock);
+    bool completed = false;
+    for (size_t i = 0u; i < impl->job_count; ++i) {
+        WinxtermManagedJob *target = impl->jobs + i;
+        if (target->value.id != id) continue;
+        bool was_foreground = winxterm_job_manager_foreground_locked(impl) == id;
+        target->value.state = WINXTERM_JOB_EXITED;
+        target->value.exit_code = exit_code;
+        target->value.has_exit_code = true;
+        *finished_snapshot = target->value;
+        finished_snapshot->foreground = was_foreground;
+        winxterm_job_manager_remove_stack_locked(impl, id);
+        if (was_foreground) {
+            uint64_t owner_id = target->value.owner_id;
+            for (size_t child = 0u; child < impl->job_count; ++child) {
+                if (impl->jobs[child].value.owner_id == id) {
+                    impl->jobs[child].value.owner_id = owner_id;
+                }
+            }
+            winxterm_job_manager_restore_locked(impl);
+            memmove(impl->jobs + i, impl->jobs + i + 1u,
+                    (impl->job_count - i - 1u) * sizeof(*impl->jobs));
+            --impl->job_count;
+            *removed_foreground = true;
+        }
+        completed = true;
+        break;
+    }
+    LeaveCriticalSection(&impl->lock);
+    return completed;
+}
+
 bool winxterm_job_manager_fail(WinxtermJobManager *manager, uint64_t id, uint32_t error_code)
 { return winxterm_job_manager_finish(manager, id, error_code, WINXTERM_JOB_FAILED); }
 

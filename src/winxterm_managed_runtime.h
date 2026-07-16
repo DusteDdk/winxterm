@@ -35,6 +35,7 @@ typedef struct WinxtermHostManagedChild {
     WinxtermJobCoordinatorClient *pending_kill_client;
     WinxtermJobCoordinatorClient *client;
     bool client_linked;
+    bool pty_created;
     WinxtermTerminalSession session;
     uint64_t destination_id;
     HANDLE connection_thread;
@@ -48,7 +49,9 @@ typedef struct WinxtermHostManagedChild {
     bool output_eof;
     bool redirected_output_eof;
     bool foreground_request_registration_pending;
-    bool auto_remove_on_exit;
+    bool process_completed;
+    bool completion_has_exit_code;
+    uint32_t completion_exit_code;
 } WinxtermHostManagedChild;
 
 typedef struct WinxtermManagedRuntimeRegistry {
