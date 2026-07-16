@@ -176,13 +176,17 @@ bool winxterm_pty_prepare_startup(WinxtermPty *pty,
     *inherit_handles = FALSE;
     *creation_flags = 0u;
     if (pty->backend == WINXTERM_PTY_BACKEND_SHIM) {
-        if (!winxterm_pty_prepare_stdio_startup(pty->child_input,
-                                                pty->child_output,
-                                                pty->child_output,
-                                                extra_handles,
-                                                extra_handle_count,
-                                                startup,
-                                                attribute_list)) return false;
+        /* Use the ordinary redirected-stdio CreateProcess contract here.
+           Unlike ConPTY, the shim does not need extended startup attributes.
+           The pipe ends and optional job-channel handles were all created as
+           inheritable, while their parent-side counterparts were explicitly
+           made non-inheritable. */
+        memset(startup, 0, sizeof(*startup));
+        startup->StartupInfo.cb = sizeof(startup->StartupInfo);
+        startup->StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup->StartupInfo.hStdInput = pty->child_input;
+        startup->StartupInfo.hStdOutput = pty->child_output;
+        startup->StartupInfo.hStdError = pty->child_output;
         *inherit_handles = TRUE;
         *creation_flags = CREATE_NO_WINDOW;
         return true;
@@ -203,6 +207,7 @@ bool winxterm_pty_prepare_startup(WinxtermPty *pty,
         return false;
     }
     *inherit_handles = extra_handle_count != 0u;
+    *creation_flags = EXTENDED_STARTUPINFO_PRESENT;
     return true;
 }
 

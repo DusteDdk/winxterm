@@ -2185,8 +2185,8 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
     WinxtermHostStandardHandles standard_handles = winxterm_host_clear_standard_handles();
     BOOL created = CreateProcessW(0, command_line, 0, 0,
                                   inherit_handles,
-                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                                      CREATE_SUSPENDED | backend_creation_flags,
+                                  CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
+                                      backend_creation_flags,
                                   environment_block, cwd, &startup.StartupInfo, &child->process);
     winxterm_host_restore_standard_handles(standard_handles);
     winxterm_pty_finish_launch(&child->pty);
@@ -2349,7 +2349,8 @@ static void winxterm_host_apply_pending_resize(WinxtermHostContext *host)
 }
 
 static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t session_id,
-                                              HANDLE input_write)
+                                              HANDLE input_write,
+                                              bool translate_stdio_enter)
 {
     uint8_t input[512];
     size_t input_count = winxterm_bridge_read_session_input(
@@ -2357,12 +2358,23 @@ static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t s
     if (input_count == 0u) {
         return true;
     }
+    uint8_t translated[sizeof(input) * 2u];
+    const uint8_t *write_input = input;
+    size_t write_count = input_count;
+    if (translate_stdio_enter) {
+        write_count = 0u;
+        for (size_t i = 0u; i < input_count; ++i) {
+            translated[write_count++] = input[i];
+            if (input[i] == '\r') translated[write_count++] = '\n';
+        }
+        write_input = translated;
+    }
     DWORD written = 0;
-    if (!WriteFile(input_write, input, (DWORD)input_count, &written, 0)) {
+    if (!WriteFile(input_write, write_input, (DWORD)write_count, &written, 0)) {
         winxterm_log_writef(bridge->log, "PTY input write failed, error=%lu", (unsigned long)GetLastError());
         return false;
     }
-    return written == (DWORD)input_count;
+    return written == (DWORD)write_count;
 }
 
 static bool winxterm_host_read_available_output(WinxtermHostContext *host, bool *read_any)
@@ -2772,8 +2784,8 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                                   0,
                                   0,
                                   inherit_handles,
-                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                                      CREATE_SUSPENDED | backend_creation_flags,
+                                  CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
+                                      backend_creation_flags,
                                   environment,
                                   current_directory != 0 && current_directory[0] != L'\0' ? current_directory : 0,
                                   &startup.StartupInfo,
@@ -2907,7 +2919,10 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         if (!headless && root_active) {
             winxterm_host_apply_pending_resize(&host);
             if (!winxterm_host_write_pending_input(bridge, root_job_id,
-                                                   host.input_write)) {
+                                                   host.input_write,
+                                                   host.pty_backend == WINXTERM_PTY_BACKEND_SHIM &&
+                                                       !winxterm_host_is_dstshell(
+                                                           host.root_executable))) {
                 if (WaitForSingleObject(shutdown_event, 0) != WAIT_OBJECT_0 &&
                     !winxterm_bridge_terminate_requested(bridge)) {
                     winxterm_bridge_set_host_state(bridge, WINXTERM_HOST_STATE_FAILED);

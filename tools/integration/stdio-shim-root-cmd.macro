@@ -1,0 +1,10 @@
+set typedelayms 5
+waitms 750
+enterstring echo SHIM_ROOT_CMD
+waitms 750
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-root-cmd.txt
+histdump Z:/tmp/winxterm-shim-root-cmd.log
+enterstring exit
+waitms 500
+exit
