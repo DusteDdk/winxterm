@@ -50,7 +50,7 @@ run_macro() {
     local macro_windows
     macro_windows="$(WINEPREFIX="$TEST_WINEPREFIX" WINEDEBUG=-all winepath -w "$macro")"
     set +e
-    "$ROOT/wine-x11.sh" run env WINEPREFIX="$TEST_WINEPREFIX" WINXTERM_HOST_TRANSPORT=stdio \
+    "$ROOT/wine-x11.sh" run env WINEPREFIX="$TEST_WINEPREFIX" WINXTERM_USE_CONPTY_SHIM=1 \
         timeout "${RUN_TIMEOUT}s" wine "$BUILD_DIR/winxterm.exe" --macro "$macro_windows" \
         >"/tmp/winxterm-editor-$name-wine.log" 2>&1
     local status=$?

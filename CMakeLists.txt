@@ -33,6 +33,7 @@ add_executable(winxterm WIN32
     src/winxterm_modes.c
     src/winxterm_mouse.c
     src/winxterm_options.c
+    src/winxterm_pty.c
     src/winxterm_replies.c
     src/winxterm_render.c
     src/winxterm_screen.c

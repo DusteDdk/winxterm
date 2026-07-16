@@ -1,0 +1,19 @@
+set typedelayms 5
+waitms 500
+enterstring set debuglog on
+waitms 500
+enterstring cmd.exe /d /c echo SHIM_STDOUT
+waitms 750
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-finite.txt
+histdump Z:/tmp/winxterm-shim-finite.log
+enterstring cmd.exe /q
+waitms 750
+enterstring echo SHIM_INTERACTIVE
+waitms 500
+enterstring exit
+waitms 750
+waitredraw -w
+celldump Z:/tmp/winxterm-shim-interactive.txt
+histdump Z:/tmp/winxterm-shim-interactive.log
+exit

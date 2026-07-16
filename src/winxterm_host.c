@@ -6,6 +6,7 @@
 #include "winxterm_host_dispatch.h"
 #include "winxterm_transfer_format.h"
 #include "winxterm_managed_runtime.h"
+#include "winxterm_pty.h"
 
 #include <stdbool.h>
 #include <limits.h>
@@ -23,7 +24,8 @@ static const uint64_t WINXTERM_HOST_OUTPUT_BATCH_MAX_NS = 500000ull;
 
 struct WinxtermHostContext {
     WinxtermBridge *bridge;
-    HPCON pseudo_console;
+    WinxtermPty pty;
+    WinxtermPtyBackend pty_backend;
     PROCESS_INFORMATION process;
     HANDLE process_job;
     HANDLE input_write;
@@ -67,6 +69,9 @@ bool winxterm_host_dispatch_request_ui(WinxtermHostContext *host)
 }
 
 static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t target_id);
+static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
+                                            uint64_t target_id,
+                                            bool request_frame);
 static WinxtermHostManagedChild *winxterm_host_find_child_locked(WinxtermHostContext *host,
                                                                  uint64_t id);
 static void winxterm_host_prune_removed_children(WinxtermHostContext *host);
@@ -350,6 +355,15 @@ static bool winxterm_host_append_quoted_arg(wchar_t *buffer,
     if (*offset != 0u) {
         buffer[(*offset)++] = L' ';
     }
+    bool quote = arg[0] == L'\0' || wcspbrk(arg, L" \t\"") != 0;
+    if (!quote) {
+        size_t length = wcslen(arg);
+        if (*offset + length >= capacity) return false;
+        memcpy(buffer + *offset, arg, length * sizeof(*buffer));
+        *offset += length;
+        buffer[*offset] = L'\0';
+        return true;
+    }
     buffer[(*offset)++] = L'"';
     for (const wchar_t *p = arg; *p != L'\0'; ++p) {
         if (*p == L'\\' || *p == L'"') {
@@ -613,116 +627,6 @@ static bool winxterm_host_show_root_exit_notice(WinxtermHostContext *host)
                                          (size_t)bytes, host->shutdown_event);
     free(utf8);
     return ok;
-}
-
-static bool winxterm_host_prepare_startup(HPCON pseudo_console,
-                                          const HANDLE *inherited_handles,
-                                          size_t inherited_handle_count,
-                                          STARTUPINFOEXW *startup,
-                                          LPPROC_THREAD_ATTRIBUTE_LIST *attribute_list)
-{
-    SIZE_T attribute_size = 0;
-    memset(startup, 0, sizeof(*startup));
-    startup->StartupInfo.cb = sizeof(*startup);
-
-    DWORD attribute_count = inherited_handle_count != 0u ? 2u : 1u;
-    InitializeProcThreadAttributeList(0, attribute_count, 0, &attribute_size);
-    *attribute_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attribute_size);
-    if (*attribute_list == 0) {
-        return false;
-    }
-    if (!InitializeProcThreadAttributeList(*attribute_list, attribute_count, 0, &attribute_size)) {
-        HeapFree(GetProcessHeap(), 0, *attribute_list);
-        *attribute_list = 0;
-        return false;
-    }
-    if (!UpdateProcThreadAttribute(*attribute_list,
-                                   0,
-                                   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                                   pseudo_console,
-                                   sizeof(pseudo_console),
-                                   0,
-                                   0)) {
-        DeleteProcThreadAttributeList(*attribute_list);
-        HeapFree(GetProcessHeap(), 0, *attribute_list);
-        *attribute_list = 0;
-        return false;
-    }
-    if (inherited_handle_count != 0u &&
-        !UpdateProcThreadAttribute(*attribute_list,
-                                   0,
-                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   (void *)inherited_handles,
-                                   inherited_handle_count * sizeof(*inherited_handles),
-                                   0,
-                                   0)) {
-        DeleteProcThreadAttributeList(*attribute_list);
-        HeapFree(GetProcessHeap(), 0, *attribute_list);
-        *attribute_list = 0;
-        return false;
-    }
-    startup->lpAttributeList = *attribute_list;
-    return true;
-}
-
-static bool winxterm_host_prepare_stdio_startup(HANDLE stdin_handle,
-                                                HANDLE stdout_handle,
-                                                HANDLE stderr_handle,
-                                                const HANDLE *extra_handles,
-                                                size_t extra_handle_count,
-                                                STARTUPINFOEXW *startup,
-                                                LPPROC_THREAD_ATTRIBUTE_LIST *attribute_list)
-{
-    SIZE_T attribute_size = 0u;
-    memset(startup, 0, sizeof(*startup));
-    startup->StartupInfo.cb = sizeof(*startup);
-    startup->StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup->StartupInfo.hStdInput = stdin_handle;
-    startup->StartupInfo.hStdOutput = stdout_handle;
-    startup->StartupInfo.hStdError = stderr_handle;
-    HANDLE handles[8];
-    size_t handle_count = 0u;
-    HANDLE candidates[8] = {stdin_handle, stdout_handle, stderr_handle};
-    if (extra_handle_count > 5u) {
-        return false;
-    }
-    for (size_t i = 0u; i < extra_handle_count; ++i) {
-        candidates[3u + i] = extra_handles[i];
-    }
-    for (size_t i = 0u; i < 3u + extra_handle_count; ++i) {
-        bool duplicate = false;
-        for (size_t j = 0u; j < handle_count; ++j) {
-            if (handles[j] == candidates[i]) duplicate = true;
-        }
-        if (!duplicate) handles[handle_count++] = candidates[i];
-    }
-    InitializeProcThreadAttributeList(0, 1u, 0, &attribute_size);
-    *attribute_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0,
-                                                              attribute_size);
-    if (*attribute_list == 0 ||
-        !InitializeProcThreadAttributeList(*attribute_list, 1u, 0, &attribute_size)) {
-        if (*attribute_list != 0) HeapFree(GetProcessHeap(), 0, *attribute_list);
-        *attribute_list = 0;
-        return false;
-    }
-    if (!UpdateProcThreadAttribute(*attribute_list, 0,
-                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
-                                   handle_count * sizeof(*handles), 0, 0)) {
-        DeleteProcThreadAttributeList(*attribute_list);
-        HeapFree(GetProcessHeap(), 0, *attribute_list);
-        *attribute_list = 0;
-        return false;
-    }
-    startup->lpAttributeList = *attribute_list;
-    return true;
-}
-
-static void winxterm_host_destroy_startup(LPPROC_THREAD_ATTRIBUTE_LIST attribute_list)
-{
-    if (attribute_list != 0) {
-        DeleteProcThreadAttributeList(attribute_list);
-        HeapFree(GetProcessHeap(), 0, attribute_list);
-    }
 }
 
 typedef struct WinxtermHostStandardHandles {
@@ -1099,7 +1003,9 @@ static bool winxterm_host_drain_journal_locked(WinxtermHostContext *host, uint64
     }
 }
 
-static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t target_id)
+static bool winxterm_host_switch_session_ex(WinxtermHostContext *host,
+                                            uint64_t target_id,
+                                            bool request_frame)
 {
     if (host == 0) return false;
     EnterCriticalSection(&host->runtimes.lock);
@@ -1205,12 +1111,75 @@ static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t tar
                                                 &target_child->session.output_lock);
     }
     LeaveCriticalSection(&host->runtimes.lock);
-    if (ok) winxterm_bridge_request_frame(host->bridge, WINXTERM_FRAME_CAUSE_CONTENT |
-                                                        WINXTERM_FRAME_CAUSE_PRESENTATION);
+    if (ok && request_frame) {
+        winxterm_bridge_request_frame(host->bridge, WINXTERM_FRAME_CAUSE_CONTENT |
+                                                    WINXTERM_FRAME_CAUSE_PRESENTATION);
+    }
     if (ok && target_id != 0u) {
         winxterm_host_send_event(host, WINXTERM_JOB_EVENT_FOREGROUND_CHANGED, target_id);
     }
     return ok;
+}
+
+static bool winxterm_host_switch_session(WinxtermHostContext *host, uint64_t target_id)
+{
+    return winxterm_host_switch_session_ex(host, target_id, true);
+}
+
+static bool winxterm_host_merge_completed_foreground_output(
+    WinxtermHostManagedChild *child, uint64_t target_id)
+{
+    if (child == 0 || child->host == 0 || target_id == 0u || target_id == child->id) {
+        return false;
+    }
+    WinxtermHostContext *host = child->host;
+    uint64_t offset = 0u;
+    uint64_t end = 0u;
+    EnterCriticalSection(&child->session.output_lock);
+    offset = child->session.transcript_base_offset;
+    end = child->session.transcript_produced_offset;
+    bool truncated = offset != 0u;
+    LeaveCriticalSection(&child->session.output_lock);
+    if (!winxterm_host_switch_session_ex(host, target_id, false)) return false;
+
+    EnterCriticalSection(&host->runtimes.lock);
+    WinxtermHostManagedChild *target_child = target_id != host->root_job_id ?
+        winxterm_host_find_child_locked(host, target_id) : 0;
+    WinxtermTerminalSession *target_session = target_id == host->root_job_id ?
+        &host->root_session : target_child != 0 ? &target_child->session : 0;
+    LeaveCriticalSection(&host->runtimes.lock);
+    if (target_session == 0) return false;
+
+    uint8_t bytes[WINXTERM_HOST_OUTPUT_READ_CHUNK_BYTES];
+    uint64_t merged = 0u;
+    bool ok = true;
+    while (ok && offset < end) {
+        size_t length = 0u;
+        uint64_t next = offset;
+        bool more = false;
+        ok = winxterm_terminal_session_copy_transcript_page(
+            &child->session, offset, end, bytes, sizeof(bytes),
+            &length, &next, &more);
+        if (!ok || length == 0u || next <= offset) break;
+        ok = winxterm_terminal_session_record(target_session, bytes, length) &&
+             winxterm_host_route_output(host, target_id,
+                                        &target_session->journal,
+                                        &target_session->output_lock,
+                                        bytes, length);
+        if (ok) {
+            merged += length;
+            offset = next;
+        }
+    }
+    winxterm_log_writef(host->bridge->log,
+                        "managed foreground output merged job=%llu owner=%llu bytes=%llu truncated=%s",
+                        (unsigned long long)child->id,
+                        (unsigned long long)target_id,
+                        (unsigned long long)merged,
+                        truncated ? "yes" : "no");
+    winxterm_bridge_request_frame(host->bridge, WINXTERM_FRAME_CAUSE_CONTENT |
+                                                WINXTERM_FRAME_CAUSE_PRESENTATION);
+    return ok && offset == end;
 }
 
 static void winxterm_host_managed_child_close_runtime(WinxtermHostManagedChild *child)
@@ -1223,12 +1192,9 @@ static void winxterm_host_managed_child_close_runtime(WinxtermHostManagedChild *
     winxterm_host_close_handle(&child->kill_cancel_event);
     winxterm_host_close_handle(&child->process.hThread);
     winxterm_host_close_handle(&child->process.hProcess);
-    if (child->pseudo_console != 0) {
-        ClosePseudoConsole(child->pseudo_console);
-        child->pseudo_console = 0;
-    }
     winxterm_host_close_handle(&child->input_write);
     winxterm_host_close_handle(&child->output_read);
+    winxterm_pty_dispose(&child->pty);
     winxterm_host_close_handle(&child->redirected_output_read);
     winxterm_host_close_handle(&child->redirected_file);
     if (child->session.output_lock_initialized) EnterCriticalSection(&child->session.output_lock);
@@ -1541,9 +1507,11 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
     WinxtermHostManagedChild *child = (WinxtermHostManagedChild *)context;
     uint8_t bytes[WINXTERM_HOST_OUTPUT_READ_CHUNK_BYTES];
     bool process_exited = false;
+    DWORD exit_drain_tick = 0u;
     for (;;) {
         if (!process_exited && winxterm_host_managed_child_all_exited(child)) {
             process_exited = true;
+            exit_drain_tick = GetTickCount();
         }
         bool drained_attachment = false;
         bool attachment_failed = false;
@@ -1624,14 +1592,25 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
             size_t input_count = winxterm_bridge_read_session_input(
                 child->host->bridge, child->id, input, sizeof(input));
             if (input_count != 0u) {
+                uint8_t shim_input[sizeof(input) * 2u];
+                const uint8_t *write_input = input;
+                size_t write_count = input_count;
+                if (child->pty.backend == WINXTERM_PTY_BACKEND_SHIM) {
+                    write_count = 0u;
+                    for (size_t i = 0u; i < input_count; ++i) {
+                        shim_input[write_count++] = input[i];
+                        if (input[i] == '\r') shim_input[write_count++] = '\n';
+                    }
+                    write_input = shim_input;
+                }
                 DWORD written = 0u;
-                (void)WriteFile(child->input_write, input, (DWORD)input_count, &written, 0);
+                (void)WriteFile(child->input_write, write_input,
+                                (DWORD)write_count, &written, 0);
             }
             int columns = 0, rows = 0;
-            if (child->pseudo_console != 0 &&
-                winxterm_bridge_peek_pending_resize(child->host->bridge, &columns, &rows)) {
+            if (winxterm_bridge_peek_pending_resize(child->host->bridge, &columns, &rows)) {
                 COORD size = {(SHORT)(columns > 0 ? columns : 1), (SHORT)(rows > 0 ? rows : 1)};
-                if (SUCCEEDED(ResizePseudoConsole(child->pseudo_console, size))) {
+                if (SUCCEEDED(winxterm_pty_resize(&child->pty, size))) {
                     (void)winxterm_bridge_ack_pending_resize(child->host->bridge, columns, rows);
                 }
             }
@@ -1645,7 +1624,8 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
         if (full) {
             (void)winxterm_job_manager_set_output(&child->host->bridge->job_manager,
                                                   child->id, WINXTERM_JOB_OUTPUT_LIMIT, true);
-            if (process_exited && available == 0u && redirected_available == 0u) break;
+            if (process_exited && available == 0u && redirected_available == 0u &&
+                GetTickCount() - exit_drain_tick >= WINXTERM_HOST_EXIT_DRAIN_MS) break;
             Sleep(10u);
             continue;
         }
@@ -1667,6 +1647,7 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
                                                 child->id, ERROR_WRITE_FAULT);
                 break;
             }
+            if (process_exited) exit_drain_tick = GetTickCount();
             continue;
         }
         if (available != 0u) {
@@ -1689,9 +1670,11 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
                                                 child->id, ERROR_BUFFER_OVERFLOW);
                 break;
             }
+            if (process_exited) exit_drain_tick = GetTickCount();
             continue;
         }
-        if (process_exited && available == 0u && redirected_available == 0u) break;
+        if (process_exited && available == 0u && redirected_available == 0u &&
+            GetTickCount() - exit_drain_tick >= WINXTERM_HOST_EXIT_DRAIN_MS) break;
         Sleep(10u);
     }
     DWORD exit_code = 1u;
@@ -1711,11 +1694,18 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
     LeaveCriticalSection(&child->session.output_lock);
     if (final_process != 0 && GetExitCodeProcess(final_process, &exit_code) &&
         exit_code != STILL_ACTIVE) {
+        EnterCriticalSection(&child->host->runtimes.lock);
+        bool merge_foreground = child->host->active_session_id == child->id &&
+                                child->destination_id == 0u;
+        LeaveCriticalSection(&child->host->runtimes.lock);
         (void)winxterm_job_manager_exit(&child->host->bridge->job_manager,
                                        child->id, exit_code);
         winxterm_host_send_event(child->host, WINXTERM_JOB_EVENT_EXITED, child->id);
         uint64_t restored = winxterm_job_manager_foreground_id(&child->host->bridge->job_manager);
-        (void)winxterm_host_switch_session(child->host, restored);
+        if (!merge_foreground ||
+            !winxterm_host_merge_completed_foreground_output(child, restored)) {
+            (void)winxterm_host_switch_session(child->host, restored);
+        }
         if (redirected) {
             winxterm_host_emit_file_summary(child->host, child->redirected_bytes,
                                             child->redirect_start_ms);
@@ -1724,6 +1714,14 @@ static DWORD WINAPI winxterm_host_managed_child_thread(void *context)
             winxterm_host_emit_file_summary(child->host, child->attachment_bytes,
                                             child->attachment_start_ms);
         }
+        EnterCriticalSection(&child->session.output_lock);
+        uint64_t output_bytes = child->session.transcript_produced_offset;
+        LeaveCriticalSection(&child->session.output_lock);
+        winxterm_log_writef(child->host->bridge->log,
+                            "managed process exited job=%llu code=%lu output_bytes=%llu",
+                            (unsigned long long)child->id,
+                            (unsigned long)exit_code,
+                            (unsigned long long)output_bytes);
     }
     winxterm_host_complete_foreground_request(child->host, child->id,
                                               ERROR_SUCCESS, true, exit_code);
@@ -1941,9 +1939,9 @@ static uint32_t winxterm_host_spawn_pipeline_plan(WinxtermHostContext *host,
             edges[stage_index].write_handle;
         STARTUPINFOEXW startup;
         if (command_line == 0 ||
-            !winxterm_host_prepare_stdio_startup(stage_input, stage_output, output_write,
-                                                 0, 0u,
-                                                 &startup, &attributes)) {
+            !winxterm_pty_prepare_stdio_startup(stage_input, stage_output, output_write,
+                                                0, 0u,
+                                                &startup, &attributes)) {
             if (status == ERROR_NOT_ENOUGH_MEMORY) status = GetLastError();
             goto stage_cleanup;
         }
@@ -1964,7 +1962,7 @@ static uint32_t winxterm_host_spawn_pipeline_plan(WinxtermHostContext *host,
         }
         status = ERROR_SUCCESS;
 stage_cleanup:
-        if (attributes != 0) winxterm_host_destroy_startup(attributes);
+        if (attributes != 0) winxterm_pty_destroy_startup(attributes);
         free(command_line);
         if (arguments != 0) {
             for (size_t i = 0u; i < stage->argument_count; ++i) free(arguments[i]);
@@ -2148,20 +2146,32 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
     environment_block = winxterm_host_build_environment(
         (const wchar_t * const *)environment, environment_count);
     if (command_line == 0 || environment_block == 0) goto cleanup;
-    if (!winxterm_host_create_pipes(&input_read, &child->input_write,
-                                    &child->output_read, &output_write)) {
-        status = GetLastError(); goto cleanup;
-    }
     COORD size = {(SHORT)(host->bridge->screen.columns > 0 ? host->bridge->screen.columns : 80),
                   (SHORT)(host->bridge->screen.rows > 0 ? host->bridge->screen.rows : 24)};
-    HRESULT hr = CreatePseudoConsole(size, input_read, output_write, 0, &child->pseudo_console);
-    winxterm_host_close_handle(&input_read);
-    winxterm_host_close_handle(&output_write);
-    if (FAILED(hr)) { status = (uint32_t)hr; goto cleanup; }
+    HRESULT hr = winxterm_pty_create(&child->pty, host->pty_backend, size,
+                                     &child->input_write, &child->output_read);
+    if (FAILED(hr)) {
+        status = (uint32_t)hr;
+        winxterm_log_writef(host->bridge->log,
+                            "managed PTY creation failed job=%llu backend=%s hr=0x%08lx",
+                            (unsigned long long)child->id,
+                            winxterm_pty_backend_name(host->pty_backend),
+                            (unsigned long)hr);
+        goto cleanup;
+    }
     STARTUPINFOEXW startup;
-    if (!winxterm_host_prepare_startup(child->pseudo_console, inherited_handles,
-                                      inherited_handle_count, &startup, &attributes)) {
-        status = GetLastError(); goto cleanup;
+    BOOL inherit_handles = FALSE;
+    DWORD backend_creation_flags = 0u;
+    if (!winxterm_pty_prepare_startup(&child->pty, inherited_handles,
+                                     inherited_handle_count, &startup, &attributes,
+                                     &inherit_handles, &backend_creation_flags)) {
+        status = GetLastError();
+        winxterm_log_writef(host->bridge->log,
+                            "managed PTY startup setup failed job=%llu backend=%s error=%lu",
+                            (unsigned long long)child->id,
+                            winxterm_pty_backend_name(host->pty_backend),
+                            (unsigned long)status);
+        goto cleanup;
     }
     child->process_job = CreateJobObjectW(0, 0);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
@@ -2174,21 +2184,37 @@ uint32_t winxterm_host_spawn_plan(WinxtermHostContext *host,
     }
     WinxtermHostStandardHandles standard_handles = winxterm_host_clear_standard_handles();
     BOOL created = CreateProcessW(0, command_line, 0, 0,
-                                  inherited_handle_count != 0u,
+                                  inherit_handles,
                                   EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                                      CREATE_SUSPENDED,
+                                      CREATE_SUSPENDED | backend_creation_flags,
                                   environment_block, cwd, &startup.StartupInfo, &child->process);
     winxterm_host_restore_standard_handles(standard_handles);
+    winxterm_pty_finish_launch(&child->pty);
     winxterm_host_close_handle(&job_request_write);
     winxterm_host_close_handle(&job_reply_read);
     free(environment_block);
     environment_block = 0;
-    if (!created) { status = GetLastError(); goto cleanup; }
+    if (!created) {
+        status = GetLastError();
+        winxterm_log_writef(host->bridge->log,
+                            "managed process launch failed job=%llu backend=%s error=%lu argv0=%s plan_cwd=%s",
+                            (unsigned long long)child->id,
+                            winxterm_pty_backend_name(host->pty_backend),
+                            (unsigned long)status,
+                            plan.stages[0].arguments[0],
+                            plan.cwd);
+        goto cleanup;
+    }
     if (!AssignProcessToJobObject(child->process_job, child->process.hProcess)) {
         status = GetLastError(); goto cleanup;
     }
     (void)winxterm_job_manager_set_process(&host->bridge->job_manager, child->id,
                                           child->process.dwProcessId, arguments[0]);
+    winxterm_log_writef(host->bridge->log,
+                        "managed process started job=%llu pid=%lu backend=%s command=%ls",
+                        (unsigned long long)child->id,
+                        (unsigned long)child->process.dwProcessId,
+                        winxterm_pty_backend_name(host->pty_backend), arguments[0]);
     if ((plan.flags & WINXTERM_JOB_PLAN_FLAG_CONNECTABLE_STDIN) != 0u) {
         (void)winxterm_job_manager_set_connectable(&host->bridge->job_manager, child->id, true);
     }
@@ -2240,7 +2266,7 @@ registered_failure:
         host, winxterm_job_manager_foreground_id(&host->bridge->job_manager));
     child = 0;
 cleanup:
-    if (attributes != 0) winxterm_host_destroy_startup(attributes);
+    if (attributes != 0) winxterm_pty_destroy_startup(attributes);
     winxterm_host_close_handle(&input_read);
     winxterm_host_close_handle(&output_write);
     winxterm_host_close_handle(&job_request_write);
@@ -2300,18 +2326,14 @@ static void winxterm_host_apply_pending_resize(WinxtermHostContext *host)
     int columns = 0;
     int rows = 0;
     if (winxterm_bridge_peek_pending_resize(bridge, &columns, &rows)) {
-        if (host->pseudo_console == 0) {
-            (void)winxterm_bridge_ack_pending_resize(bridge, columns, rows);
-            return;
-        }
         COORD size;
         size.X = (SHORT)(columns > 0 ? columns : 1);
         size.Y = (SHORT)(rows > 0 ? rows : 1);
-        HRESULT result = ResizePseudoConsole(host->pseudo_console, size);
+        HRESULT result = winxterm_pty_resize(&host->pty, size);
         if (FAILED(result)) {
             if (winxterm_host_should_log_resize_failure(host, columns, rows, result)) {
                 winxterm_log_writef(bridge->log,
-                                    "ConPTY resize failed, size=%dx%d hr=0x%08lx",
+                                    "PTY resize failed, size=%dx%d hr=0x%08lx",
                                     columns,
                                     rows,
                                     (unsigned long)result);
@@ -2337,7 +2359,7 @@ static bool winxterm_host_write_pending_input(WinxtermBridge *bridge, uint64_t s
     }
     DWORD written = 0;
     if (!WriteFile(input_write, input, (DWORD)input_count, &written, 0)) {
-        winxterm_log_writef(bridge->log, "ConPTY input write failed, error=%lu", (unsigned long)GetLastError());
+        winxterm_log_writef(bridge->log, "PTY input write failed, error=%lu", (unsigned long)GetLastError());
         return false;
     }
     return written == (DWORD)input_count;
@@ -2362,7 +2384,7 @@ static bool winxterm_host_read_available_output(WinxtermHostContext *host, bool 
             DWORD error = GetLastError();
             if (error != ERROR_BROKEN_PIPE && error != ERROR_PIPE_NOT_CONNECTED) {
                 winxterm_log_writef(host->bridge->log,
-                                    "ConPTY output peek failed, error=%lu",
+                                    "PTY output peek failed, error=%lu",
                                     (unsigned long)error);
                 read_ok = false;
             }
@@ -2406,7 +2428,7 @@ static bool winxterm_host_read_available_output(WinxtermHostContext *host, bool 
             DWORD error = GetLastError();
             if (error != ERROR_BROKEN_PIPE && error != ERROR_PIPE_NOT_CONNECTED) {
                 winxterm_log_writef(host->bridge->log,
-                                    "ConPTY output read failed, error=%lu",
+                                    "PTY output read failed, error=%lu",
                                     (unsigned long)error);
                 read_ok = false;
             }
@@ -2481,7 +2503,7 @@ static void winxterm_host_request_child_shutdown(WinxtermHostContext *host)
                                             WINXTERM_JOB_TERMINATE_TIMEOUT_MS);
     if (wait_result == WAIT_TIMEOUT) {
         winxterm_log_writef(host->bridge->log,
-                            "ConPTY child did not exit after %lu ms, terminating",
+                            "PTY child did not exit after %lu ms, terminating",
                             (unsigned long)WINXTERM_JOB_TERMINATE_TIMEOUT_MS);
         if (host->process_job != 0) {
             (void)TerminateJobObject(host->process_job, 1u);
@@ -2540,12 +2562,9 @@ static void winxterm_host_cleanup_context(WinxtermHostContext *host)
     winxterm_host_close_handle(&host->process.hThread);
     winxterm_host_close_handle(&host->process.hProcess);
     winxterm_host_close_handle(&host->process_job);
-    if (host->pseudo_console != 0) {
-        ClosePseudoConsole(host->pseudo_console);
-        host->pseudo_console = 0;
-    }
     winxterm_host_close_handle(&host->input_write);
     winxterm_host_close_handle(&host->output_read);
+    winxterm_pty_dispose(&host->pty);
     winxterm_terminal_session_dispose(&host->root_session);
     winxterm_managed_runtime_registry_dispose(&host->runtimes);
 }
@@ -2574,6 +2593,17 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
     host.bridge = bridge;
     host.shutdown_event = shutdown_event;
     host.exit_code = 1;
+    wchar_t backend_error[160];
+    if (!winxterm_pty_backend_from_environment(&host.pty_backend,
+                                               backend_error,
+                                               sizeof(backend_error) / sizeof(backend_error[0]))) {
+        winxterm_log_writef(bridge->log, "invalid PTY backend environment configuration");
+        MessageBoxW(0, backend_error, L"Winxterm startup error", MB_OK | MB_ICONERROR);
+        winxterm_host_cleanup_context(&host);
+        return 1;
+    }
+    winxterm_log_writef(bridge->log, "PTY backend selected: %s",
+                        winxterm_pty_backend_name(host.pty_backend));
     host.root_is_shell = winxterm_host_is_shell_root(argv[0]);
     (void)wcsncpy_s(host.root_executable,
                     sizeof(host.root_executable) / sizeof(host.root_executable[0]),
@@ -2629,47 +2659,26 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         return 1;
     }
 
-    HANDLE input_read = 0;
-    HANDLE output_read = 0;
-    HANDLE output_write = 0;
-    wchar_t host_transport[16];
-    DWORD host_transport_length = GetEnvironmentVariableW(L"WINXTERM_HOST_TRANSPORT",
-                                                           host_transport,
-                                                           16u);
-    bool raw_stdio = host_transport_length == 5u &&
-                     _wcsicmp(host_transport, L"stdio") == 0;
-    if (!winxterm_host_create_pipes(&input_read, &host.input_write, &output_read, &output_write)) {
-        DWORD error = GetLastError();
-        winxterm_log_writef(bridge->log, "ConPTY pipe creation failed, error=%lu", (unsigned long)error);
+    COORD size;
+    size.X = (SHORT)(bridge->screen.columns > 0 ?
+        bridge->screen.columns : WINXTERM_TERMINAL_COLUMNS);
+    size.Y = (SHORT)(bridge->screen.rows > 0 ?
+        bridge->screen.rows : WINXTERM_TERMINAL_ROWS);
+    HRESULT pty_result = winxterm_pty_create(&host.pty, host.pty_backend, size,
+                                             &host.input_write, &host.output_read);
+    if (FAILED(pty_result)) {
+        winxterm_log_writef(bridge->log, "PTY creation failed backend=%s hr=0x%08lx",
+                            winxterm_pty_backend_name(host.pty_backend),
+                            (unsigned long)pty_result);
         winxterm_host_cleanup_context(&host);
-        (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, error);
+        (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id,
+                                        (uint32_t)pty_result);
         winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
         return 1;
-    }
-    host.output_read = output_read;
-
-    if (!raw_stdio) {
-        COORD size;
-        size.X = (SHORT)(bridge->screen.columns > 0 ?
-            bridge->screen.columns : WINXTERM_TERMINAL_COLUMNS);
-        size.Y = (SHORT)(bridge->screen.rows > 0 ?
-            bridge->screen.rows : WINXTERM_TERMINAL_ROWS);
-        HRESULT hr = CreatePseudoConsole(size, input_read, output_write, 0, &host.pseudo_console);
-        winxterm_host_close_handle(&input_read);
-        winxterm_host_close_handle(&output_write);
-        if (FAILED(hr)) {
-            winxterm_log_writef(bridge->log, "CreatePseudoConsole failed, hr=0x%08lx", (unsigned long)hr);
-            winxterm_host_cleanup_context(&host);
-            (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, (uint32_t)hr);
-            winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
-            return 1;
-        }
     }
 
     wchar_t *command_line = winxterm_host_build_command_line(argv, argc);
     if (command_line == 0) {
-        winxterm_host_close_handle(&input_read);
-        winxterm_host_close_handle(&output_write);
         winxterm_host_cleanup_context(&host);
         (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, ERROR_NOT_ENOUGH_MEMORY);
         winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
@@ -2726,8 +2735,6 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                                                            job_environment_count);
     if (environment == 0) {
         free(command_line);
-        winxterm_host_close_handle(&input_read);
-        winxterm_host_close_handle(&output_write);
         winxterm_host_close_handle(&job_request_write);
         winxterm_host_close_handle(&job_reply_read);
         winxterm_host_cleanup_context(&host);
@@ -2738,26 +2745,19 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
 
     STARTUPINFOEXW startup;
     LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = 0;
-    bool startup_prepared = raw_stdio ?
-        winxterm_host_prepare_stdio_startup(input_read,
-                                            output_write,
-                                            output_write,
-                                            inherited_handles,
-                                            inherited_handle_count,
-                                            &startup,
-                                            &attribute_list) :
-        winxterm_host_prepare_startup(host.pseudo_console,
+    BOOL inherit_handles = FALSE;
+    DWORD backend_creation_flags = 0u;
+    if (!winxterm_pty_prepare_startup(&host.pty,
                                      inherited_handles,
                                      inherited_handle_count,
                                      &startup,
-                                     &attribute_list);
-    if (!startup_prepared) {
+                                     &attribute_list,
+                                     &inherit_handles,
+                                     &backend_creation_flags)) {
         DWORD error = GetLastError();
         winxterm_log_writef(bridge->log, "host startup attribute setup failed, error=%lu", (unsigned long)error);
         free(command_line);
         free(environment);
-        winxterm_host_close_handle(&input_read);
-        winxterm_host_close_handle(&output_write);
         winxterm_host_close_handle(&job_request_write);
         winxterm_host_close_handle(&job_reply_read);
         winxterm_host_cleanup_context(&host);
@@ -2771,24 +2771,25 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                                   command_line,
                                   0,
                                   0,
-                                  raw_stdio || inherited_handle_count != 0u,
+                                  inherit_handles,
                                   EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                                      CREATE_SUSPENDED | (raw_stdio ? CREATE_NO_WINDOW : 0u),
+                                      CREATE_SUSPENDED | backend_creation_flags,
                                   environment,
                                   current_directory != 0 && current_directory[0] != L'\0' ? current_directory : 0,
                                   &startup.StartupInfo,
                                   &host.process);
     winxterm_host_restore_standard_handles(standard_handles);
-    winxterm_host_close_handle(&input_read);
-    winxterm_host_close_handle(&output_write);
+    winxterm_pty_finish_launch(&host.pty);
     winxterm_host_close_handle(&job_request_write);
     winxterm_host_close_handle(&job_reply_read);
     free(command_line);
     free(environment);
-    winxterm_host_destroy_startup(attribute_list);
+    winxterm_pty_destroy_startup(attribute_list);
     if (!created) {
         DWORD error = GetLastError();
-        winxterm_log_writef(bridge->log, "ConPTY client launch failed, error=%lu", (unsigned long)error);
+        winxterm_log_writef(bridge->log, "PTY client launch failed backend=%s error=%lu",
+                            winxterm_pty_backend_name(host.pty_backend),
+                            (unsigned long)error);
         winxterm_host_cleanup_context(&host);
         (void)winxterm_job_manager_fail(&bridge->job_manager, root_job_id, error);
         winxterm_bridge_clear_host_child(bridge, WINXTERM_HOST_STATE_FAILED);
@@ -2853,8 +2854,9 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
     winxterm_bridge_set_host_child(bridge, host.process.dwProcessId, argv[0],
                                    host.root_is_shell);
     winxterm_log_writef(bridge->log,
-                        "ConPTY client started pid=%lu",
-                        (unsigned long)host.process.dwProcessId);
+                        "PTY client started pid=%lu backend=%s",
+                        (unsigned long)host.process.dwProcessId,
+                        winxterm_pty_backend_name(host.pty_backend));
     bool running = true;
     while (running) {
         WinxtermBridgeJobAction job_action;
@@ -2969,7 +2971,7 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
                 running = false;
             } else if (wait_result == WAIT_FAILED) {
                 winxterm_log_writef(bridge->log,
-                                    "ConPTY host wait failed, error=%lu",
+                                    "PTY host wait failed, error=%lu",
                                     (unsigned long)GetLastError());
                 winxterm_bridge_set_host_state(bridge, WINXTERM_HOST_STATE_FAILED);
                 running = false;
@@ -2988,9 +2990,10 @@ DWORD winxterm_host_run_conpty_in_directory(WinxtermBridge *bridge,
         winxterm_host_drain_available_output(&host, WINXTERM_HOST_EXIT_DRAIN_MS);
     GetExitCodeProcess(host.process.hProcess, &host.exit_code);
     winxterm_log_writef(bridge->log,
-                        "ConPTY client exited code=%lu forced=%s",
+                        "PTY client exited code=%lu forced=%s backend=%s",
                         (unsigned long)host.exit_code,
-                        host.force_terminated ? "yes" : "no");
+                        host.force_terminated ? "yes" : "no",
+                        winxterm_pty_backend_name(host.pty_backend));
     if (winxterm_bridge_is_headless(bridge)) {
         WinxtermBridgeDiagnostics bridge_diagnostics;
         winxterm_bridge_copy_diagnostics(bridge, &bridge_diagnostics);

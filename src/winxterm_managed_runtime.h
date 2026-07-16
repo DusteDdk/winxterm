@@ -2,6 +2,7 @@
 #define WINXTERM_MANAGED_RUNTIME_H
 
 #include "winxterm_job_coordinator.h"
+#include "winxterm_pty.h"
 #include "winxterm_terminal_session.h"
 
 #include <stdbool.h>
@@ -15,7 +16,7 @@ typedef struct WinxtermHostManagedChild {
     WinxtermHostContext *host;
     struct WinxtermHostManagedChild *next;
     uint64_t id;
-    HPCON pseudo_console;
+    WinxtermPty pty;
     PROCESS_INFORMATION process;
     PROCESS_INFORMATION *stage_processes;
     size_t stage_count;

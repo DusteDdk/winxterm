@@ -92,8 +92,14 @@ never delete another user's build dirs.
 
 ## Running under wine (unit tests / smoke tests)
 
-wine is installed and runs the built binaries, including winxterm hosting
-dstshell through ConPTY.
+wine is installed and runs the built binaries. The repository Wine launch and
+UI integration scripts set `WINXTERM_USE_CONPTY_SHIM=1`, which makes winxterm
+host both dstshell and its managed external jobs through inherited stdio pipes
+instead of ConPTY. Unset the variable, or set it to `0`, to use native ConPTY.
+Values other than `0` and `1` are rejected at startup.
+
+The shim is a byte-stream compatibility backend. It does not emulate Windows
+console-buffer APIs, console modes, or resize behavior for hosted programs.
 
 - `wine <dist>/winxterm.exe --smoke` and `wine <dist>/dstshell.exe --smoke`
   run the built-in self-tests. The process exit code is the pass/fail signal;

@@ -11,10 +11,10 @@ rm -f /tmp/winxterm-grid-{initial,typed,cleared,search,final,wrapped,unicode}.tx
 
 macro_windows="$(winepath -w "$MACRO")"
 # Wine's conhost currently counts VT control bytes as screen cells. The raw
-# stdio test transport keeps Wine in the loop while letting Winxterm parse the
-# same byte stream that native ConPTY delivers.
+# The stdio shim keeps Wine in the loop while letting Winxterm parse the same
+# byte stream that native ConPTY delivers.
 set +e
-WINXTERM_HOST_TRANSPORT=stdio timeout 45s wine "$BUILD_DIR/winxterm.exe" --macro "$macro_windows"
+WINXTERM_USE_CONPTY_SHIM=1 timeout 45s wine "$BUILD_DIR/winxterm.exe" --macro "$macro_windows"
 wine_status=$?
 set -e
 if (( wine_status != 0 && wine_status != 1 )); then

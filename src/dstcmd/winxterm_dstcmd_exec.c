@@ -678,6 +678,11 @@ bool winxterm_dstcmd_exec_resolve(const wchar_t *cwd,
 
 static void winxterm_dstcmd_free_argv(const wchar_t **argv)
 {
+    if (argv != 0) {
+        for (size_t i = 0u; argv[i] != 0; ++i) {
+            free((void *)argv[i]);
+        }
+    }
     free((void *)argv);
 }
 
@@ -701,7 +706,8 @@ static const wchar_t **winxterm_dstcmd_build_process_argv(const WinxtermDstcmdRe
         break;
     }
     int total = fixed_count + (argv->count - 1);
-    const wchar_t **process_argv = (const wchar_t **)calloc((size_t)total, sizeof(*process_argv));
+    const wchar_t **process_argv =
+        (const wchar_t **)calloc((size_t)total + 1u, sizeof(*process_argv));
     if (process_argv == 0) {
         return 0;
     }
@@ -731,6 +737,15 @@ static const wchar_t **winxterm_dstcmd_build_process_argv(const WinxtermDstcmdRe
     for (int i = 1; i < argv->count; ++i) {
         process_argv[offset++] = argv->items[i];
     }
+    for (int i = 0; i < offset; ++i) {
+        const wchar_t *copy = _wcsdup(process_argv[i]);
+        if (copy == 0) {
+            process_argv[i] = 0;
+            winxterm_dstcmd_free_argv(process_argv);
+            return 0;
+        }
+        process_argv[i] = copy;
+    }
     *argc = offset;
     return process_argv;
 }
@@ -756,6 +771,15 @@ static bool winxterm_dstcmd_process_append_quoted_arg(wchar_t *buffer,
     }
     if (*offset != 0u) {
         buffer[(*offset)++] = L' ';
+    }
+    bool quote = arg[0] == L'\0' || wcspbrk(arg, L" \t\"") != 0;
+    if (!quote) {
+        size_t length = wcslen(arg);
+        if (*offset + length >= capacity) return false;
+        memcpy(buffer + *offset, arg, length * sizeof(*buffer));
+        *offset += length;
+        buffer[*offset] = L'\0';
+        return true;
     }
     buffer[(*offset)++] = L'"';
     for (const wchar_t *p = arg; *p != L'\0'; ++p) {
@@ -885,6 +909,31 @@ static void winxterm_dstcmd_write_redirect_win32_error(WinxtermDstcmdShell *shel
                                             operation != 0 ? operation : L"operation",
                                             path != 0 ? path : L"",
                                             message);
+}
+
+static void winxterm_dstcmd_write_managed_win32_error(WinxtermDstcmdShell *shell,
+                                                       DWORD code)
+{
+    wchar_t message[512];
+    DWORD length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                  0,
+                                  code,
+                                  0,
+                                  message,
+                                  (DWORD)(sizeof(message) / sizeof(message[0])),
+                                  0);
+    if (length == 0u) {
+        (void)_snwprintf_s(message,
+                           sizeof(message) / sizeof(message[0]),
+                           _TRUNCATE,
+                           L"Windows error %lu",
+                           (unsigned long)code);
+    }
+    winxterm_dstcmd_trim_win32_message(message);
+    (void)winxterm_dstcmd_shell_write_widef(shell,
+                                            L"dstcmd: managed process launch failed: %ls (error %lu)\r\n",
+                                            message,
+                                            (unsigned long)code);
 }
 
 static bool winxterm_dstcmd_open_redirect_file(WinxtermDstcmdShell *shell,
@@ -2060,8 +2109,13 @@ static int winxterm_dstcmd_exec_run_managed(WinxtermDstcmdShell *shell,
     bool has_exit_code = false;
     if (!winxterm_dstcmd_job_client_spawn(&shell->job_client, &plan, job_id,
                                           &exit_code, &has_exit_code, &host_status)) {
+        (void)winxterm_dstcmd_shell_write_wide(
+            shell, L"dstcmd: managed process request failed\r\n");
         status = 1;
     } else {
+        if (host_status != ERROR_SUCCESS) {
+            winxterm_dstcmd_write_managed_win32_error(shell, host_status);
+        }
         status = host_status == ERROR_SUCCESS ?
             (!background && has_exit_code ? (int)exit_code : 0) : (int)host_status;
     }
@@ -2200,8 +2254,11 @@ static int winxterm_dstcmd_exec_run_managed_pipeline(WinxtermDstcmdShell *shell,
     bool has_exit_code = false;
     if (!winxterm_dstcmd_job_client_spawn(&shell->job_client, &plan, &job_id,
                                           &exit_code, &has_exit_code, &host_status)) {
+        (void)winxterm_dstcmd_shell_write_wide(
+            shell, L"dstcmd: managed process request failed\r\n");
         status = 1;
     } else if (host_status != ERROR_SUCCESS) {
+        winxterm_dstcmd_write_managed_win32_error(shell, host_status);
         status = (int)host_status;
     } else {
         if (job_id_out != 0) *job_id_out = job_id;

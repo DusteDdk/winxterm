@@ -19,9 +19,13 @@ static const wchar_t WINXTERM_HELP_TEXT[] =
     L"--unpaintedlines <count>  Producer backlog limit before paint, default 20000.\n"
     L"-x <integer>              Integer display scale, 1 through 100, default 1.\n"
     L"\n"
+    L"Environment:\n"
+    L"WINXTERM_USE_CONPTY_SHIM=1  Use inherited stdio pipes for root and managed jobs.\n"
+    L"                             Unset or 0 uses native ConPTY.\n"
+    L"\n"
     L"The first non-option argument is used as the client only when it resolves\n"
     L"to a Windows executable. Without an explicit client, winxterm starts\n"
-    L"dstshell.exe from the same directory through the normal ConPTY host.\n";
+    L"dstshell.exe from the same directory through the selected PTY backend.\n";
 
 static const wchar_t WINXTERM_MACRO_HELP_TEXT[] =
     L"Usage: winxterm.exe --macro <filename>\n"

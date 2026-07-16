@@ -16,6 +16,7 @@
 #include "winxterm_modes.h"
 #include "winxterm_mouse.h"
 #include "winxterm_options.h"
+#include "winxterm_pty.h"
 #include "winxterm_replies.h"
 #include "winxterm_render.h"
 #include "winxterm_scale.h"
@@ -3456,6 +3457,48 @@ static void winxterm_smoke_test_surface(WinxtermSmokeState *state)
                           "surface disposal should release every GDI resource");
 }
 
+static void winxterm_smoke_test_pty_backend_environment(WinxtermSmokeState *state)
+{
+    wchar_t saved[16];
+    SetLastError(ERROR_SUCCESS);
+    DWORD saved_length = GetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, saved,
+                                                  (DWORD)(sizeof(saved) / sizeof(saved[0])));
+    bool had_saved = saved_length != 0u || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+    WinxtermPtyBackend backend = WINXTERM_PTY_BACKEND_SHIM;
+    wchar_t error[160];
+
+    (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, 0);
+    winxterm_smoke_expect(state,
+                          winxterm_pty_backend_from_environment(&backend, error,
+                              sizeof(error) / sizeof(error[0])) &&
+                              backend == WINXTERM_PTY_BACKEND_NATIVE,
+                          "unset PTY shim environment should select native ConPTY");
+    (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, L"0");
+    winxterm_smoke_expect(state,
+                          winxterm_pty_backend_from_environment(&backend, error,
+                              sizeof(error) / sizeof(error[0])) &&
+                              backend == WINXTERM_PTY_BACKEND_NATIVE,
+                          "PTY shim environment value 0 should select native ConPTY");
+    (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, L"1");
+    winxterm_smoke_expect(state,
+                          winxterm_pty_backend_from_environment(&backend, error,
+                              sizeof(error) / sizeof(error[0])) &&
+                              backend == WINXTERM_PTY_BACKEND_SHIM,
+                          "PTY shim environment value 1 should select the stdio shim");
+    (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, L"stdio");
+    winxterm_smoke_expect(state,
+                          !winxterm_pty_backend_from_environment(&backend, error,
+                              sizeof(error) / sizeof(error[0])) &&
+                              wcsstr(error, WINXTERM_PTY_SHIM_ENV) != 0,
+                          "invalid PTY shim environment should be rejected with its name");
+
+    if (had_saved && saved_length < sizeof(saved) / sizeof(saved[0])) {
+        (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, saved);
+    } else {
+        (void)SetEnvironmentVariableW(WINXTERM_PTY_SHIM_ENV, 0);
+    }
+}
+
 int winxterm_smoke_run(void)
 {
     WinxtermSmokeState state = {0};
@@ -3467,6 +3510,7 @@ int winxterm_smoke_run(void)
     winxterm_smoke_test_settings(&state);
     winxterm_smoke_test_grouped_u64_format(&state);
     winxterm_smoke_test_options(&state);
+    winxterm_smoke_test_pty_backend_environment(&state);
     winxterm_smoke_test_job_control_contracts(&state);
     winxterm_smoke_test_bridge_hardening(&state);
     winxterm_smoke_test_screen_and_text(&state);
